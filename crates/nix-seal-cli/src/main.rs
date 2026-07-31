@@ -6,9 +6,12 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Command as ProcessCommand, Stdio},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Parser)]
@@ -1208,10 +1211,15 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
             .generators
             .get(&generator_id)
             .context("generator disappeared from validated plan")?;
+        let generated_values = generate_generator_values(generator)?;
+        if generated_values.len() != generator.outputs.len() {
+            bail!("generator produced an unexpected output count");
+        }
         let generated = generator
             .outputs
             .iter()
-            .map(|secret_id| {
+            .zip(generated_values)
+            .map(|(secret_id, plaintext)| {
                 let secret = plan
                     .secrets
                     .get(secret_id)
@@ -1220,7 +1228,7 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                 Ok(GeneratedSecret {
                     id: secret_id.clone(),
                     source: secret.source.clone(),
-                    plaintext: generate_builtin_value(generator)?,
+                    plaintext,
                     recipients: recipients.recipients.into_values().collect(),
                 })
             })
@@ -1268,6 +1276,120 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn generate_generator_values(
+    generator: &nix_seal_core::Generator,
+) -> Result<Vec<SecretBox<Vec<u8>>>> {
+    if generator.executable.starts_with("builtin:") {
+        return generator
+            .outputs
+            .iter()
+            .map(|_| generate_builtin_value(generator))
+            .collect();
+    }
+    generate_external_values(generator)
+}
+
+fn generate_external_values(
+    generator: &nix_seal_core::Generator,
+) -> Result<Vec<SecretBox<Vec<u8>>>> {
+    let workspace = tempfile::Builder::new()
+        .prefix("nix-seal-generator-")
+        .tempdir()
+        .context("could not create private generator workspace")?;
+    set_private_directory(workspace.path())?;
+    let output_directory = workspace.path().join("outputs");
+    fs::create_dir(&output_directory)
+        .context("could not create private generator output directory")?;
+    set_private_directory(&output_directory)?;
+    let runtime_path = std::env::join_paths(
+        generator
+            .runtime_inputs
+            .iter()
+            .map(|input| Path::new(input).join("bin")),
+    )
+    .context("generator runtime inputs cannot form a safe PATH")?;
+    let mut child = ProcessCommand::new(&generator.executable)
+        .args(&generator.arguments)
+        .env_clear()
+        .env("PATH", runtime_path)
+        .env("HOME", workspace.path())
+        .env("TMPDIR", workspace.path())
+        .env("NIX_SEAL_OUTPUT_DIR", &output_directory)
+        .env("NIX_SEAL_OUTPUT_COUNT", generator.outputs.len().to_string())
+        .current_dir(workspace.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("could not start constrained generator")?;
+    let deadline = Instant::now() + Duration::from_secs(u64::from(generator.timeout_seconds));
+    loop {
+        match child
+            .try_wait()
+            .context("could not observe constrained generator")?
+        {
+            Some(status) if status.success() => break,
+            Some(_) => bail!("constrained generator failed"),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("constrained generator timed out");
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    let expected = (0..generator.outputs.len())
+        .map(|index| index.to_string())
+        .collect::<BTreeSet<_>>();
+    let actual = fs::read_dir(&output_directory)
+        .context("could not inspect constrained generator outputs")?
+        .map(|entry| {
+            let entry = entry.context("could not inspect constrained generator output")?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("generator output name is not UTF-8"))?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .context("could not inspect constrained generator output metadata")?;
+            if !metadata.file_type().is_file() {
+                bail!("constrained generator created a non-regular output");
+            }
+            Ok(name)
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if actual != expected {
+        bail!("constrained generator created undeclared or missing outputs");
+    }
+    expected
+        .iter()
+        .map(|name| read_generator_output(&output_directory.join(name), generator.max_output_bytes))
+        .collect()
+}
+
+fn read_generator_output(path: &Path, maximum: u64) -> Result<SecretBox<Vec<u8>>> {
+    let metadata =
+        fs::symlink_metadata(path).context("could not inspect constrained generator output")?;
+    if !metadata.file_type().is_file() || metadata.len() > maximum {
+        bail!("constrained generator output is invalid or exceeds its declared limit");
+    }
+    set_private_file(path)
+        .context("could not restrict constrained generator output permissions")?;
+    let mut input = open_private_identity(path)
+        .context("constrained generator output has unsafe ownership or permissions")?;
+    let capacity =
+        usize::try_from(metadata.len()).context("generator output length cannot fit memory")?;
+    let mut output = Vec::with_capacity(capacity);
+    std::io::Read::by_ref(&mut input)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut output)
+        .context("could not read constrained generator output")?;
+    let length = u64::try_from(output.len()).context("generator output length cannot fit u64")?;
+    if length > maximum {
+        bail!("constrained generator output exceeded its declared limit");
+    }
+    Ok(SecretBox::new(Box::new(output)))
 }
 
 fn collect_generator_order(
@@ -2018,6 +2140,18 @@ fn set_private_file(path: &Path) -> Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
+
+#[cfg(unix)]
+fn set_private_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
 #[cfg(not(unix))]
 fn set_private_file(_path: &Path) -> Result<()> {
     Ok(())
@@ -2401,6 +2535,10 @@ mod tests {
         let output = nix_seal_core::Id::parse("application/token")?;
         let random = nix_seal_core::Generator {
             executable: "builtin:random".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
             outputs: vec![output.clone()],
             parameters: BTreeMap::from([("bytes".to_owned(), "48".to_owned())]),
@@ -2409,6 +2547,10 @@ mod tests {
         assert_eq!(generate_builtin_value(&random)?.expose_secret().len(), 48);
         let hex = nix_seal_core::Generator {
             executable: "builtin:hex".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
             outputs: vec![output.clone()],
             parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
@@ -2419,6 +2561,10 @@ mod tests {
         assert!(hex_value.expose_secret().iter().all(u8::is_ascii_hexdigit));
         let uuid = nix_seal_core::Generator {
             executable: "builtin:uuid".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
             outputs: vec![output],
             parameters: BTreeMap::new(),
@@ -2431,6 +2577,39 @@ mod tests {
             uuid.expose_secret()[19],
             b'8' | b'9' | b'a' | b'b'
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn constrained_external_generator_uses_private_declared_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let shell = std::env::split_paths(&std::env::var_os("PATH").ok_or("PATH is absent")?)
+            .map(|directory| directory.join("sh"))
+            .find(|candidate| candidate.is_file())
+            .ok_or("sh is absent from PATH")?
+            .canonicalize()?;
+        let generator = nix_seal_core::Generator {
+            executable: shell.to_string_lossy().into_owned(),
+            arguments: vec![
+                "-c".to_owned(),
+                "printf first > \"$NIX_SEAL_OUTPUT_DIR/0\"; printf second > \"$NIX_SEAL_OUTPUT_DIR/1\""
+                    .to_owned(),
+            ],
+            runtime_inputs: Vec::new(),
+            timeout_seconds: 5,
+            max_output_bytes: 1024,
+            dependencies: Vec::new(),
+            outputs: vec![
+                nix_seal_core::Id::parse("generator/one")?,
+                nix_seal_core::Id::parse("generator/two")?,
+            ],
+            parameters: BTreeMap::new(),
+            validation: None,
+        };
+        let values = generate_external_values(&generator)?;
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].expose_secret(), b"first");
+        assert_eq!(values[1].expose_secret(), b"second");
         Ok(())
     }
 
@@ -2514,6 +2693,10 @@ mod tests {
             generator_id.clone(),
             nix_seal_core::Generator {
                 executable: "builtin:hex".to_owned(),
+                arguments: Vec::new(),
+                runtime_inputs: Vec::new(),
+                timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+                max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
                 dependencies: Vec::new(),
                 outputs: vec![secret_id, second_secret_id],
                 parameters: BTreeMap::from([("bytes".to_owned(), "20".to_owned())]),

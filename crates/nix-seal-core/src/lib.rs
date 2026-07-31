@@ -8,6 +8,10 @@ use thiserror::Error;
 
 /// Current intermediate-representation schema identifier.
 pub const PLAN_SCHEMA: &str = "nix-seal.plan.v1";
+/// Default maximum execution time for a constrained external generator.
+pub const DEFAULT_GENERATOR_TIMEOUT_SECONDS: u16 = 30;
+/// Default per-output plaintext safety limit for a constrained external generator.
+pub const DEFAULT_GENERATOR_MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A validated stable object identifier.
 #[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
@@ -290,6 +294,18 @@ pub struct Lifecycle {
 pub struct Generator {
     /// Built-in name or direct executable store path.
     pub executable: String,
+    /// Literal public arguments passed directly to an external executable.
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    /// Nix-store package roots whose `bin` directories form the generator `PATH`.
+    #[serde(default)]
+    pub runtime_inputs: Vec<String>,
+    /// Maximum external-generator execution time in seconds.
+    #[serde(default = "default_generator_timeout_seconds")]
+    pub timeout_seconds: u16,
+    /// Maximum plaintext bytes accepted from each external output file.
+    #[serde(default = "default_generator_max_output_bytes")]
+    pub max_output_bytes: u64,
     /// Generator dependencies.
     #[serde(default)]
     pub dependencies: Vec<Id>,
@@ -300,6 +316,14 @@ pub struct Generator {
     pub parameters: BTreeMap<String, String>,
     /// Public validation fingerprint.
     pub validation: Option<String>,
+}
+
+fn default_generator_timeout_seconds() -> u16 {
+    DEFAULT_GENERATOR_TIMEOUT_SECONDS
+}
+
+fn default_generator_max_output_bytes() -> u64 {
+    DEFAULT_GENERATOR_MAX_OUTPUT_BYTES
 }
 
 /// Runtime template declaration.

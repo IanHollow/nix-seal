@@ -813,17 +813,7 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
                 "generator {generator_id} exceeds dependency or output limits"
             )));
         }
-        if generator.executable.is_empty()
-            || generator.executable.len() > 16 * 1024
-            || generator
-                .executable
-                .bytes()
-                .any(|byte| byte.is_ascii_control())
-        {
-            return Err(PolicyError::Violation(format!(
-                "generator {generator_id} has an invalid executable declaration"
-            )));
-        }
+        validate_generator_execution(generator_id, generator)?;
         if generator.outputs.is_empty() {
             return Err(PolicyError::Violation(format!(
                 "generator {generator_id} must declare at least one output"
@@ -892,6 +882,68 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
         ));
     }
     Ok(())
+}
+
+fn validate_generator_execution(
+    generator_id: &Id,
+    generator: &nix_seal_core::Generator,
+) -> Result<(), PolicyError> {
+    if generator.executable.is_empty()
+        || generator.executable.len() > 16 * 1024
+        || generator
+            .executable
+            .bytes()
+            .any(|byte| byte.is_ascii_control())
+    {
+        return Err(PolicyError::Violation(format!(
+            "generator {generator_id} has an invalid executable declaration"
+        )));
+    }
+    let is_builtin = matches!(
+        generator.executable.as_str(),
+        "builtin:random" | "builtin:hex" | "builtin:uuid"
+    );
+    if !is_builtin && !valid_store_executable(&generator.executable) {
+        return Err(PolicyError::Violation(format!(
+            "generator {generator_id} must use a built-in or direct executable below /nix/store"
+        )));
+    }
+    if generator.arguments.len() > 256
+        || generator.arguments.iter().any(|argument| {
+            argument.len() > 16 * 1024 || argument.bytes().any(|byte| byte.is_ascii_control())
+        })
+        || generator.runtime_inputs.len() > 128
+        || generator
+            .runtime_inputs
+            .iter()
+            .any(|input| !valid_store_executable(input))
+        || !(1..=300).contains(&generator.timeout_seconds)
+        || generator.max_output_bytes == 0
+        || generator.max_output_bytes > nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES
+        || (is_builtin
+            && (!generator.arguments.is_empty()
+                || !generator.runtime_inputs.is_empty()
+                || generator.timeout_seconds != nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS
+                || generator.max_output_bytes != nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES))
+    {
+        return Err(PolicyError::Violation(format!(
+            "generator {generator_id} has invalid constrained-execution settings"
+        )));
+    }
+    Ok(())
+}
+
+fn valid_store_executable(value: &str) -> bool {
+    let path = Path::new(value);
+    value.starts_with("/nix/store/")
+        && !value.contains(':')
+        && path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
 }
 
 fn is_generator_parameter_name(value: &str) -> bool {
@@ -1029,6 +1081,20 @@ mod tests {
         validate(&plan)?;
         assert_eq!(plan_hash(&plan)?, plan_hash(&plan)?);
         Ok(())
+    }
+
+    #[test]
+    fn external_generator_paths_are_confined_to_the_nix_store() {
+        assert!(valid_store_executable(
+            "/nix/store/abc123-generator/bin/generate"
+        ));
+        assert!(!valid_store_executable("/bin/sh"));
+        assert!(!valid_store_executable(
+            "/nix/store/abc123-generator/../bin/generate"
+        ));
+        assert!(!valid_store_executable(
+            "/nix/store/abc123:unsafe/bin/generate"
+        ));
     }
     #[test]
     fn duplicate_ids_are_rejected() -> Result<(), PolicyError> {

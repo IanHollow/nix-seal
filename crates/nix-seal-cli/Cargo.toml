@@ -29,10 +29,8 @@ rustix.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 uzers.workspace = true
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
