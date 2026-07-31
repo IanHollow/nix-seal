@@ -1,0 +1,19 @@
+[package]
+name = "nix-seal-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3.workspace = true
+nix-seal-core.workspace = true
+schemars.workspace = true
+serde_json.workspace = true
+serde_jcs.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,541 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlanV1",
+  "description": "Fully compiled public plan.",
+  "type": "object",
+  "properties": {
+    "approvalPolicies": {
+      "description": "Artifact signature policies.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ApprovalPolicy"
+      },
+      "default": {}
+    },
+    "backends": {
+      "description": "Encryption/provider backends.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Backend"
+      },
+      "default": {}
+    },
+    "generators": {
+      "description": "Generator definitions.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Generator"
+      },
+      "default": {}
+    },
+    "groups": {
+      "description": "Named sets of object IDs.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Group"
+      },
+      "default": {}
+    },
+    "identities": {
+      "description": "Public recipients and signers.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Identity"
+      },
+      "default": {}
+    },
+    "schema": {
+      "description": "Must equal [`PLAN_SCHEMA`].",
+      "type": "string"
+    },
+    "secrets": {
+      "description": "Secret policy and encrypted source metadata.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Secret"
+      },
+      "default": {}
+    },
+    "targets": {
+      "description": "Platform consumers.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Target"
+      },
+      "default": {}
+    },
+    "templates": {
+      "description": "Runtime template definitions.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Template"
+      },
+      "default": {}
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema"
+  ],
+  "$defs": {
+    "ActivationPhase": {
+      "description": "Activation lifecycle phase.",
+      "oneOf": [
+        {
+          "description": "Disk/installation phase.",
+          "type": "string",
+          "const": "partitioning"
+        },
+        {
+          "description": "Before user creation.",
+          "type": "string",
+          "const": "users"
+        },
+        {
+          "description": "General activation.",
+          "type": "string",
+          "const": "activation"
+        },
+        {
+          "description": "Before service consumption.",
+          "type": "string",
+          "const": "services"
+        }
+      ]
+    },
+    "ApprovalPolicy": {
+      "description": "N-of-M artifact signature policy.",
+      "type": "object",
+      "properties": {
+        "signers": {
+          "description": "Trusted signer IDs.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "threshold": {
+          "description": "Required distinct signer count.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "threshold",
+        "signers"
+      ]
+    },
+    "Backend": {
+      "description": "Backend declaration.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "Backend kind.",
+          "$ref": "#/$defs/BackendKind"
+        },
+        "options": {
+          "description": "Reserved public backend options. Native age uses an empty map.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ]
+    },
+    "BackendKind": {
+      "description": "Supported backend kinds.",
+      "oneOf": [
+        {
+          "description": "Standard age.",
+          "type": "string",
+          "const": "age"
+        }
+      ]
+    },
+    "DeliveryMode": {
+      "description": "Ciphertext delivery model.",
+      "oneOf": [
+        {
+          "description": "Target-bound cache artifacts.",
+          "type": "string",
+          "const": "rekeyed"
+        },
+        {
+          "description": "Canonical ciphertext includes target recipients.",
+          "type": "string",
+          "const": "direct"
+        }
+      ]
+    },
+    "Generator": {
+      "description": "Generator declaration.",
+      "type": "object",
+      "properties": {
+        "dependencies": {
+          "description": "Generator dependencies.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "executable": {
+          "description": "Built-in name or direct executable store path.",
+          "type": "string"
+        },
+        "outputs": {
+          "description": "Declared outputs.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "validation": {
+          "description": "Public validation fingerprint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "executable",
+        "outputs"
+      ]
+    },
+    "Group": {
+      "description": "Named group of IDs.",
+      "type": "object",
+      "properties": {
+        "members": {
+          "description": "Members of the group.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Id": {
+      "description": "A validated stable object identifier.",
+      "type": "string"
+    },
+    "Identity": {
+      "description": "Public recipient or signer identity.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "Identity role.",
+          "$ref": "#/$defs/IdentityKind"
+        },
+        "public": {
+          "description": "Public recipient, key, or plugin reference.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "public"
+      ]
+    },
+    "IdentityKind": {
+      "description": "Identity role.",
+      "oneOf": [
+        {
+          "description": "Administrator encryption recipient.",
+          "type": "string",
+          "const": "administrator"
+        },
+        {
+          "description": "Target encryption recipient.",
+          "type": "string",
+          "const": "target"
+        },
+        {
+          "description": "Recovery encryption recipient.",
+          "type": "string",
+          "const": "recovery"
+        },
+        {
+          "description": "Artifact approval verifier.",
+          "type": "string",
+          "const": "signer"
+        },
+        {
+          "description": "Standard age plugin reference.",
+          "type": "string",
+          "const": "plugin"
+        }
+      ]
+    },
+    "Lifecycle": {
+      "description": "Public lifecycle metadata.",
+      "type": "object",
+      "properties": {
+        "classification": {
+          "description": "Public classification.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contact": {
+          "description": "Responsible contact.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "createdAt": {
+          "description": "ISO-8601 creation time.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expiresAt": {
+          "description": "ISO-8601 expiry time.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "purpose": {
+          "description": "Non-secret purpose.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rotateAfterDays": {
+          "description": "Rotation interval in days.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "RuntimeSettings": {
+      "description": "Runtime materialization controls.",
+      "type": "object",
+      "properties": {
+        "group": {
+          "description": "File group.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "Octal mode represented as a string.",
+          "type": "string"
+        },
+        "owner": {
+          "description": "File owner.",
+          "type": "string"
+        },
+        "reloadUnits": {
+          "description": "Units reloaded after a successful switch.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "restartUnits": {
+          "description": "Units restarted after a successful switch.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "owner",
+        "group",
+        "mode"
+      ]
+    },
+    "Secret": {
+      "description": "Secret policy. It contains paths and metadata, never plaintext.",
+      "type": "object",
+      "properties": {
+        "administrators": {
+          "description": "Explicit administrator identity/group IDs.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "approvalPolicy": {
+          "description": "Approval policy ID.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "consumers": {
+          "description": "Explicit target/group IDs.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "delivery": {
+          "description": "Artifact delivery model.",
+          "$ref": "#/$defs/DeliveryMode",
+          "default": "rekeyed"
+        },
+        "lifecycle": {
+          "description": "Lifecycle metadata.",
+          "$ref": "#/$defs/Lifecycle",
+          "default": {
+            "classification": null,
+            "contact": null,
+            "createdAt": null,
+            "expiresAt": null,
+            "purpose": null,
+            "rotateAfterDays": null
+          }
+        },
+        "phase": {
+          "description": "Required activation phase.",
+          "$ref": "#/$defs/ActivationPhase",
+          "default": "activation"
+        },
+        "runtime": {
+          "description": "Runtime delivery settings.",
+          "$ref": "#/$defs/RuntimeSettings",
+          "default": {
+            "group": "root",
+            "mode": "0400",
+            "owner": "root",
+            "reloadUnits": [],
+            "restartUnits": []
+          }
+        },
+        "source": {
+          "description": "Repository-relative canonical age ciphertext path.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source"
+      ]
+    },
+    "Target": {
+      "description": "Target platform consumer.",
+      "type": "object",
+      "properties": {
+        "identity": {
+          "description": "Recipient identity ID.",
+          "$ref": "#/$defs/Id"
+        },
+        "kind": {
+          "description": "Integration type.",
+          "$ref": "#/$defs/TargetKind"
+        },
+        "system": {
+          "description": "Nix system value.",
+          "type": "string"
+        },
+        "tags": {
+          "description": "Public selector tags.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "username": {
+          "description": "Optional Home Manager user.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "system",
+        "identity"
+      ]
+    },
+    "TargetKind": {
+      "description": "Supported integration type.",
+      "oneOf": [
+        {
+          "description": "NixOS system.",
+          "type": "string",
+          "const": "nixOs"
+        },
+        {
+          "description": "nix-darwin system.",
+          "type": "string",
+          "const": "darwin"
+        },
+        {
+          "description": "Standalone or integrated Home Manager profile.",
+          "type": "string",
+          "const": "homeManager"
+        }
+      ]
+    },
+    "Template": {
+      "description": "Runtime template declaration.",
+      "type": "object",
+      "properties": {
+        "runtime": {
+          "description": "Rendered-file runtime settings.",
+          "$ref": "#/$defs/RuntimeSettings",
+          "default": {
+            "group": "root",
+            "mode": "0400",
+            "owner": "root",
+            "reloadUnits": [],
+            "restartUnits": []
+          }
+        },
+        "secrets": {
+          "description": "Placeholder secret IDs.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "source": {
+          "description": "Non-secret source path.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "secrets"
+      ]
+    }
+  }
+}

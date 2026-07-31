@@ -1,0 +1,19 @@
+schema = "nix-seal.plan.v1"
+
+[identities.admin]
+kind = "administrator"
+public = "age1replace-with-a-public-recipient"
+
+[identities.server]
+kind = "target"
+public = "age1replace-with-a-public-recipient"
+
+[targets.server]
+kind = "nixOs"
+system = "x86_64-linux"
+identity = "server"
+
+[secrets."services/example/token"]
+source = "secrets/services/example/token.age"
+consumers = ["server"]
+administrators = ["admin"]

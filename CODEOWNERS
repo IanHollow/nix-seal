@@ -1,0 +1,8 @@
+# Security-sensitive ownership; expand to multiple independent reviewers as the
+# maintainer team grows.
+/crates/nix-seal-crypto/ @IanHollow
+/crates/nix-seal-runtime/ @IanHollow
+/crates/nix-seal-cache/ @IanHollow
+/docs/adr/ @IanHollow
+/THREAT_MODEL.md @IanHollow
+/SECURITY.md @IanHollow

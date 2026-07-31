@@ -1,0 +1,25 @@
+name: Bug report
+description: Report a non-security defect
+body:
+  - type: markdown
+    attributes:
+      value: "For vulnerabilities, stop and follow SECURITY.md instead. Never attach secrets or identities."
+  - type: input
+    id: version
+    attributes:
+      label: Version
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed and expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Redacted reproduction
+      description: Use synthetic ciphertext and canary values only.
+    validations:
+      required: true

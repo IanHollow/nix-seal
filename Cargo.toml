@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/nix-seal-cache",
+  "crates/nix-seal-cli",
+  "crates/nix-seal-core",
+  "crates/nix-seal-crypto",
+  "crates/nix-seal-policy",
+  "crates/nix-seal-runtime",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Ian Hollow"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/IanHollow/nix-seal"
+
+[workspace.dependencies]
+age = { version = "=0.12.1", default-features = false, features = ["armor"] }
+anyhow = "1.0.98"
+blake3 = "1.8.2"
+clap = { version = "4.5.40", features = ["derive"] }
+clap_complete = "4.5.54"
+clap_complete_nushell = "4.6.1"
+fs2 = "0.4.3"
+nix-seal-cache = { path = "crates/nix-seal-cache", version = "=0.1.0-alpha.1" }
+nix-seal-core = { path = "crates/nix-seal-core", version = "=0.1.0-alpha.1" }
+nix-seal-crypto = { path = "crates/nix-seal-crypto", version = "=0.1.0-alpha.1" }
+nix-seal-policy = { path = "crates/nix-seal-policy", version = "=0.1.0-alpha.1" }
+schemars = "1.0.4"
+secrecy = "0.10.3"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+serde_jcs = "0.1.0"
+tempfile = "3.20.0"
+thiserror = "2.0.12"
+toml = "0.9.2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+overflow-checks = true
+panic = "abort"
