@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use secrecy::{ExposeSecret, SecretString};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::{Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -282,6 +282,21 @@ enum CacheCommand {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Report or remove cache entries not authenticated by the current plan.
+    Gc {
+        /// Canonical compiled plan.v1 JSON used to authenticate retained artifacts.
+        #[arg(long, default_value = "plan.v1.json")]
+        plan: PathBuf,
+        /// Repository root used to hash canonical ciphertext sources.
+        #[arg(long, default_value = ".")]
+        repository_root: PathBuf,
+        /// Override the standard XDG cache root.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Remove candidates after the authenticated dry-run calculation.
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -343,6 +358,12 @@ fn run() -> Result<()> {
         Command::Schema { kind } => run_schema(kind)?,
         Command::Completions { shell } => completions(shell),
         Command::Cache(CacheCommand::Status { root }) => cache_status(root, cli.json)?,
+        Command::Cache(CacheCommand::Gc {
+            plan,
+            repository_root,
+            root,
+            execute,
+        }) => cache_gc(&plan, &repository_root, root, execute, cli.json)?,
     }
     Ok(())
 }
@@ -1530,6 +1551,252 @@ fn cache_status(root: Option<PathBuf>, json: bool) -> Result<()> {
     Ok(())
 }
 
+struct GcRetention {
+    plan_hash: String,
+    artifact_keys: BTreeSet<String>,
+    unavailable_sources: u64,
+}
+
+fn cache_gc(
+    plan_path: &Path,
+    repository_root: &Path,
+    root: Option<PathBuf>,
+    execute: bool,
+    json: bool,
+) -> Result<()> {
+    let plan = read_plan_bounded(plan_path)?;
+    let cache = nix_seal_cache::Cache::open(root.unwrap_or_else(default_cache_root))?;
+    let retention = authenticated_gc_retention(&cache, &plan, repository_root)?;
+    let report = cache.garbage_collect(&nix_seal_cache::GcRequest {
+        retained_artifacts: retention.artifact_keys,
+        // Generic objects are not referenced by the v1 plan/artifact format and
+        // must therefore never be retained by inference.
+        retained_objects: BTreeSet::new(),
+        execute,
+    })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.cache-gc.v1",
+                "root":cache.root(),
+                "dryRun":!report.executed,
+                "planHash":retention.plan_hash,
+                "retainedArtifacts":report.retained_artifacts,
+                "retainedObjects":report.retained_objects,
+                "candidateArtifacts":report.candidate_artifacts,
+                "candidateObjects":report.candidate_objects,
+                "candidateBytes":report.candidate_bytes,
+                "unavailableSources":retention.unavailable_sources
+            })
+        );
+    } else {
+        let action = if report.executed {
+            "removed"
+        } else {
+            "would remove"
+        };
+        println!(
+            "{}: retained {} target artifacts; {action} {} target artifacts and {} generic objects ({} bytes)",
+            cache.root().display(),
+            report.retained_artifacts,
+            report.candidate_artifacts,
+            report.candidate_objects,
+            report.candidate_bytes,
+        );
+        if !report.executed {
+            eprintln!("dry run; rerun with --execute to remove candidates");
+        }
+        if retention.unavailable_sources > 0 {
+            eprintln!(
+                "{} canonical ciphertext source(s) could not be authenticated; related artifacts are candidates",
+                retention.unavailable_sources
+            );
+        }
+    }
+    Ok(())
+}
+
+fn authenticated_gc_retention(
+    cache: &nix_seal_cache::Cache,
+    plan: &nix_seal_core::PlanV1,
+    repository_root: &Path,
+) -> Result<GcRetention> {
+    let plan_hash = nix_seal_policy::plan_hash(plan)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    let mut target_policies = BTreeMap::new();
+    let mut source_hashes = BTreeMap::new();
+    let mut unavailable_sources = BTreeSet::new();
+    let mut artifact_keys = BTreeSet::new();
+    for record in cache.artifact_records()? {
+        let Ok(envelope) =
+            serde_json::from_slice::<nix_seal_manifest::SignedEnvelopeV1>(&record.envelope)
+        else {
+            continue;
+        };
+        let Ok(manifest) = nix_seal_manifest::inspect_unverified(&envelope) else {
+            continue;
+        };
+        if artifact_is_active(
+            &record,
+            &envelope,
+            &manifest,
+            plan,
+            &plan_hash,
+            repository_root,
+            now,
+            &mut target_policies,
+            &mut source_hashes,
+            &mut unavailable_sources,
+        ) {
+            artifact_keys.insert(record.key);
+        }
+    }
+    Ok(GcRetention {
+        plan_hash,
+        artifact_keys,
+        unavailable_sources: u64::try_from(unavailable_sources.len())
+            .context("source availability count exceeds supported range")?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn artifact_is_active(
+    record: &nix_seal_cache::ArtifactRecord,
+    envelope: &nix_seal_manifest::SignedEnvelopeV1,
+    manifest: &nix_seal_manifest::TargetManifestV2,
+    plan: &nix_seal_core::PlanV1,
+    plan_hash: &str,
+    repository_root: &Path,
+    now: u64,
+    target_policies: &mut BTreeMap<nix_seal_core::Id, nix_seal_policy::TargetPolicyV1>,
+    source_hashes: &mut BTreeMap<nix_seal_core::Id, Option<String>>,
+    unavailable_sources: &mut BTreeSet<nix_seal_core::Id>,
+) -> bool {
+    if manifest.plan_hash != plan_hash
+        || !plan.targets.contains_key(&manifest.target_id)
+        || !plan.secrets.contains_key(&manifest.secret_id)
+    {
+        return false;
+    }
+    let policy = match target_policies.entry(manifest.target_id.clone()) {
+        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            let Ok(policy) = nix_seal_policy::target_policy(plan, &manifest.target_id) else {
+                return false;
+            };
+            entry.insert(policy)
+        }
+    };
+    let Ok(policy_hash) = nix_seal_policy::target_policy_hash(policy) else {
+        return false;
+    };
+    let Some(secret_policy) = policy.secrets.get(&manifest.secret_id) else {
+        return false;
+    };
+    if manifest.target_policy_hash != policy_hash
+        || !matches!(secret_policy.delivery, nix_seal_core::DeliveryMode::Rekeyed)
+    {
+        return false;
+    }
+    let source_hash = match source_hashes.entry(manifest.secret_id.clone()) {
+        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            let hash = canonical_ciphertext_hash(repository_root, &secret_policy.source).ok();
+            if hash.is_none() {
+                unavailable_sources.insert(manifest.secret_id.clone());
+            }
+            entry.insert(hash)
+        }
+    };
+    let Some(source_hash) = source_hash.as_deref() else {
+        return false;
+    };
+    let Ok(recipient_fingerprint) = nix_seal_crypto::recipient_fingerprint(&policy.recipient)
+    else {
+        return false;
+    };
+    if manifest.source_ciphertext_hash != source_hash
+        || manifest.recipient_fingerprint != recipient_fingerprint
+    {
+        return false;
+    }
+    let Ok(address) = nix_seal_cache::ArtifactAddress::new(
+        plan_hash,
+        &policy_hash,
+        source_hash,
+        &recipient_fingerprint,
+        manifest.target_id.as_str(),
+        manifest.secret_id.as_str(),
+        manifest.artifact_generation,
+    ) else {
+        return false;
+    };
+    if address.key().ok().as_deref() != Some(&record.key) {
+        return false;
+    }
+    let mut trusted = nix_seal_manifest::TrustedKeys::new();
+    if secret_policy
+        .approval
+        .signers
+        .values()
+        .any(|encoded| trusted.insert_encoded(encoded).is_err())
+    {
+        return false;
+    }
+    let expected = nix_seal_manifest::ExpectedBinding {
+        // The current policy has no producer-version allow-list yet. The signed
+        // value remains bound by `verify`; a future version policy can constrain it.
+        tool_version: &manifest.tool_version,
+        plan_hash,
+        target_policy_hash: &policy_hash,
+        source_ciphertext_hash: source_hash,
+        artifact_ciphertext_hash: &record.artifact_ciphertext_hash,
+        target_id: &manifest.target_id,
+        secret_id: &manifest.secret_id,
+        recipient_fingerprint: &recipient_fingerprint,
+        artifact_generation: manifest.artifact_generation,
+        now,
+        allowed_clock_skew: 300,
+    };
+    nix_seal_manifest::verify(
+        envelope,
+        &trusted,
+        usize::from(secret_policy.approval.threshold),
+        &expected,
+    )
+    .is_ok()
+}
+
+fn canonical_ciphertext_hash(repository_root: &Path, relative: &str) -> Result<String> {
+    const LIMIT: u64 = 70 * 1024 * 1024;
+    let path = existing_secret_path(repository_root, relative)?;
+    let mut file = open_public_ciphertext(&path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(u64::try_from(read).context("ciphertext read length exceeds u64")?)
+            .context("ciphertext exceeds supported length")?;
+        if total > LIMIT {
+            bail!("canonical ciphertext exceeds the 70 MiB safety limit");
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if total == 0 {
+        bail!("canonical ciphertext is empty");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 fn default_cache_root() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map_or_else(
@@ -1781,6 +2048,122 @@ mod tests {
             std::fs::read(runtime_root.join("current/db/password"))?,
             b"cli-activation-canary"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cache_gc_retains_only_current_authenticated_artifacts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository_root = temporary.path().join("repository");
+        let source_path = repository_root.join("secrets/application.age");
+        std::fs::create_dir_all(source_path.parent().ok_or("source has no parent")?)?;
+        let (administrator_identity, administrator_recipient) = nix_seal_crypto::generate_x25519();
+        let (_, target_recipient) = nix_seal_crypto::generate_x25519();
+        let signer = nix_seal_manifest::ApprovalSigningKey::generate()?;
+        let target_id = nix_seal_core::Id::parse("host.test")?;
+        let secret_id = nix_seal_core::Id::parse("application/token")?;
+        let target_identity_id = nix_seal_core::Id::parse("target.host-test")?;
+        let signer_id = nix_seal_core::Id::parse("signer.release")?;
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.identities.insert(
+            nix_seal_core::Id::parse("administrator")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: administrator_recipient,
+            },
+        );
+        plan.identities.insert(
+            target_identity_id.clone(),
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Target,
+                public: target_recipient.clone(),
+            },
+        );
+        plan.identities.insert(
+            signer_id,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Signer,
+                public: signer.encode_public(),
+            },
+        );
+        plan.targets.insert(
+            target_id.clone(),
+            nix_seal_core::Target {
+                kind: nix_seal_core::TargetKind::NixOs,
+                system: "x86_64-linux".to_owned(),
+                identity: target_identity_id,
+                username: None,
+                tags: Vec::new(),
+            },
+        );
+        plan.secrets.insert(
+            secret_id.clone(),
+            nix_seal_core::Secret {
+                source: "secrets/application.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: vec![target_id.clone()],
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: None,
+            },
+        );
+        nix_seal_policy::validate(&plan)?;
+        let mut source = std::fs::File::create(&source_path)?;
+        nix_seal_crypto::encrypt(
+            b"gc-canary".as_slice(),
+            &mut source,
+            &[plan
+                .identities
+                .get(&nix_seal_core::Id::parse("administrator")?)
+                .ok_or("administrator missing")?
+                .public
+                .clone()],
+        )?;
+        source.sync_all()?;
+        let policy = nix_seal_policy::target_policy(&plan, &target_id)?;
+        let cache = nix_seal_cache::Cache::open(temporary.path().join("cache"))?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        nix_seal_rekey::rekey(
+            &cache,
+            &nix_seal_rekey::RekeyRequest {
+                source: &source_path,
+                administrator_identity: &administrator_identity,
+                target_recipient: &target_recipient,
+                plan_hash: &nix_seal_policy::plan_hash(&plan)?,
+                target_policy_hash: &nix_seal_policy::target_policy_hash(&policy)?,
+                target_id: &target_id,
+                secret_id: &secret_id,
+                artifact_generation: 1,
+                issued_at: now,
+                expires_at: now.checked_add(60),
+                tool_version: env!("CARGO_PKG_VERSION"),
+                signing_key: &signer,
+            },
+        )?;
+        cache.put(b"unreferenced ciphertext")?;
+
+        let retention = authenticated_gc_retention(&cache, &plan, &repository_root)?;
+        assert_eq!(retention.artifact_keys.len(), 1);
+        assert_eq!(retention.unavailable_sources, 0);
+        let report = cache.garbage_collect(&nix_seal_cache::GcRequest {
+            retained_artifacts: retention.artifact_keys,
+            retained_objects: BTreeSet::new(),
+            execute: false,
+        })?;
+        assert_eq!(report.retained_artifacts, 1);
+        assert_eq!(report.candidate_objects, 1);
+
+        plan.targets
+            .get_mut(&target_id)
+            .ok_or("target missing")?
+            .tags
+            .push("changed".to_owned());
+        let stale = authenticated_gc_retention(&cache, &plan, &repository_root)?;
+        assert!(stale.artifact_keys.is_empty());
         Ok(())
     }
 }

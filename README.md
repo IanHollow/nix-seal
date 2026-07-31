@@ -42,6 +42,22 @@ ciphertext hash, and deletion time. The authoritative plan is never rewritten
 implicitly, so recovery remains possible and `check --deep` fails until policy
 is intentionally updated or the ciphertext is restored.
 
+Cache garbage collection is explicitly dry-run-first and trusts neither cache
+names nor unsigned metadata. It recomputes the active plan and target-policy
+hashes, hashes the canonical source ciphertext through a no-follow descriptor,
+reconstructs the deterministic artifact address, and checks the current
+approval threshold before retaining an artifact:
+
+```console
+nix-seal cache gc --plan plan.v1.json --repository-root .
+nix-seal cache gc --plan plan.v1.json --repository-root . --execute
+```
+
+Any malformed, expired, stale, source-mismatched, target-mismatched, or
+untrusted artifact is a deletion candidate. Version 1 generic cache objects do
+not have an authenticated plan reference, so they are always candidates. The
+command never removes anything without `--execute`.
+
 The project is in an early, pre-release foundation phase. The current vertical
 slice provides strict plan parsing and validation, canonical plan hashing,
 native age X25519 encryption/decryption, signed target artifacts, transactional
