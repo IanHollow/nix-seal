@@ -20,16 +20,51 @@ let
       secrets."db/password" = {
         inherit ciphertext envelope;
         sourceCiphertextHash = digest "2";
-        restartUnits = [ "example.service" ];
       };
     };
+  };
+  credentialMapping = {
+    nixSeal.secrets."db/password".serviceCredentials = [
+      {
+        unit = "example.service";
+        name = "database-password";
+      }
+    ];
+  };
+  explicitRestart = {
+    nixSeal.secrets."db/password".restartUnits = [ "example.service" ];
   };
   nixos = inputs.nixpkgs.lib.nixosSystem {
     inherit system;
     modules = [
       self.nixosModules.default
       common
+      credentialMapping
       { system.stateVersion = "26.05"; }
+    ];
+  };
+  credentialCollision = inputs.nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = [
+      self.nixosModules.default
+      common
+      credentialMapping
+      {
+        system.stateVersion = "26.05";
+        systemd.services.example.serviceConfig.LoadCredential = [
+          "database-password:/run/conflicting-source"
+        ];
+        nixSeal.secrets."api/token" = {
+          inherit ciphertext envelope;
+          sourceCiphertextHash = digest "3";
+          serviceCredentials = [
+            {
+              unit = "example.service";
+              name = "database-password";
+            }
+          ];
+        };
+      }
     ];
   };
   home = inputs.home-manager.lib.homeManagerConfiguration {
@@ -37,6 +72,7 @@ let
     modules = [
       self.homeManagerModules.default
       common
+      (if pkgs.stdenv.hostPlatform.isLinux then credentialMapping else explicitRestart)
       {
         home = {
           username = "test";
@@ -47,39 +83,114 @@ let
     ];
   };
   checkDocument =
-    name: manager: spec: activationText:
+    name: manager: owner: group: spec: activationText: credentialSpec:
     pkgs.runCommand name { nativeBuildInputs = [ pkgs.jq ]; } ''
-      jq -e --arg manager ${lib.escapeShellArg manager} '
+      jq -e \
+        --arg manager ${lib.escapeShellArg manager} \
+        --arg owner ${lib.escapeShellArg owner} \
+        --arg group ${lib.escapeShellArg group} '
         .schema == "nix-seal.activation.v1" and
         .targetId == "host.test" and
         .approvalThreshold == 1 and
         (.artifacts | length) == 1 and
         .artifacts[0].secretId == "db/password" and
-        .artifacts[0].owner == "root" and
-        .artifacts[0].group == "root" and
+        .artifacts[0].owner == $owner and
+        .artifacts[0].group == $group and
         .postSwitch.restartUnits == ["example.service"] and
         .postSwitch.manager == $manager
       ' ${spec} >/dev/null
+      ${lib.optionalString (credentialSpec != null) ''
+        jq -e '
+          .loadCredential == ["database-password:" + .expectedPath] and
+          (.privateMounts == null or .privateMounts == true)
+        ' ${credentialSpec} >/dev/null
+      ''}
       grep -F -- "--identity /run/keys/nix-seal-target" ${activationText} >/dev/null
       touch "$out"
     '';
   nixosActivation = pkgs.writeText "nix-seal-nixos-activation" nixos.config.system.activationScripts.nixSeal.text;
   homeActivation = pkgs.writeText "nix-seal-home-activation" home.config.home.activation.nixSeal.data;
+  nixosCredentialSpec = pkgs.writeText "nix-seal-nixos-credential.json" (
+    builtins.toJSON {
+      loadCredential = nixos.config.systemd.services.example.serviceConfig.LoadCredential;
+      privateMounts = nixos.config.systemd.services.example.serviceConfig.PrivateMounts;
+      expectedPath = "/run/nix-seal/current/db/password";
+    }
+  );
+  homeCredentialSpec = pkgs.writeText "nix-seal-home-credential.json" (
+    builtins.toJSON {
+      loadCredential = home.config.systemd.user.services.example.Service.LoadCredential;
+      privateMounts = null;
+      expectedPath = "%t/nix-seal/current/db/password";
+    }
+  );
+  hasFailedAssertion =
+    message: evaluated:
+    lib.any (
+      assertion: !assertion.assertion && assertion.message == message
+    ) evaluated.config.assertions;
 in
 {
   module-nixos =
-    checkDocument "nix-seal-module-nixos" "systemd-system" nixos.config.nixSeal.activationSpec
-      nixosActivation;
-  module-home-manager = checkDocument "nix-seal-module-home-manager" (
-    if pkgs.stdenv.hostPlatform.isLinux then "systemd-user" else "launchd-user"
-  ) home.config.nixSeal.activationSpec homeActivation;
+    checkDocument "nix-seal-module-nixos" "systemd-system" "root" "root"
+      nixos.config.nixSeal.activationSpec
+      nixosActivation
+      nixosCredentialSpec;
+  module-home-manager =
+    checkDocument "nix-seal-module-home-manager"
+      (if pkgs.stdenv.hostPlatform.isLinux then "systemd-user" else "launchd-user")
+      "test"
+      (if pkgs.stdenv.hostPlatform.isLinux then "test" else "staff")
+      home.config.nixSeal.activationSpec
+      homeActivation
+      (if pkgs.stdenv.hostPlatform.isLinux then homeCredentialSpec else null);
+  module-credential-policy =
+    assert hasFailedAssertion
+      "a systemd service credential name may be mapped by only one nixSeal secret"
+      credentialCollision;
+    assert hasFailedAssertion
+      "systemd service example.service has a LoadCredential name that conflicts with nixSeal"
+      credentialCollision;
+    pkgs.runCommand "nix-seal-module-credential-policy" { } ''
+      touch "$out"
+    '';
 }
+// lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
+  let
+    homeExternalCollision = inputs.home-manager.lib.homeManagerConfiguration {
+      inherit pkgs;
+      modules = [
+        self.homeManagerModules.default
+        common
+        credentialMapping
+        {
+          home = {
+            username = "test";
+            homeDirectory = "/home/test";
+            stateVersion = "26.05";
+          };
+          systemd.user.services.example.Service.LoadCredential = [
+            "database-password:/run/conflicting-source"
+          ];
+        }
+      ];
+    };
+  in
+  {
+    module-home-credential-policy =
+      assert !(builtins.tryEval homeExternalCollision.activationPackage).success;
+      pkgs.runCommand "nix-seal-module-home-credential-policy" { } ''
+        touch "$out"
+      '';
+  }
+)
 // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin (
   let
     darwin = inputs.nix-darwin.lib.darwinSystem {
       modules = [
         self.darwinModules.default
         common
+        explicitRestart
         {
           nixpkgs.hostPlatform = system;
           system.stateVersion = 6;
@@ -87,10 +198,44 @@ in
       ];
     };
     darwinActivation = pkgs.writeText "nix-seal-darwin-activation" darwin.config.system.activationScripts.postActivation.text;
+    darwinUnsupported = inputs.nix-darwin.lib.darwinSystem {
+      modules = [
+        self.darwinModules.default
+        common
+        credentialMapping
+        {
+          nixpkgs.hostPlatform = system;
+          system.stateVersion = 6;
+        }
+      ];
+    };
+    homeUnsupported = inputs.home-manager.lib.homeManagerConfiguration {
+      inherit pkgs;
+      modules = [
+        self.homeManagerModules.default
+        common
+        credentialMapping
+        {
+          home = {
+            username = "test";
+            homeDirectory = "/Users/test";
+            stateVersion = "26.05";
+          };
+        }
+      ];
+    };
   in
   {
     module-darwin =
-      checkDocument "nix-seal-module-darwin" "launchd-system" darwin.config.nixSeal.activationSpec
-        darwinActivation;
+      checkDocument "nix-seal-module-darwin" "launchd-system" "root" "root"
+        darwin.config.nixSeal.activationSpec
+        darwinActivation
+        null;
+    module-darwin-credential-policy =
+      assert hasFailedAssertion "nixSeal serviceCredentials require a systemd platform" darwinUnsupported;
+      assert !(builtins.tryEval homeUnsupported.activationPackage).success;
+      pkgs.runCommand "nix-seal-module-darwin-credential-policy" { } ''
+        touch "$out"
+      '';
   }
 )

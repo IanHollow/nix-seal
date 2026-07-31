@@ -48,3 +48,15 @@ remains held through the switch, action execution, and marker update so
 concurrent activations cannot lose or duplicate the pending state. Removing
 actions from a later plan clears a matching or stale marker without executing
 it.
+
+On systemd platforms, a secret may map its runtime path to one or more explicit
+`(service unit, credential name)` pairs. The modules emit only
+`LoadCredential=name:runtime-path`; plaintext remains outside the unit and Nix
+store. A credential mapping automatically adds its service to the post-switch
+restart set because systemd credentials are immutable for the lifetime of one
+service activation. Duplicate names within a service are rejected across the
+entire nix-seal configuration. System-service mappings on NixOS default to
+`PrivateMounts=true`, following systemd's recommendation that credential users
+receive a private mount namespace. Linux Home Manager uses the corresponding
+user-service setting. Darwin and macOS Home Manager reject credential mappings
+because launchd has no equivalent contract.

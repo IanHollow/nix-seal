@@ -3,6 +3,9 @@
   runtimeDirectory,
   serviceManager,
   serviceExecutable,
+  supportsServiceCredentials,
+  serviceCredentialConfig,
+  homeManagerRuntimeIdentity,
 }:
 {
   lib,
@@ -15,12 +18,29 @@ let
   cfg = config.nixSeal;
   digestType = types.strMatching "[0-9a-f]{64}";
   unitType = types.strMatching "[A-Za-z0-9_.@:-]{1,256}";
+  serviceUnitType = types.strMatching "[A-Za-z0-9_.@:-]{1,247}\\.service";
+  credentialNameType = types.addCheck (types.strMatching "[A-Za-z0-9_.@-]{1,255}") (
+    name: name != "." && name != ".."
+  );
   configuredSecrets = lib.filterAttrs (_: secret: secret.ciphertext != null) cfg.secrets;
-  reloadUnits = lib.unique (
+  explicitReloadUnits = lib.unique (
     lib.concatMap (secret: secret.reloadUnits) (builtins.attrValues configuredSecrets)
   );
-  restartUnits = lib.unique (
+  explicitRestartUnits = lib.unique (
     lib.concatMap (secret: secret.restartUnits) (builtins.attrValues configuredSecrets)
+  );
+  serviceCredentialBindings = lib.concatMap (
+    secretId:
+    map (credential: {
+      inherit secretId;
+      inherit (credential) unit name;
+      path = cfg.secrets.${secretId}.path;
+    }) cfg.secrets.${secretId}.serviceCredentials
+  ) (builtins.attrNames configuredSecrets);
+  serviceCredentialKeys = map (binding: "${binding.unit}:${binding.name}") serviceCredentialBindings;
+  reloadUnits = explicitReloadUnits;
+  restartUnits = lib.unique (
+    explicitRestartUnits ++ map (binding: binding.unit) serviceCredentialBindings
   );
   activationDocument = {
     schema = "nix-seal.activation.v1";
@@ -58,8 +78,8 @@ in
     enable = lib.mkEnableOption "nix-seal pre-release integration";
     package = mkOption {
       type = types.package;
-      default = self.packages.${pkgs.system}.nix-seal;
-      defaultText = lib.literalExpression "nix-seal.packages.\${pkgs.system}.nix-seal";
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.nix-seal;
+      defaultText = lib.literalExpression "nix-seal.packages.\${pkgs.stdenv.hostPlatform.system}.nix-seal";
       description = "nix-seal package used by activation tooling.";
     };
     targetId = mkOption {
@@ -121,11 +141,17 @@ in
               };
               owner = mkOption {
                 type = types.str;
-                default = "root";
+                default = if homeManagerRuntimeIdentity then config.home.username else "root";
+                description = "Existing runtime account that owns the activated file.";
               };
               group = mkOption {
                 type = types.str;
-                default = "root";
+                default =
+                  if homeManagerRuntimeIdentity then
+                    (if pkgs.stdenv.hostPlatform.isDarwin then "staff" else config.home.username)
+                  else
+                    "root";
+                description = "Existing runtime group that owns the activated file.";
               };
               mode = mkOption {
                 type = types.strMatching "0[0-7]{3}";
@@ -159,6 +185,28 @@ in
                 type = types.listOf unitType;
                 default = [ ];
               };
+              serviceCredentials = mkOption {
+                type = types.listOf (
+                  types.submodule {
+                    options = {
+                      unit = mkOption {
+                        type = serviceUnitType;
+                        description = "Systemd service that receives this secret as a credential.";
+                      };
+                      name = mkOption {
+                        type = credentialNameType;
+                        description = "Filename exposed below the service's CREDENTIALS_DIRECTORY.";
+                      };
+                    };
+                  }
+                );
+                default = [ ];
+                description = ''
+                  Per-service systemd credential mappings. Each mapping loads the
+                  activated runtime file and automatically schedules a service
+                  restart when the secret generation changes.
+                '';
+              };
             };
           }
         )
@@ -188,50 +236,64 @@ in
     };
   };
 
-  config = mkIf cfg.enable {
-    assertions = [
+  config = mkIf cfg.enable (
+    lib.mkMerge [
       {
-        assertion = builtins.match "[a-z0-9._-]+(/[a-z0-9._-]+)*" cfg.targetId != null;
-        message = "nixSeal.targetId must be a lowercase stable ID";
+        assertions = [
+          {
+            assertion = builtins.match "[a-z0-9._-]+(/[a-z0-9._-]+)*" cfg.targetId != null;
+            message = "nixSeal.targetId must be a lowercase stable ID";
+          }
+          {
+            assertion = cfg.identityFile != null;
+            message = "nixSeal.identityFile must name an out-of-store target identity when nix-seal is enabled";
+          }
+          {
+            assertion = cfg.planHash != null && cfg.recipientFingerprint != null;
+            message = "nixSeal.planHash and recipientFingerprint must be explicitly configured";
+          }
+          {
+            assertion = cfg.trustedKeys != [ ] && cfg.approvalThreshold <= builtins.length cfg.trustedKeys;
+            message = "nixSeal approvalThreshold must be satisfied by configured trustedKeys";
+          }
+          {
+            assertion = configuredSecrets != { };
+            message = "nixSeal requires at least one configured target ciphertext artifact";
+          }
+          {
+            assertion = lib.all (secret: secret.envelope != null && secret.sourceCiphertextHash != null) (
+              builtins.attrValues configuredSecrets
+            );
+            message = "every nixSeal ciphertext requires an envelope and sourceCiphertextHash";
+          }
+          {
+            assertion =
+              builtins.length (builtins.attrNames configuredSecrets)
+              == builtins.length (builtins.attrNames cfg.secrets);
+            message = "every declared nixSeal secret requires a target ciphertext";
+          }
+          {
+            assertion =
+              serviceManager != "launchd-system" && serviceManager != "launchd-user" || reloadUnits == [ ];
+            message = "nixSeal reloadUnits are unsupported by launchd; use restartUnits";
+          }
+          {
+            assertion = lib.intersectLists reloadUnits restartUnits == [ ];
+            message = "a nixSeal unit cannot appear in both reloadUnits and restartUnits";
+          }
+          {
+            assertion = supportsServiceCredentials || serviceCredentialBindings == [ ];
+            message = "nixSeal serviceCredentials require a systemd platform";
+          }
+          {
+            assertion =
+              builtins.length serviceCredentialKeys == builtins.length (lib.unique serviceCredentialKeys);
+            message = "a systemd service credential name may be mapped by only one nixSeal secret";
+          }
+        ];
+        warnings = [ "nix-seal is pre-1.0 and has not passed its required external security audit" ];
       }
-      {
-        assertion = cfg.identityFile != null;
-        message = "nixSeal.identityFile must name an out-of-store target identity when nix-seal is enabled";
-      }
-      {
-        assertion = cfg.planHash != null && cfg.recipientFingerprint != null;
-        message = "nixSeal.planHash and recipientFingerprint must be explicitly configured";
-      }
-      {
-        assertion = cfg.trustedKeys != [ ] && cfg.approvalThreshold <= builtins.length cfg.trustedKeys;
-        message = "nixSeal approvalThreshold must be satisfied by configured trustedKeys";
-      }
-      {
-        assertion = configuredSecrets != { };
-        message = "nixSeal requires at least one configured target ciphertext artifact";
-      }
-      {
-        assertion = lib.all (secret: secret.envelope != null && secret.sourceCiphertextHash != null) (
-          builtins.attrValues configuredSecrets
-        );
-        message = "every nixSeal ciphertext requires an envelope and sourceCiphertextHash";
-      }
-      {
-        assertion =
-          builtins.length (builtins.attrNames configuredSecrets)
-          == builtins.length (builtins.attrNames cfg.secrets);
-        message = "every declared nixSeal secret requires a target ciphertext";
-      }
-      {
-        assertion =
-          serviceManager != "launchd-system" && serviceManager != "launchd-user" || reloadUnits == [ ];
-        message = "nixSeal reloadUnits are unsupported by launchd; use restartUnits";
-      }
-      {
-        assertion = lib.intersectLists reloadUnits restartUnits == [ ];
-        message = "a nixSeal unit cannot appear in both reloadUnits and restartUnits";
-      }
-    ];
-    warnings = [ "nix-seal is pre-1.0 and has not passed its required external security audit" ];
-  };
+      (serviceCredentialConfig serviceCredentialBindings)
+    ]
+  );
 }

@@ -5,6 +5,16 @@ self:
   pkgs,
   ...
 }:
+let
+  credentialId = value: builtins.head (lib.splitString ":" (toString value));
+  groupCredentials = lib.foldl' (
+    grouped: binding:
+    let
+      unit = lib.removeSuffix ".service" binding.unit;
+    in
+    grouped // { ${unit} = (grouped.${unit} or [ ]) ++ [ "${binding.name}:${binding.path}" ]; }
+  ) { };
+in
 {
   imports = [
     ((import ./shared.nix) {
@@ -13,9 +23,35 @@ self:
       serviceManager = if pkgs.stdenv.hostPlatform.isLinux then "systemd-user" else "launchd-user";
       serviceExecutable =
         if pkgs.stdenv.hostPlatform.isLinux then "${pkgs.systemd}/bin/systemctl" else "/bin/launchctl";
+      supportsServiceCredentials = true;
+      homeManagerRuntimeIdentity = true;
+      serviceCredentialConfig = bindings: {
+        systemd.user.services = lib.mapAttrs (_: credentials: {
+          Service.LoadCredential = lib.mkAfter credentials;
+        }) (groupCredentials bindings);
+        assertions = lib.mapAttrsToList (unit: credentials: {
+          assertion =
+            let
+              expectedNames = map credentialId credentials;
+              configuredNames = map credentialId (
+                lib.toList config.systemd.user.services.${unit}.Service.LoadCredential
+              );
+            in
+            lib.all (name: lib.count (configured: configured == name) configuredNames == 1) expectedNames;
+          message = "systemd user service ${unit}.service has a LoadCredential name that conflicts with nixSeal";
+        }) (groupCredentials bindings);
+      };
     })
   ];
   config = lib.mkIf config.nixSeal.enable {
+    assertions = [
+      {
+        assertion =
+          pkgs.stdenv.hostPlatform.isLinux
+          || lib.all (secret: secret.serviceCredentials == [ ]) (builtins.attrValues config.nixSeal.secrets);
+        message = "Home Manager nixSeal serviceCredentials require Linux systemd user services";
+      }
+    ];
     home.activation.nixSeal = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
       if [ -z "''${XDG_RUNTIME_DIR:-}" ]; then
         echo "nix-seal: XDG_RUNTIME_DIR is required for Home Manager activation" >&2

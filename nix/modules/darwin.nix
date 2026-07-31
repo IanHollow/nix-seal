@@ -5,6 +5,9 @@ self: { config, lib, ... }: {
       runtimeDirectory = "/var/run/nix-seal";
       serviceManager = "launchd-system";
       serviceExecutable = "/bin/launchctl";
+      supportsServiceCredentials = false;
+      serviceCredentialConfig = _: { };
+      homeManagerRuntimeIdentity = false;
     })
   ];
   config = lib.mkIf config.nixSeal.enable {
