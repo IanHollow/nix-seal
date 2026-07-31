@@ -477,9 +477,17 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<(), std::io::Error> {
 #[cfg(unix)]
 fn set_file_mode(file: &File, mode: u32) -> Result<(), std::io::Error> {
     use rustix::fs::{Mode, fchmod};
-    let mode =
-        u16::try_from(mode).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    fchmod(file, Mode::from_raw_mode(mode)).map_err(Into::into)
+    let mut permissions = Mode::empty();
+    if mode & 0o400 != 0 {
+        permissions |= Mode::RUSR;
+    }
+    if mode & 0o200 != 0 {
+        permissions |= Mode::WUSR;
+    }
+    if mode & 0o100 != 0 {
+        permissions |= Mode::XUSR;
+    }
+    fchmod(file, permissions).map_err(Into::into)
 }
 
 #[cfg(not(unix))]
