@@ -187,8 +187,8 @@ separate storage and TTY hardening designs are complete.
 
 ## Migration inspection
 
-The first migration adapter is deliberately report-only. Export the existing
-public index and inspect the stable mapping before touching ciphertext:
+Migration begins with a deliberately non-destructive public inventory. Export
+the existing index and inspect the stable mapping before touching ciphertext:
 
 ```console
 nix eval --json .#secretIndex > /tmp/secretctl-index.json
@@ -219,6 +219,26 @@ reports require an explicit nix-seal target/recipient mapping before import. Use
 source ciphertext directly into replacement recipients, verifies the new
 ciphertext with the named identity, and atomically creates or replaces the
 destination. It never writes plaintext to the repository or Nix store.
+
+To produce a separate, reviewable `plan.v1.json` bridge from a `secretctl`
+index, provide every legacy target's Nix system and at least one independent
+approval signer. The candidate preserves the current direct-recipient model; it
+does not modify the old manager or any ciphertext.
+
+```console
+nix-seal migrate secretctl --index /tmp/secretctl-index.json \
+  --plan-output /tmp/nix-seal-plan.v1.json \
+  --target-system 'home:ianmh@desktop=x86_64-linux' \
+  --target-system 'host:nixos:desktop=x86_64-linux' \
+  --signer 'release=nix-seal-ed25519-v1:…'
+nix-seal check --nix-plan /tmp/nix-seal-plan.v1.json --deep --repository-root .
+```
+
+Candidate plans default each migrated secret to advanced `direct` delivery and
+root-only runtime permissions because those private runtime choices are absent
+from `secretIndex`. Review and replace those defaults, add lifecycle/template
+metadata, and migrate to administrator/recovery-backed `rekeyed` delivery before
+activation.
 
 ## Development
 

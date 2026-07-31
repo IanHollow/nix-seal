@@ -370,11 +370,20 @@ enum CacheCommand {
 
 #[derive(Subcommand)]
 enum MigrateCommand {
-    /// Inspect a public secretctl `secretIndex` JSON export without changing files.
+    /// Inspect a public secretctl `secretIndex` JSON export and optionally write a new candidate plan.
     Secretctl {
         /// `nix eval --json .#secretIndex` output saved to a public JSON file.
         #[arg(long)]
         index: PathBuf,
+        /// Write a new canonical public `plan.v1.json` candidate; refuses to overwrite.
+        #[arg(long)]
+        plan_output: Option<PathBuf>,
+        /// Required target-system mapping for a candidate plan as `LEGACY_TARGET=SYSTEM`.
+        #[arg(long = "target-system", value_name = "LEGACY_TARGET=SYSTEM")]
+        target_systems: Vec<String>,
+        /// Trusted approval signer for a candidate plan as `ID=PUBLIC_KEY`; repeat as needed.
+        #[arg(long = "signer", value_name = "ID=PUBLIC_KEY")]
+        signers: Vec<String>,
     },
     /// Inspect an agenix ciphertext tree without changing files or decrypting data.
     Agenix {
@@ -764,7 +773,18 @@ struct ValidatedSecretctlSecrets {
 
 fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
     match command {
-        MigrateCommand::Secretctl { index } => migrate_secretctl(&index, json),
+        MigrateCommand::Secretctl {
+            index,
+            plan_output,
+            target_systems,
+            signers,
+        } => migrate_secretctl(
+            &index,
+            plan_output.as_deref(),
+            &target_systems,
+            &signers,
+            json,
+        ),
         MigrateCommand::Agenix { directory } => migrate_agenix_tree(&directory, "agenix", json),
         MigrateCommand::Ragenix { directory } => migrate_agenix_tree(&directory, "ragenix", json),
         MigrateCommand::Ciphertext {
@@ -967,15 +987,37 @@ fn scan_agenix_ciphertexts(root: &Path, directory: &Path, output: &mut Vec<PathB
     Ok(())
 }
 
-fn migrate_secretctl(index_path: &Path, json: bool) -> Result<()> {
+fn migrate_secretctl(
+    index_path: &Path,
+    plan_output: Option<&Path>,
+    target_systems: &[String],
+    signers: &[String],
+    json: bool,
+) -> Result<()> {
     let index: SecretctlIndexV1 =
         read_json_bounded(index_path).context("invalid strict secretctl secretIndex JSON")?;
     let report = build_secretctl_migration_report(&index)?;
-    let warnings = vec![
+    let candidate_plan = if let Some(output) = plan_output {
+        let plan = build_secretctl_candidate_plan(&index, target_systems, signers)?;
+        let canonical = nix_seal_policy::canonical_json(&plan)?;
+        emit_canonical_public_json(Some(output), &canonical)?;
+        Some(output)
+    } else {
+        if !target_systems.is_empty() || !signers.is_empty() {
+            bail!("--target-system and --signer require --plan-output");
+        }
+        None
+    };
+    let mut warnings = vec![
         "dry run only: no ciphertext, configuration, or source manager was changed".to_owned(),
         "secretctl uses SSH recipients; native age is preferred, while unencrypted OpenSSH identities are available only for reviewed migration compatibility".to_owned(),
         "the reported legacy group memberships and direct-recipient sets were cross-checked; review normalized IDs and scope selectors before generating a nix-seal plan".to_owned(),
     ];
+    if candidate_plan.is_some() {
+        warnings.push(
+            "candidate plans retain legacy direct delivery and use default root-only runtime settings; review runtime ownership, phases, templates, lifecycle metadata, and a rekeyed administrator/recovery policy before activation".to_owned(),
+        );
+    }
     if json {
         println!(
             "{}",
@@ -987,6 +1029,7 @@ fn migrate_secretctl(index_path: &Path, json: bool) -> Result<()> {
                 "secrets":report.secrets,
                 "targets":report.targets,
                 "sshRecipientCount":report.ssh_recipient_count,
+                "candidatePlan":candidate_plan,
                 "warnings":warnings
             })
         );
@@ -1000,6 +1043,12 @@ fn migrate_secretctl(index_path: &Path, json: bool) -> Result<()> {
         );
         for warning in warnings {
             eprintln!("warning: {warning}");
+        }
+        if let Some(path) = candidate_plan {
+            eprintln!(
+                "candidate plan written to {}; review before activation",
+                path.display()
+            );
         }
         for mapping in report.secrets {
             println!(
@@ -1037,6 +1086,193 @@ fn build_secretctl_migration_report(index: &SecretctlIndexV1) -> Result<Secretct
         targets: targets.mappings,
         ssh_recipient_count: ssh_recipients.len(),
     })
+}
+
+fn build_secretctl_candidate_plan(
+    index: &SecretctlIndexV1,
+    target_system_specs: &[String],
+    signer_specs: &[String],
+) -> Result<nix_seal_core::PlanV1> {
+    let _ = build_secretctl_migration_report(index)?;
+    let systems = parse_target_systems(target_system_specs, &index.targets)?;
+    let signers = parse_candidate_signers(signer_specs)?;
+    let mut plan = nix_seal_core::PlanV1::default();
+    plan.identities.extend(signers);
+
+    let mut target_ids = BTreeMap::new();
+    let mut seen_target_recipients = BTreeSet::new();
+    for (legacy_id, target) in &index.targets {
+        let target_id = migration_prefixed_id("target", legacy_id)?;
+        let identity_id = migration_prefixed_id("target-key", legacy_id)?;
+        let public = normalize_secretctl_recipient(
+            &target.public_key,
+            &format!("secretctl target {legacy_id}"),
+        )?;
+        if !seen_target_recipients.insert(public.clone()) {
+            bail!("secretctl candidate cannot represent duplicate target recipient keys");
+        }
+        let kind = candidate_target_kind(legacy_id, &target.target_type)?;
+        let username = candidate_target_username(legacy_id, &target.target_type)?;
+        plan.identities.insert(
+            identity_id.clone(),
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Target,
+                public,
+            },
+        );
+        plan.targets.insert(
+            target_id.clone(),
+            nix_seal_core::Target {
+                kind,
+                system: systems
+                    .get(legacy_id)
+                    .cloned()
+                    .with_context(|| format!("missing target-system mapping for {legacy_id}"))?,
+                identity: identity_id,
+                username,
+                tags: Vec::new(),
+            },
+        );
+        target_ids.insert(legacy_id.as_str(), target_id);
+    }
+
+    for legacy_group in index.groups.keys() {
+        let members = index
+            .targets
+            .iter()
+            .filter_map(|(legacy_target, target)| {
+                target
+                    .groups
+                    .iter()
+                    .any(|group| group == legacy_group)
+                    .then(|| target_ids.get(legacy_target.as_str()).cloned())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            bail!("secretctl candidate group {legacy_group} has no target members");
+        }
+        plan.groups.insert(
+            migration_prefixed_id("legacy-group", legacy_group)?,
+            nix_seal_core::Group { members },
+        );
+    }
+
+    for (legacy_id, secret) in &index.secrets {
+        let consumers = secret
+            .consumers
+            .iter()
+            .map(|consumer| {
+                target_ids.get(consumer.as_str()).cloned().with_context(|| {
+                    format!("secretctl secret {legacy_id} references missing target {consumer}")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        plan.secrets.insert(
+            migrated_id(legacy_id)?,
+            nix_seal_core::Secret {
+                source: secret.file.clone(),
+                delivery: nix_seal_core::DeliveryMode::Direct,
+                administrators: Vec::new(),
+                consumers,
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: None,
+            },
+        );
+    }
+    nix_seal_policy::validate(&plan)?;
+    Ok(plan)
+}
+
+fn parse_target_systems(
+    specs: &[String],
+    targets: &BTreeMap<String, SecretctlTargetV1>,
+) -> Result<BTreeMap<String, String>> {
+    if specs.len() != targets.len() {
+        bail!("candidate plan requires exactly one --target-system for every legacy target");
+    }
+    let mut systems = BTreeMap::new();
+    for spec in specs {
+        let (target, system) = spec
+            .split_once('=')
+            .context("target-system must use LEGACY_TARGET=SYSTEM")?;
+        if !targets.contains_key(target)
+            || !matches!(
+                system,
+                "x86_64-linux" | "aarch64-linux" | "x86_64-darwin" | "aarch64-darwin"
+            )
+            || systems
+                .insert(target.to_owned(), system.to_owned())
+                .is_some()
+        {
+            bail!(
+                "candidate target-system mappings must be unique supported systems for known legacy targets"
+            );
+        }
+    }
+    Ok(systems)
+}
+
+fn parse_candidate_signers(
+    specs: &[String],
+) -> Result<BTreeMap<nix_seal_core::Id, nix_seal_core::Identity>> {
+    if specs.is_empty() || specs.len() > 256 {
+        bail!("candidate plan requires one or more distinct --signer ID=PUBLIC_KEY mappings");
+    }
+    let mut trusted = nix_seal_manifest::TrustedKeys::new();
+    let mut signers = BTreeMap::new();
+    for spec in specs {
+        let (id, public) = spec
+            .split_once('=')
+            .context("signer must use ID=PUBLIC_KEY")?;
+        let id = nix_seal_core::Id::parse(id).context("candidate signer ID is invalid")?;
+        trusted
+            .insert_encoded(public)
+            .context("candidate signer public key is invalid or duplicated")?;
+        if signers
+            .insert(
+                id,
+                nix_seal_core::Identity {
+                    kind: nix_seal_core::IdentityKind::Signer,
+                    public: public.to_owned(),
+                },
+            )
+            .is_some()
+        {
+            bail!("candidate signer IDs must be distinct");
+        }
+    }
+    Ok(signers)
+}
+
+fn migration_prefixed_id(prefix: &str, legacy_id: &str) -> Result<nix_seal_core::Id> {
+    nix_seal_core::Id::parse(format!("{prefix}/{}", migrated_id(legacy_id)?))
+        .context("legacy migration ID is invalid")
+}
+
+fn candidate_target_kind(legacy_id: &str, target_type: &str) -> Result<nix_seal_core::TargetKind> {
+    match (target_type, legacy_id) {
+        ("home", value) if value.starts_with("home:") => Ok(nix_seal_core::TargetKind::HomeManager),
+        ("host", value) if value.starts_with("host:nixos:") => Ok(nix_seal_core::TargetKind::NixOs),
+        ("host", value) if value.starts_with("host:darwin:") => {
+            Ok(nix_seal_core::TargetKind::Darwin)
+        }
+        _ => bail!("secretctl candidate cannot infer nix target kind for {legacy_id}"),
+    }
+}
+
+fn candidate_target_username(legacy_id: &str, target_type: &str) -> Result<Option<String>> {
+    if target_type != "home" {
+        return Ok(None);
+    }
+    let value = legacy_id
+        .strip_prefix("home:")
+        .and_then(|value| value.split_once('@').map(|(username, _)| username))
+        .filter(|username| !username.is_empty())
+        .context("secretctl home target must use home:USERNAME@CONFIG naming")?;
+    Ok(Some(value.to_owned()))
 }
 
 fn validate_secretctl_groups(
@@ -3341,6 +3577,30 @@ mod tests {
         assert_eq!(report.targets.len(), 2);
         assert_eq!(report.secrets.len(), 1);
         assert_eq!(report.ssh_recipient_count, 2);
+        let signer = nix_seal_manifest::ApprovalSigningKey::generate()?;
+        let plan = build_secretctl_candidate_plan(
+            &index,
+            &[
+                "home:ianmh@desktop=x86_64-linux".to_owned(),
+                "host:nixos:desktop=x86_64-linux".to_owned(),
+            ],
+            &[format!("release={}", signer.encode_public())],
+        )?;
+        assert_eq!(plan.targets.len(), 2);
+        assert_eq!(plan.groups.len(), 1);
+        assert!(matches!(
+            plan.secrets[&nix_seal_core::Id::parse("operators.home.ianmh.token")?].delivery,
+            nix_seal_core::DeliveryMode::Direct
+        ));
+        assert_eq!(
+            nix_seal_policy::secret_recipients(
+                &plan,
+                &nix_seal_core::Id::parse("operators.home.ianmh.token")?
+            )?
+            .recipients
+            .len(),
+            1
+        );
 
         index
             .targets

@@ -11,7 +11,9 @@ explicit `migrate ciphertext --execute` path that streams a reviewed source
 ciphertext through replacement recipients without materializing plaintext. The
 `secretctl` adapter validates group membership, target recipient expansion, and
 every secret's direct recipient set against its declared consumers before it
-emits a mapping report.
+emits a mapping report. With explicit target-system and approval-signer mappings
+it may also write a separate valid direct-delivery candidate plan; it never
+mutates the legacy configuration or ciphertext.
 
 Adapters for agenix-rekey metadata, SOPS/sops-nix, and Clan Vars/Facts remain
 planned. Their format-specific policy mapping must be reviewed before any
