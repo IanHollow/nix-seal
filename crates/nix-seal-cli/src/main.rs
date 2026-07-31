@@ -790,6 +790,11 @@ fn migrate_ciphertext(
 }
 
 fn migrate_agenix_tree(directory: &Path, source: &str, json: bool) -> Result<()> {
+    let supplied_metadata = fs::symlink_metadata(directory)
+        .with_context(|| format!("could not inspect {source} ciphertext directory"))?;
+    if supplied_metadata.file_type().is_symlink() || !supplied_metadata.file_type().is_dir() {
+        bail!("{source} ciphertext root must be a non-symlink directory");
+    }
     let root = directory
         .canonicalize()
         .with_context(|| format!("could not resolve {source} ciphertext directory"))?;
@@ -2994,6 +2999,18 @@ mod tests {
             migrated_id("agenix/nested/token")?.as_str(),
             "agenix/nested/token"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agenix_migration_refuses_a_symlinked_root() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let linked = temporary.path().join("secrets");
+        symlink(outside.path(), &linked)?;
+        assert!(migrate_agenix_tree(&linked, "agenix", false).is_err());
         Ok(())
     }
 
