@@ -50,6 +50,9 @@ enum Command {
     Artifact(ArtifactCommand),
     /// Explicitly create or verify a target-encrypted cache artifact.
     Rekey(RekeyArgs),
+    /// Internal authenticated runtime activation entrypoint.
+    #[command(hide = true)]
+    Activate(ActivateArgs),
     /// Secret authoring operations.
     #[command(subcommand)]
     Secret(SecretCommand),
@@ -167,6 +170,19 @@ struct RekeyArgs {
     cache_root: Option<PathBuf>,
 }
 
+#[derive(Args)]
+struct ActivateArgs {
+    /// Strict public activation specification; safe for the Nix store.
+    #[arg(long)]
+    spec: PathBuf,
+    /// Target age identity path; must remain outside the Nix store.
+    #[arg(long)]
+    identity: PathBuf,
+    /// Override the public runtime root, primarily for Home Manager runtime directories.
+    #[arg(long)]
+    runtime_root: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 enum SecretCommand {
     /// Encrypt stdin to a new standard age file.
@@ -256,6 +272,7 @@ fn run() -> Result<()> {
         Command::Key(command) => run_key(command, cli.json)?,
         Command::Artifact(command) => run_artifact(command, cli.json)?,
         Command::Rekey(arguments) => run_rekey(arguments, cli.json)?,
+        Command::Activate(arguments) => run_activate(&arguments, cli.json)?,
         Command::Secret(command) => run_secret(command)?,
         Command::Schema => println!("{}", nix_seal_policy::json_schema()?),
         Command::Completions { shell } => completions(shell),
@@ -477,6 +494,71 @@ fn run_rekey(arguments: RekeyArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
+    let mut spec: nix_seal_runtime::ActivationSpecV1 = read_json_bounded(&arguments.spec)?;
+    if let Some(runtime_root) = &arguments.runtime_root {
+        spec.runtime_root.clone_from(runtime_root);
+    }
+    spec.validate()?;
+    let identity = read_identity(&arguments.identity)?;
+    let mut trusted = nix_seal_manifest::TrustedKeys::new();
+    for key in &spec.trusted_keys {
+        trusted.insert_encoded(key)?;
+    }
+    let artifacts = spec
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            Ok(nix_seal_runtime::ActivationArtifact {
+                ciphertext: &artifact.ciphertext,
+                envelope: &artifact.envelope,
+                secret_id: &artifact.secret_id,
+                source_ciphertext_hash: &artifact.source_ciphertext_hash,
+                artifact_generation: artifact.artifact_generation,
+                mode: artifact.parsed_mode()?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    let request = nix_seal_runtime::ActivationRequest {
+        runtime_root: &spec.runtime_root,
+        runtime_generation: spec.runtime_generation,
+        plan_hash: &spec.plan_hash,
+        target_id: &spec.target_id,
+        recipient_fingerprint: &spec.recipient_fingerprint,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        now,
+        allowed_clock_skew: spec.allowed_clock_skew,
+        trusted_keys: &trusted,
+        approval_threshold: spec.approval_threshold,
+        target_identity: &identity,
+        artifacts: &artifacts,
+    };
+    let result = nix_seal_runtime::activate(&request)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.output.v1",
+                "activated":true,
+                "target":spec.target_id,
+                "generationPath":result.generation_path,
+                "secretCount":result.secret_count
+            })
+        );
+    } else {
+        println!("{}", result.generation_path.display());
+        eprintln!(
+            "activated {} secret(s) for {}",
+            result.secret_count, spec.target_id
+        );
+    }
+    Ok(())
+}
+
 fn artifact_written(path: &Path, signatures: usize, json: bool) {
     if json {
         println!(
@@ -561,7 +643,7 @@ fn run_secret(command: SecretCommand) -> Result<()> {
 
 fn read_identity(path: &Path) -> Result<SecretString> {
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?
+    open_private_identity(path)?
         .take(1024 * 1024 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > 1024 * 1024 {
@@ -570,6 +652,35 @@ fn read_identity(path: &Path) -> Result<SecretString> {
     Ok(SecretString::from(
         String::from_utf8(bytes).context("identity is not UTF-8")?,
     ))
+}
+
+#[cfg(unix)]
+fn open_private_identity(path: &Path) -> Result<std::fs::File> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+        || metadata.st_nlink != 1
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+        || metadata.st_mode & 0o077 != 0
+    {
+        bail!("private identity file has unsafe ownership, mode, or link metadata");
+    }
+    Ok(std::fs::File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn open_private_identity(path: &Path) -> Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        bail!("private identity file has unsafe link metadata");
+    }
+    Ok(std::fs::File::open(path)?)
 }
 
 fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -665,5 +776,91 @@ fn completions(shell: CompletionShell) {
             name,
             &mut std::io::stdout(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix_seal_manifest::{ARTIFACT_SCHEMA, TargetManifestV1};
+
+    #[test]
+    fn internal_activate_command_materializes_signed_spec() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = tempfile::tempdir()?;
+        let identity_path = temporary.path().join("target.identity");
+        let ciphertext_path = temporary.path().join("artifact.age");
+        let envelope_path = temporary.path().join("artifact.json");
+        let spec_path = temporary.path().join("activation.json");
+        let runtime_root = temporary.path().join("runtime");
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        write_new_private(&identity_path, identity.expose_secret().as_bytes())?;
+        let mut ciphertext = std::fs::File::create(&ciphertext_path)?;
+        nix_seal_crypto::encrypt(
+            b"cli-activation-canary".as_slice(),
+            &mut ciphertext,
+            std::slice::from_ref(&recipient),
+        )?;
+        ciphertext.sync_all()?;
+        let artifact_hash = blake3::hash(&std::fs::read(&ciphertext_path)?)
+            .to_hex()
+            .to_string();
+        let plan_hash = "0".repeat(64);
+        let source_hash = "1".repeat(64);
+        let target_id = nix_seal_core::Id::parse("host.test")?;
+        let secret_id = nix_seal_core::Id::parse("db/password")?;
+        let fingerprint = nix_seal_crypto::recipient_fingerprint(&recipient)?;
+        let signer = nix_seal_manifest::ApprovalSigningKey::generate()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let manifest = TargetManifestV1 {
+            schema: ARTIFACT_SCHEMA.to_owned(),
+            tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+            plan_hash: plan_hash.clone(),
+            source_ciphertext_hash: source_hash.clone(),
+            artifact_ciphertext_hash: artifact_hash,
+            target_id: target_id.clone(),
+            secret_id: secret_id.clone(),
+            recipient_fingerprint: fingerprint.clone(),
+            artifact_generation: 1,
+            issued_at: now.saturating_sub(1),
+            expires_at: now.checked_add(60),
+        };
+        write_new_json(
+            &envelope_path,
+            &nix_seal_manifest::sign_manifest(&manifest, &signer)?,
+        )?;
+        let spec = nix_seal_runtime::ActivationSpecV1 {
+            schema: nix_seal_runtime::ACTIVATION_SCHEMA.to_owned(),
+            runtime_root: runtime_root.clone(),
+            runtime_generation: None,
+            plan_hash,
+            target_id,
+            recipient_fingerprint: fingerprint,
+            allowed_clock_skew: 0,
+            approval_threshold: 1,
+            trusted_keys: vec![signer.encode_public()],
+            artifacts: vec![nix_seal_runtime::ActivationArtifactSpecV1 {
+                ciphertext: ciphertext_path,
+                envelope: envelope_path,
+                secret_id,
+                source_ciphertext_hash: source_hash,
+                artifact_generation: 1,
+                mode: "0400".to_owned(),
+            }],
+        };
+        write_new_json(&spec_path, &spec)?;
+        run_activate(
+            &ActivateArgs {
+                spec: spec_path,
+                identity: identity_path,
+                runtime_root: None,
+            },
+            false,
+        )?;
+        assert_eq!(
+            std::fs::read(runtime_root.join("current/db/password"))?,
+            b"cli-activation-canary"
+        );
+        Ok(())
     }
 }

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 clap_complete_nushell.workspace = true
@@ -21,9 +22,14 @@ nix-seal-crypto.workspace = true
 nix-seal-manifest.workspace = true
 nix-seal-policy.workspace = true
 nix-seal-rekey.workspace = true
+nix-seal-runtime.workspace = true
+rustix.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1101,6 +1101,7 @@ name = "nix-seal"
 version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "clap_complete",
  "clap_complete_nushell",
@@ -1110,9 +1111,12 @@ dependencies = [
  "nix-seal-manifest",
  "nix-seal-policy",
  "nix-seal-rekey",
+ "nix-seal-runtime",
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1200,6 +1204,7 @@ dependencies = [
  "nix-seal-manifest",
  "rustix",
  "secrecy",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",

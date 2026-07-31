@@ -16,3 +16,12 @@ serializes activation with a private no-follow lock. Each new generation is
 fsynced and published under an immutable name before an atomic `current` symlink
 switch. Authentication or decryption failure drops the transaction and leaves
 the previous generation active.
+
+Nix modules emit a strict `nix-seal.activation.v1` public document containing
+only ciphertext paths, signed-envelope paths, hashes, target bindings, public
+approval keys, and runtime policy. The target identity is configured as a string
+runtime path and is never coerced to a Nix path or copied into the store. The
+internal Rust `activate` command loads that identity with no-follow,
+single-link, owner, and restrictive-mode checks. Runtime generation numbers are
+allocated while the activation lock is held, avoiding collisions between
+concurrent or repeated activations.

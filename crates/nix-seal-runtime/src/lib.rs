@@ -5,7 +5,9 @@ use fs2::FileExt;
 use nix_seal_core::Id;
 use nix_seal_manifest::{ExpectedBinding, SignedEnvelopeV1, TrustedKeys};
 use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeSet,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -15,6 +17,102 @@ use thiserror::Error;
 
 const MAX_CIPHERTEXT_BYTES: u64 = 70 * 1024 * 1024;
 const MAX_ENVELOPE_BYTES: u64 = 2 * 1024 * 1024;
+/// Exact schema accepted for public activation metadata.
+pub const ACTIVATION_SCHEMA: &str = "nix-seal.activation.v1";
+
+/// Strict public activation document. It may enter the Nix store.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ActivationSpecV1 {
+    /// Must equal [`ACTIVATION_SCHEMA`].
+    pub schema: String,
+    /// Restrictive runtime root.
+    pub runtime_root: PathBuf,
+    /// Optional explicit runtime generation; omission safely allocates the next.
+    #[serde(default)]
+    pub runtime_generation: Option<u64>,
+    /// Exact compiled plan hash.
+    pub plan_hash: String,
+    /// Exact target binding.
+    pub target_id: Id,
+    /// Fingerprint of the target recipient corresponding to the private identity.
+    pub recipient_fingerprint: String,
+    /// Maximum accepted issue-time lead.
+    #[serde(default = "default_clock_skew")]
+    pub allowed_clock_skew: u64,
+    /// Required number of distinct trusted approvals.
+    pub approval_threshold: usize,
+    /// Encoded public approval keys.
+    pub trusted_keys: Vec<String>,
+    /// Complete all-or-nothing artifact batch.
+    pub artifacts: Vec<ActivationArtifactSpecV1>,
+}
+
+/// One public artifact entry in [`ActivationSpecV1`].
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ActivationArtifactSpecV1 {
+    /// Target-encrypted standard age file.
+    pub ciphertext: PathBuf,
+    /// Signed envelope file.
+    pub envelope: PathBuf,
+    /// Signed secret and runtime destination ID.
+    pub secret_id: Id,
+    /// Expected canonical source ciphertext hash.
+    pub source_ciphertext_hash: String,
+    /// Exact artifact generation.
+    pub artifact_generation: u64,
+    /// Restrictive octal mode such as `0400`.
+    pub mode: String,
+}
+
+impl ActivationArtifactSpecV1 {
+    /// Returns the validated numeric runtime mode.
+    pub fn parsed_mode(&self) -> Result<u32, RuntimeError> {
+        parse_mode(&self.mode)
+    }
+}
+
+const fn default_clock_skew() -> u64 {
+    300
+}
+
+impl ActivationSpecV1 {
+    /// Enforces structural and resource constraints before filesystem access.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if self.schema != ACTIVATION_SCHEMA
+            || !self.runtime_root.is_absolute()
+            || self.runtime_generation == Some(0)
+            || !is_digest(&self.plan_hash)
+            || !is_digest(&self.recipient_fingerprint)
+            || self.allowed_clock_skew > 86_400
+            || self.approval_threshold == 0
+            || self.approval_threshold > self.trusted_keys.len()
+            || self.trusted_keys.len() > 64
+            || self
+                .trusted_keys
+                .iter()
+                .any(|key| key.is_empty() || key.len() > 16 * 1024)
+            || self.artifacts.is_empty()
+            || self.artifacts.len() > 10_000
+        {
+            return Err(RuntimeError::InvalidSpec);
+        }
+        let mut ids = BTreeSet::new();
+        for artifact in &self.artifacts {
+            if !artifact.ciphertext.is_absolute()
+                || !artifact.envelope.is_absolute()
+                || !is_digest(&artifact.source_ciphertext_hash)
+                || artifact.artifact_generation == 0
+                || !ids.insert(&artifact.secret_id)
+                || parse_mode(&artifact.mode).is_err()
+            {
+                return Err(RuntimeError::InvalidSpec);
+            }
+        }
+        Ok(())
+    }
+}
 
 /// One public artifact and its exact locally expected policy bindings.
 pub struct ActivationArtifact<'a> {
@@ -37,7 +135,7 @@ pub struct ActivationRequest<'a> {
     /// Restrictive runtime root such as `/run/nix-seal`.
     pub runtime_root: &'a Path,
     /// Monotonic plaintext generation name.
-    pub runtime_generation: u64,
+    pub runtime_generation: Option<u64>,
     /// Exact local plan hash.
     pub plan_hash: &'a str,
     /// Exact local target ID.
@@ -87,6 +185,9 @@ pub enum RuntimeError {
     /// Public envelope JSON was malformed.
     #[error("artifact envelope is malformed")]
     Envelope,
+    /// Public activation metadata violated its strict schema or resource limits.
+    #[error("invalid activation specification")]
+    InvalidSpec,
     /// Artifact authentication failed before decryption.
     #[error(transparent)]
     Manifest(#[from] nix_seal_manifest::ManifestError),
@@ -110,7 +211,7 @@ struct PreparedArtifact<'a> {
 /// Authenticates every artifact before decrypting any, then atomically switches
 /// a complete runtime generation.
 pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, RuntimeError> {
-    if request.runtime_generation == 0 || request.artifacts.is_empty() {
+    if request.runtime_generation == Some(0) || request.artifacts.is_empty() {
         return Err(RuntimeError::InvalidDestination);
     }
     let mut prepared = Vec::with_capacity(request.artifacts.len());
@@ -159,7 +260,7 @@ pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, Run
         )?;
         destination.sync_all()?;
     }
-    let generation_path = generation.commit_and_switch(request.runtime_generation)?;
+    let generation_path = generation.commit_and_switch_optional(request.runtime_generation)?;
     Ok(ActivationResult {
         generation_path,
         secret_count: request.artifacts.len(),
@@ -237,9 +338,11 @@ impl Generation {
     /// Atomically publishes and switches the `current` symlink to this complete
     /// generation. Existing generations are never overwritten.
     pub fn commit_and_switch(self, generation: u64) -> Result<PathBuf, RuntimeError> {
-        if generation == 0 {
-            return Err(RuntimeError::InvalidDestination);
-        }
+        self.commit_and_switch_optional(Some(generation))
+    }
+
+    fn commit_and_switch_optional(self, generation: Option<u64>) -> Result<PathBuf, RuntimeError> {
+        let generation = generation.map_or_else(|| next_generation(&self.root), Ok)?;
         sync_tree(self.transaction.path())?;
         let destination = self.root.join(format!("generation-{generation}"));
         if std::fs::symlink_metadata(&destination).is_ok() {
@@ -255,6 +358,49 @@ impl Generation {
         }
         Ok(destination)
     }
+}
+
+fn next_generation(root: &Path) -> Result<u64, RuntimeError> {
+    let mut maximum = 0_u64;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix("generation-") else {
+            continue;
+        };
+        if !file_type.is_dir()
+            || suffix.is_empty()
+            || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(RuntimeError::InvalidDestination);
+        }
+        let value = suffix
+            .parse::<u64>()
+            .map_err(|_| RuntimeError::InvalidDestination)?;
+        maximum = maximum.max(value);
+    }
+    maximum
+        .checked_add(1)
+        .ok_or(RuntimeError::InvalidDestination)
+}
+
+fn parse_mode(value: &str) -> Result<u32, RuntimeError> {
+    if value.len() != 4 || !value.starts_with('0') {
+        return Err(RuntimeError::InvalidSpec);
+    }
+    let mode = u32::from_str_radix(value, 8).map_err(|_| RuntimeError::InvalidSpec)?;
+    validate_mode(mode)?;
+    Ok(mode)
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_mode(mode: u32) -> Result<(), RuntimeError> {
@@ -576,7 +722,7 @@ mod tests {
         };
         let request = ActivationRequest {
             runtime_root: &fixture.runtime,
-            runtime_generation: 1,
+            runtime_generation: None,
             plan_hash: PLAN_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
@@ -598,6 +744,58 @@ mod tests {
             std::fs::read_link(fixture.runtime.join("current"))?,
             Path::new("generation-1")
         );
+        let second = activate(&request)?;
+        assert_eq!(second.generation_path, fixture.runtime.join("generation-2"));
+        assert_eq!(
+            std::fs::read_link(fixture.runtime.join("current"))?,
+            Path::new("generation-2")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_spec_is_strict_and_rejects_duplicate_destinations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture()?;
+        let artifact = ActivationArtifactSpecV1 {
+            ciphertext: fixture.ciphertext.clone(),
+            envelope: fixture.envelope.clone(),
+            secret_id: fixture.secret_id.clone(),
+            source_ciphertext_hash: SOURCE_HASH.to_owned(),
+            artifact_generation: 1,
+            mode: "0400".to_owned(),
+        };
+        let spec = ActivationSpecV1 {
+            schema: ACTIVATION_SCHEMA.to_owned(),
+            runtime_root: fixture.runtime.clone(),
+            runtime_generation: None,
+            plan_hash: PLAN_HASH.to_owned(),
+            target_id: fixture.target_id,
+            recipient_fingerprint: fixture.fingerprint,
+            allowed_clock_skew: 300,
+            approval_threshold: 1,
+            trusted_keys: vec!["public-key-placeholder".to_owned()],
+            artifacts: vec![artifact.clone()],
+        };
+        spec.validate()?;
+        let mut duplicate = spec.clone();
+        duplicate.artifacts.push(artifact);
+        assert!(matches!(
+            duplicate.validate(),
+            Err(RuntimeError::InvalidSpec)
+        ));
+        let mut encoded = serde_json::to_value(&spec)?;
+        encoded
+            .as_object_mut()
+            .ok_or("spec was not an object")?
+            .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<ActivationSpecV1>(encoded).is_err());
+        let mut excessive_skew = spec;
+        excessive_skew.allowed_clock_skew = 86_401;
+        assert!(matches!(
+            excessive_skew.validate(),
+            Err(RuntimeError::InvalidSpec)
+        ));
         Ok(())
     }
 
@@ -620,7 +818,7 @@ mod tests {
         };
         let request = ActivationRequest {
             runtime_root: &fixture.runtime,
-            runtime_generation: 2,
+            runtime_generation: Some(2),
             plan_hash: PLAN_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
@@ -673,7 +871,7 @@ mod tests {
         let artifacts = [first, mismatched];
         let request = ActivationRequest {
             runtime_root: &fixture.runtime,
-            runtime_generation: 1,
+            runtime_generation: Some(1),
             plan_hash: PLAN_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
@@ -713,7 +911,7 @@ mod tests {
         };
         let request = ActivationRequest {
             runtime_root: &fixture.runtime,
-            runtime_generation: 2,
+            runtime_generation: Some(2),
             plan_hash: PLAN_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
@@ -755,7 +953,7 @@ mod tests {
         };
         let request = ActivationRequest {
             runtime_root: &fixture.runtime,
-            runtime_generation: 1,
+            runtime_generation: Some(1),
             plan_hash: PLAN_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,

@@ -85,9 +85,19 @@
           };
         }
       );
-      checks = eachSystem (system: {
-        inherit (inputs.self.packages.${system}) nix-seal;
-      });
+      checks = eachSystem (
+        system:
+        let
+          pkgs = inputs.nixpkgs.legacyPackages.${system};
+        in
+        {
+          inherit (inputs.self.packages.${system}) nix-seal;
+        }
+        // import ./nix/tests/module-evaluation.nix {
+          inherit inputs system pkgs;
+          self = inputs.self;
+        }
+      );
       nixosModules.default = import ./nix/modules/nixos.nix inputs.self;
       darwinModules.default = import ./nix/modules/darwin.nix inputs.self;
       homeManagerModules.default = import ./nix/modules/home-manager.nix inputs.self;
