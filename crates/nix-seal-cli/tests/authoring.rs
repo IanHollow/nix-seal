@@ -9,12 +9,106 @@ use secrecy::ExposeSecret;
 use std::{
     fs::File,
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 #[test]
 fn plan_directed_create_rotate_and_reveal() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture()?;
+    let root = &fixture.root;
+    let plan_path = &fixture.plan_path;
+    let identity_path = &fixture.identity_path;
+
+    let created = run_with_stdin(
+        root,
+        &[
+            "secret",
+            "create",
+            "--plan",
+            path_text(plan_path)?,
+            "--repository-root",
+            path_text(root)?,
+            "--secret",
+            "db/password",
+            "--identity",
+            path_text(identity_path)?,
+        ],
+        b"initial-value",
+    )?;
+    assert!(created.status.success());
+    assert!(
+        !created
+            .stdout
+            .windows(13)
+            .any(|window| window == b"initial-value")
+    );
+    let checked = run(
+        root,
+        &[
+            "check",
+            "--nix-plan",
+            path_text(plan_path)?,
+            "--deep",
+            "--repository-root",
+            path_text(root)?,
+        ],
+    )?;
+    assert!(checked.status.success());
+
+    let revealed = run(root, &reveal_args(plan_path, root, identity_path)?)?;
+    assert!(revealed.status.success());
+    assert_eq!(revealed.stdout, b"initial-value");
+
+    let rotated = run_with_stdin(
+        root,
+        &[
+            "rotate",
+            "--plan",
+            path_text(plan_path)?,
+            "--repository-root",
+            path_text(root)?,
+            "--secret",
+            "db/password",
+            "--identity",
+            path_text(identity_path)?,
+        ],
+        b"rotated-value",
+    )?;
+    assert!(rotated.status.success());
+    assert!(String::from_utf8(rotated.stderr)?.contains("record lifecycle.rotatedAt = "));
+    let revealed = run(root, &reveal_args(plan_path, root, identity_path)?)?;
+    assert_eq!(revealed.stdout, b"rotated-value");
+
+    let forbidden_json = run(
+        root,
+        &[
+            "--json",
+            "secret",
+            "reveal",
+            "--plan",
+            path_text(plan_path)?,
+            "--repository-root",
+            path_text(root)?,
+            "--secret",
+            "db/password",
+            "--identity",
+            path_text(identity_path)?,
+        ],
+    )?;
+    assert!(!forbidden_json.status.success());
+    assert!(forbidden_json.stdout.is_empty());
+    Ok(())
+}
+
+struct Fixture {
+    _temporary: tempfile::TempDir,
+    root: PathBuf,
+    plan_path: PathBuf,
+    identity_path: PathBuf,
+}
+
+fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().canonicalize()?;
     let plan_path = root.join("plan.v1.json");
@@ -52,89 +146,12 @@ fn plan_directed_create_rotate_and_reveal() -> Result<(), Box<dyn std::error::Er
     );
     nix_seal_policy::validate(&plan)?;
     std::fs::write(&plan_path, nix_seal_policy::canonical_json(&plan)?)?;
-
-    let created = run_with_stdin(
-        &root,
-        &[
-            "secret",
-            "create",
-            "--plan",
-            path_text(&plan_path)?,
-            "--repository-root",
-            path_text(&root)?,
-            "--secret",
-            "db/password",
-            "--identity",
-            path_text(&identity_path)?,
-        ],
-        b"initial-value",
-    )?;
-    assert!(created.status.success());
-    assert!(
-        !created
-            .stdout
-            .windows(13)
-            .any(|window| window == b"initial-value")
-    );
-    let checked = run(
-        &root,
-        &[
-            "check",
-            "--nix-plan",
-            path_text(&plan_path)?,
-            "--deep",
-            "--repository-root",
-            path_text(&root)?,
-        ],
-    )?;
-    assert!(checked.status.success());
-
-    let revealed = run(&root, &reveal_args(&plan_path, &root, &identity_path)?)?;
-    assert!(revealed.status.success());
-    assert_eq!(revealed.stdout, b"initial-value");
-
-    let rotated = run_with_stdin(
-        &root,
-        &[
-            "rotate",
-            "--plan",
-            path_text(&plan_path)?,
-            "--repository-root",
-            path_text(&root)?,
-            "--secret",
-            "db/password",
-            "--identity",
-            path_text(&identity_path)?,
-        ],
-        b"rotated-value",
-    )?;
-    assert!(rotated.status.success());
-    assert!(
-        String::from_utf8(rotated.stderr)?
-            .contains("record lifecycle.rotatedAt = ")
-    );
-    let revealed = run(&root, &reveal_args(&plan_path, &root, &identity_path)?)?;
-    assert_eq!(revealed.stdout, b"rotated-value");
-
-    let forbidden_json = run(
-        &root,
-        &[
-            "--json",
-            "secret",
-            "reveal",
-            "--plan",
-            path_text(&plan_path)?,
-            "--repository-root",
-            path_text(&root)?,
-            "--secret",
-            "db/password",
-            "--identity",
-            path_text(&identity_path)?,
-        ],
-    )?;
-    assert!(!forbidden_json.status.success());
-    assert!(forbidden_json.stdout.is_empty());
-    Ok(())
+    Ok(Fixture {
+        _temporary: temporary,
+        root,
+        plan_path,
+        identity_path,
+    })
 }
 
 fn reveal_args<'a>(

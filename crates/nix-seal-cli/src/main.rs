@@ -298,83 +298,19 @@ fn run() -> Result<()> {
             nix_plan,
             target,
             output,
-        } => {
-            let plan = load_plan(&toml, nix_plan.as_deref())?;
-            nix_seal_policy::validate(&plan)?;
-            let plan_hash = nix_seal_policy::plan_hash(&plan)?;
-            if let Some(target) = target {
-                let policy = nix_seal_policy::target_policy(&plan, &target)?;
-                let policy_hash = nix_seal_policy::target_policy_hash(&policy)?;
-                let canonical = nix_seal_policy::canonical_target_policy_json(&policy)?;
-                eprintln!("plan hash: {plan_hash}");
-                eprintln!("target policy hash: {policy_hash}");
-                if cli.json {
-                    if let Some(output) = output.as_deref() {
-                        emit_canonical_public_json(Some(output), &canonical)?;
-                    }
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "schema":"nix-seal.output.v1",
-                            "planHash":plan_hash,
-                            "targetPolicyHash":policy_hash,
-                            "target":target,
-                            "targetPolicy":(output.is_none()).then_some(&policy),
-                            "output":output
-                        })
-                    );
-                } else {
-                    emit_canonical_public_json(output.as_deref(), &canonical)?;
-                }
-            } else {
-                let canonical = nix_seal_policy::canonical_json(&plan)?;
-                eprintln!("plan hash: {plan_hash}");
-                if cli.json {
-                    if let Some(output) = output.as_deref() {
-                        emit_canonical_public_json(Some(output), &canonical)?;
-                    }
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "schema":"nix-seal.output.v1",
-                            "planHash":plan_hash,
-                            "plan":(output.is_none()).then_some(&plan),
-                            "output":output
-                        })
-                    );
-                } else {
-                    emit_canonical_public_json(output.as_deref(), &canonical)?;
-                }
-            }
-        }
+        } => run_plan(
+            &toml,
+            nix_plan.as_deref(),
+            target,
+            output.as_deref(),
+            cli.json,
+        )?,
         Command::Check {
             toml,
             nix_plan,
             deep,
             repository_root,
-        } => {
-            let plan = load_plan(&toml, nix_plan.as_deref())?;
-            nix_seal_policy::validate(&plan)?;
-            let hash = nix_seal_policy::plan_hash(&plan)?;
-            if deep {
-                deep_check_plan(&plan, &repository_root)?;
-            }
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"schema":"nix-seal.output.v1","ok":true,"deep":deep,"planHash":hash})
-                );
-            } else {
-                println!(
-                    "plan {hash} is valid{}",
-                    if deep {
-                        " (deep checks are incremental)"
-                    } else {
-                        ""
-                    }
-                );
-            }
-        }
+        } => run_check(&toml, nix_plan.as_deref(), deep, &repository_root, cli.json)?,
         Command::Key(command) => run_key(command, cli.json)?,
         Command::Artifact(command) => run_artifact(command, cli.json)?,
         Command::Rekey(arguments) => run_rekey(arguments, cli.json)?,
@@ -390,6 +326,94 @@ fn run() -> Result<()> {
         Command::Schema { kind } => run_schema(kind)?,
         Command::Completions { shell } => completions(shell),
         Command::Cache(CacheCommand::Status { root }) => cache_status(root, cli.json)?,
+    }
+    Ok(())
+}
+
+fn run_plan(
+    toml: &Path,
+    nix_plan: Option<&Path>,
+    target: Option<nix_seal_core::Id>,
+    output: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let plan = load_plan(toml, nix_plan)?;
+    nix_seal_policy::validate(&plan)?;
+    let plan_hash = nix_seal_policy::plan_hash(&plan)?;
+    if let Some(target) = target {
+        let policy = nix_seal_policy::target_policy(&plan, &target)?;
+        let policy_hash = nix_seal_policy::target_policy_hash(&policy)?;
+        let canonical = nix_seal_policy::canonical_target_policy_json(&policy)?;
+        eprintln!("plan hash: {plan_hash}");
+        eprintln!("target policy hash: {policy_hash}");
+        if json {
+            if let Some(output) = output {
+                emit_canonical_public_json(Some(output), &canonical)?;
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema":"nix-seal.output.v1",
+                    "planHash":plan_hash,
+                    "targetPolicyHash":policy_hash,
+                    "target":target,
+                    "targetPolicy":output.is_none().then_some(&policy),
+                    "output":output
+                })
+            );
+        } else {
+            emit_canonical_public_json(output, &canonical)?;
+        }
+    } else {
+        let canonical = nix_seal_policy::canonical_json(&plan)?;
+        eprintln!("plan hash: {plan_hash}");
+        if json {
+            if let Some(output) = output {
+                emit_canonical_public_json(Some(output), &canonical)?;
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema":"nix-seal.output.v1",
+                    "planHash":plan_hash,
+                    "plan":output.is_none().then_some(&plan),
+                    "output":output
+                })
+            );
+        } else {
+            emit_canonical_public_json(output, &canonical)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_check(
+    toml: &Path,
+    nix_plan: Option<&Path>,
+    deep: bool,
+    repository_root: &Path,
+    json: bool,
+) -> Result<()> {
+    let plan = load_plan(toml, nix_plan)?;
+    nix_seal_policy::validate(&plan)?;
+    let hash = nix_seal_policy::plan_hash(&plan)?;
+    if deep {
+        deep_check_plan(&plan, repository_root)?;
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"schema":"nix-seal.output.v1","ok":true,"deep":deep,"planHash":hash})
+        );
+    } else {
+        println!(
+            "plan {hash} is valid{}",
+            if deep {
+                " (deep checks are incremental)"
+            } else {
+                ""
+            }
+        );
     }
     Ok(())
 }
