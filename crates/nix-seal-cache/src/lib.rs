@@ -33,6 +33,12 @@ pub enum CacheError {
     /// The deterministic artifact address is already populated.
     #[error("ciphertext cache artifact already exists")]
     ArtifactExists,
+    /// An export directory must be created rather than overwritten.
+    #[error("ciphertext cache export destination already exists")]
+    DestinationExists,
+    /// An existing address has different verified ciphertext or public metadata.
+    #[error("ciphertext cache import conflicts with an existing entry")]
+    Conflict,
     /// A bundle entry is not a private regular file/directory.
     #[error("ciphertext cache artifact has unsafe filesystem metadata")]
     UnsafeMetadata,
@@ -193,6 +199,17 @@ pub struct GcReport {
     pub candidate_bytes: u64,
 }
 
+/// Public result of a ciphertext-only cache exchange operation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CacheTransferReport {
+    /// Generic ciphertext objects copied or verified.
+    pub object_count: u64,
+    /// Target artifact bundles copied or verified.
+    pub artifact_count: u64,
+    /// Total ciphertext and envelope bytes copied or verified.
+    pub bytes: u64,
+}
+
 /// Versioned ciphertext cache.
 pub struct Cache {
     root: PathBuf,
@@ -269,10 +286,67 @@ impl Cache {
         ciphertext: R,
         envelope: &[u8],
     ) -> Result<ArtifactRecord, CacheError> {
+        let key = address.key()?;
+        self.put_artifact_by_key(key, ciphertext, envelope)
+    }
+
+    /// Exports a verified ciphertext-only cache snapshot to a new directory.
+    ///
+    /// The destination is atomically published only after every source entry
+    /// has been copied and revalidated. It contains no private identities or
+    /// plaintext, and deliberately omits lock and transaction files.
+    pub fn export_to(&self, destination: &Path) -> Result<CacheTransferReport, CacheError> {
+        if std::fs::symlink_metadata(destination).is_ok() {
+            return Err(CacheError::DestinationExists);
+        }
+        let parent = destination.parent().ok_or(CacheError::UnsafeMetadata)?;
+        let parent_metadata = std::fs::symlink_metadata(parent)?;
+        if !parent_metadata.file_type().is_dir() {
+            return Err(CacheError::UnsafeMetadata);
+        }
+        let transaction = TempDir::new_in(parent)?;
+        set_private_permissions(transaction.path(), true)?;
+        let staged = transaction.path().join("cache");
+        let exported = Cache::open(&staged)?;
+        let report = self.copy_into(&exported)?;
+        File::open(&staged)?.sync_all()?;
+        let lock_path = staged.join(".lock");
+        if lock_path.exists() {
+            std::fs::remove_file(lock_path)?;
+        }
+        File::open(&staged)?.sync_all()?;
+        let staged = transaction.keep();
+        let published = staged.join("cache");
+        std::fs::rename(&published, destination)?;
+        File::open(parent)?.sync_all()?;
+        std::fs::remove_dir(staged)?;
+        Ok(report)
+    }
+
+    /// Imports every verified ciphertext-only entry from an existing exchange directory.
+    ///
+    /// Existing byte-identical entries are reused. A matching object or artifact
+    /// address with different content fails closed and leaves that entry intact.
+    pub fn import_from(&self, source: &Path) -> Result<CacheTransferReport, CacheError> {
+        let source = Self::open_existing(source)?;
+        if source.root.canonicalize()? == self.root.canonicalize()? {
+            return Err(CacheError::UnsafeMetadata);
+        }
+        source.copy_into_unlocked(self)
+    }
+
+    fn put_artifact_by_key<R: Read>(
+        &self,
+        key: String,
+        ciphertext: R,
+        envelope: &[u8],
+    ) -> Result<ArtifactRecord, CacheError> {
+        if !is_digest(&key) {
+            return Err(CacheError::InvalidAddress);
+        }
         if envelope.len() > MAX_ENVELOPE_BYTES {
             return Err(CacheError::Limit);
         }
-        let key = address.key()?;
         let lock = self.lock()?;
         let artifacts = self.artifacts_directory()?;
         let destination = artifacts.join(&key);
@@ -308,6 +382,80 @@ impl Cache {
             envelope: envelope.to_vec(),
             ciphertext_path: destination.join("ciphertext.age"),
         })
+    }
+
+    fn open_existing(root: &Path) -> Result<Self, CacheError> {
+        let metadata = std::fs::symlink_metadata(root)?;
+        validate_private_metadata(&metadata, true)?;
+        Ok(Self {
+            root: root.to_owned(),
+        })
+    }
+
+    fn copy_into(&self, destination: &Cache) -> Result<CacheTransferReport, CacheError> {
+        let lock = self.lock()?;
+        let report = self.copy_into_unlocked(destination);
+        FileExt::unlock(&lock)?;
+        report
+    }
+
+    fn copy_into_unlocked(&self, destination: &Cache) -> Result<CacheTransferReport, CacheError> {
+        let mut report = CacheTransferReport::default();
+        let objects = self.root.join("objects");
+        if let Some(entries) = read_directory_if_present(&objects)? {
+            for entry in entries {
+                let entry = entry?;
+                let digest = entry
+                    .file_name()
+                    .to_str()
+                    .ok_or(CacheError::UnsafeMetadata)?
+                    .to_owned();
+                let bytes = self.get(&digest)?;
+                let destination_digest = destination.put(&bytes)?;
+                if destination_digest != digest {
+                    return Err(CacheError::HashMismatch);
+                }
+                report.object_count = report
+                    .object_count
+                    .checked_add(1)
+                    .ok_or(CacheError::Limit)?;
+                report.bytes = report
+                    .bytes
+                    .checked_add(u64::try_from(bytes.len()).map_err(|_| CacheError::Limit)?)
+                    .ok_or(CacheError::Limit)?;
+            }
+        }
+        for record in self.artifact_records()? {
+            let ciphertext_bytes = file_length(&record.ciphertext_path)?;
+            match destination.put_artifact_by_key(
+                record.key.clone(),
+                open_private_regular(&record.ciphertext_path)?,
+                &record.envelope,
+            ) {
+                Ok(imported)
+                    if imported.artifact_ciphertext_hash == record.artifact_ciphertext_hash => {}
+                Ok(_) => return Err(CacheError::Conflict),
+                Err(CacheError::ArtifactExists) => {
+                    let existing = destination.load_artifact_by_key(&record.key)?;
+                    if existing.artifact_ciphertext_hash != record.artifact_ciphertext_hash
+                        || existing.envelope != record.envelope
+                    {
+                        return Err(CacheError::Conflict);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+            report.artifact_count = report
+                .artifact_count
+                .checked_add(1)
+                .ok_or(CacheError::Limit)?;
+            report.bytes = checked_transfer_bytes(report.bytes, ciphertext_bytes)?;
+            report.bytes = checked_transfer_bytes(
+                report.bytes,
+                u64::try_from(record.envelope.len()).map_err(|_| CacheError::Limit)?,
+            )?;
+        }
+        Ok(report)
     }
 
     /// Loads a bundle and recalculates its ciphertext hash before returning it.
@@ -559,6 +707,10 @@ impl Cache {
             ciphertext_path,
         })
     }
+}
+
+fn checked_transfer_bytes(total: u64, additional: u64) -> Result<u64, CacheError> {
+    total.checked_add(additional).ok_or(CacheError::Limit)
 }
 
 fn read_directory_if_present(path: &Path) -> Result<Option<std::fs::ReadDir>, CacheError> {
@@ -847,6 +999,47 @@ mod tests {
         std::fs::remove_file(&manifest)?;
         symlink(&outside, &manifest)?;
         assert!(cache.load_artifact(&address).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn exports_and_imports_verified_ciphertext_only_entries() -> Result<(), CacheError> {
+        let temporary = tempfile::tempdir()?;
+        let source = Cache::open(temporary.path().join("source"))?;
+        source.put(b"ciphertext object")?;
+        let address = ArtifactAddress::new(
+            "0".repeat(64),
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64),
+            "host.test",
+            "db/password",
+            1,
+        )?;
+        source.put_artifact(&address, b"target ciphertext".as_slice(), b"envelope")?;
+        let exchange = temporary.path().join("exchange");
+        let exported = source.export_to(&exchange)?;
+        assert_eq!(exported.object_count, 1);
+        assert_eq!(exported.artifact_count, 1);
+        assert!(!exchange.join(".lock").exists());
+        assert!(matches!(
+            source.export_to(&exchange),
+            Err(CacheError::DestinationExists)
+        ));
+
+        let destination = Cache::open(temporary.path().join("destination"))?;
+        let imported = destination.import_from(&exchange)?;
+        assert_eq!(imported, exported);
+        assert_eq!(destination.inventory()?, source.inventory()?);
+        assert_eq!(destination.import_from(&exchange)?, exported);
+        assert!(!exchange.join(".lock").exists());
+
+        let conflicting = Cache::open(temporary.path().join("conflicting"))?;
+        conflicting.put_artifact(&address, b"different ciphertext".as_slice(), b"envelope")?;
+        assert!(matches!(
+            conflicting.import_from(&exchange),
+            Err(CacheError::Conflict)
+        ));
         Ok(())
     }
 }

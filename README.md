@@ -58,6 +58,17 @@ untrusted artifact is a deletion candidate. Version 1 generic cache objects do
 not have an authenticated plan reference, so they are always candidates. The
 command never removes anything without `--execute`.
 
+For air-gapped or remote deployment workflows, cache exchange is an explicit
+ciphertext-only directory operation. Export refuses to overwrite its destination
+and atomically publishes only verified generic ciphertext and target-artifact
+bundles; identities, plaintext, locks, and transactions are excluded. Import
+revalidates every entry and is idempotent, but rejects same-address conflicts:
+
+```console
+nix-seal cache export --root "$XDG_CACHE_HOME/nix-seal/v1" --destination ./nix-seal-cache
+nix-seal cache import --source ./nix-seal-cache
+```
+
 The project is in an early, pre-release foundation phase. The current vertical
 slice provides strict plan parsing and validation, canonical plan hashing,
 native age X25519 encryption/decryption, signed target artifacts, transactional

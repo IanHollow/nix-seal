@@ -40,3 +40,12 @@ treats all of them as candidates rather than guessing from filenames or public
 metadata. The current GC compatibility rule accepts a signed producer version
 because v1 has no producer-version allow-list; future policy must add an
 explicit allow-list before it can tighten this decision.
+
+The v1 cache exchange format is a directory containing only the verified
+`objects/` and `artifacts/` layouts. Export stages a new private directory and
+publishes it with one rename, refusing to replace an existing destination. It
+does not copy identities, plaintext, locks, or transactions. Import is
+append-only and idempotent for byte-identical entries; a matching address with
+different ciphertext or envelope fails closed. Artifact authorization remains a
+policy/activation operation, so importing an artifact never by itself grants it
+runtime use.

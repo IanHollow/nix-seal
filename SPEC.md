@@ -86,7 +86,10 @@ remote builds. GC is dry-run-first and retains only target artifacts that are
 authenticated by the active plan, target policy, canonical source hash,
 deterministic address, and current approval threshold. Generic v1 cache objects
 have no authenticated reachability edge and are candidates until a future format
-introduces one.
+introduces one. Cache export/import exchanges a staged, ciphertext-only
+directory with verified generic objects and target artifact bundles; it excludes
+identities, plaintext, locks, and transactions, and import rejects conflicting
+same-address content.
 
 Activation verifies schema, signatures, hashes, target, and recipient metadata;
 decrypts a complete restrictive generation; and switches only after every value

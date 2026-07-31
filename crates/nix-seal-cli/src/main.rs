@@ -297,6 +297,24 @@ enum CacheCommand {
         #[arg(long)]
         execute: bool,
     },
+    /// Create a new ciphertext-only cache exchange directory.
+    Export {
+        /// New destination directory. It must not already exist.
+        #[arg(long)]
+        destination: PathBuf,
+        /// Override the standard XDG cache root.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Import a ciphertext-only cache exchange directory.
+    Import {
+        /// Existing exchange directory created by `cache export`.
+        #[arg(long)]
+        source: PathBuf,
+        /// Override the standard XDG cache root.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -364,6 +382,12 @@ fn run() -> Result<()> {
             root,
             execute,
         }) => cache_gc(&plan, &repository_root, root, execute, cli.json)?,
+        Command::Cache(CacheCommand::Export { destination, root }) => {
+            cache_export(&destination, root, cli.json)?;
+        }
+        Command::Cache(CacheCommand::Import { source, root }) => {
+            cache_import(&source, root, cli.json)?;
+        }
     }
     Ok(())
 }
@@ -1615,6 +1639,52 @@ fn cache_gc(
         }
     }
     Ok(())
+}
+
+fn cache_export(destination: &Path, root: Option<PathBuf>, json: bool) -> Result<()> {
+    let cache = nix_seal_cache::Cache::open(root.unwrap_or_else(default_cache_root))?;
+    let report = cache.export_to(destination)?;
+    emit_cache_transfer("exported", cache.root(), destination, &report, json);
+    Ok(())
+}
+
+fn cache_import(source: &Path, root: Option<PathBuf>, json: bool) -> Result<()> {
+    let cache = nix_seal_cache::Cache::open(root.unwrap_or_else(default_cache_root))?;
+    let report = cache.import_from(source)?;
+    emit_cache_transfer("imported", source, cache.root(), &report, json);
+    Ok(())
+}
+
+fn emit_cache_transfer(
+    operation: &str,
+    source: &Path,
+    destination: &Path,
+    report: &nix_seal_cache::CacheTransferReport,
+    json: bool,
+) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.cache-transfer.v1",
+                "operation":operation,
+                "source":source,
+                "destination":destination,
+                "objects":report.object_count,
+                "artifacts":report.artifact_count,
+                "bytes":report.bytes
+            })
+        );
+    } else {
+        println!(
+            "{operation} {} objects and {} target artifacts ({} bytes) from {} to {}",
+            report.object_count,
+            report.artifact_count,
+            report.bytes,
+            source.display(),
+            destination.display(),
+        );
+    }
 }
 
 fn authenticated_gc_retention(
