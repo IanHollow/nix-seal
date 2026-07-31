@@ -16,12 +16,12 @@ fail plan validation. Target template inclusion is fail-closed: a template is
 available only when every placeholder secret is authorized for that target.
 
 Rekey accepts the compiled plan, target ID, and secret ID. It derives the source
-path, delivery mode, target recipient, plan hash, target-policy hash, and allowed
-approval signers instead of accepting those values independently. Artifact v2
-signatures bind both hashes. Activation likewise derives the recipient and
-approval rules from the plan, requires the configured private identity to match,
-and requires the complete artifact/template/runtime/service declaration to equal
-the projection before creating any plaintext transaction.
+path, delivery mode, target recipient, plan hash, target-policy hash, and
+allowed approval signers instead of accepting those values independently.
+Artifact v2 signatures bind both hashes. Activation likewise derives the
+recipient and approval rules from the plan, requires the configured private
+identity to match, and requires the complete artifact/template/runtime/service
+declaration to equal the projection before creating any plaintext transaction.
 
 This deliberately duplicates some public policy inside the activation document
 only as materialization instructions; those fields have no authority and must

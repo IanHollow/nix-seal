@@ -5,12 +5,13 @@ nix-darwin, and Home Manager. It stores standard age ciphertext in Git, builds a
 strict deterministic public policy plan, and activates plaintext only in
 restricted runtime directories.
 
-The validated `plan.v1` is the single policy authority. `nix-seal plan --target
-<id>` emits a canonical target-specific projection. Rekey and activation derive
-recipients, hashes, authorized secret/template sets, runtime permissions,
-service actions, and per-secret approval thresholds from that projection rather
-than trusting duplicate command-line or Nix options. Signed artifact v2
-manifests bind its hash, so policy substitution fails before decryption.
+The validated `plan.v1` is the single policy authority.
+`nix-seal plan --target <id>` emits a canonical target-specific projection.
+Rekey and activation derive recipients, hashes, authorized secret/template sets,
+runtime permissions, service actions, and per-secret approval thresholds from
+that projection rather than trusting duplicate command-line or Nix options.
+Signed artifact v2 manifests bind its hash, so policy substitution fails before
+decryption.
 
 The project is in an early, pre-release foundation phase. The current vertical
 slice provides strict plan parsing and validation, canonical plan hashing,
