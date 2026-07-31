@@ -807,6 +807,7 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
     let mut indegree = BTreeMap::new();
     let mut dependents: BTreeMap<&Id, Vec<&Id>> = BTreeMap::new();
     let mut generated_outputs = BTreeSet::new();
+    let mut generator_prompts = BTreeSet::new();
     for (generator_id, generator) in &plan.generators {
         if generator.dependencies.len() > 10_000 || generator.outputs.len() > 10_000 {
             return Err(PolicyError::Violation(format!(
@@ -814,6 +815,19 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
             )));
         }
         validate_generator_execution(generator_id, generator)?;
+        if generator.prompts.len() > 64
+            || generator.prompts.iter().any(|prompt| {
+                prompt.message.is_empty()
+                    || prompt.message.len() > 4096
+                    || prompt.message.bytes().any(|byte| byte == 0)
+                    || prompt.persistent
+                    || !generator_prompts.insert(&prompt.id)
+            })
+        {
+            return Err(PolicyError::Violation(format!(
+                "generator {generator_id} has invalid, duplicate, or unsupported persistent prompts"
+            )));
+        }
         if generator.outputs.is_empty() {
             return Err(PolicyError::Violation(format!(
                 "generator {generator_id} must declare at least one output"

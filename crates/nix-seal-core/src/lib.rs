@@ -311,11 +311,42 @@ pub struct Generator {
     pub dependencies: Vec<Id>,
     /// Declared outputs.
     pub outputs: Vec<Id>,
+    /// Explicit prompt declarations. Prompt values never enter the public plan.
+    #[serde(default)]
+    pub prompts: Vec<GeneratorPrompt>,
     /// Strict public generator parameters, such as a random-byte length.
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
     /// Public validation fingerprint.
     pub validation: Option<String>,
+}
+
+/// One declared external-generator prompt.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GeneratorPrompt {
+    /// Stable prompt identifier, used to bind a private response file.
+    pub id: Id,
+    /// Whether interactive frontends should mask the response.
+    pub mode: GeneratorPromptMode,
+    /// Public operator-facing prompt text.
+    pub message: String,
+    /// Whether the response may contain multiple lines.
+    #[serde(default)]
+    pub multiline: bool,
+    /// Whether a later persistent-prompt backend may retain the response.
+    #[serde(default)]
+    pub persistent: bool,
+}
+
+/// Display behavior for an external-generator prompt.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GeneratorPromptMode {
+    /// Input should not be echoed by an interactive frontend.
+    Hidden,
+    /// Input may be displayed by an interactive frontend.
+    Visible,
 }
 
 fn default_generator_timeout_seconds() -> u16 {

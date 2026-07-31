@@ -163,6 +163,16 @@ workspace, and a bounded timeout. It must write exactly one regular file named
 Unlisted files, links, oversized output, nonzero exits, and timeouts fail the
 full transaction without exposing process output.
 
+Declared external-generator prompts are non-interactive by default. Supply each
+response with
+`nix-seal generate --prompt-file prompt/id=/absolute/private-file`; the response
+file must be owned by the invoking user and mode `0600` (or stricter). The CLI
+rejects missing or unused prompt files and copies responses only into numbered
+files below `$NIX_SEAL_PROMPT_DIR` in the private workspace. Prompt values never
+enter the plan, command arguments, environment, or logs. Persistent prompt
+storage and terminal prompting remain explicitly unavailable until their
+separate storage and TTY hardening designs are complete.
+
 ## Migration inspection
 
 The first migration adapter is deliberately report-only. Export the existing

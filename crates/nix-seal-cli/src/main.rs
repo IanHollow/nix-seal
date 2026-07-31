@@ -222,6 +222,9 @@ struct GenerateArgs {
     /// Replace existing canonical ciphertext; omission is create-only.
     #[arg(long)]
     replace: bool,
+    /// Private response file bound to one declared generator prompt as `ID=PATH`.
+    #[arg(long = "prompt-file", value_name = "ID=PATH")]
+    prompt_files: Vec<String>,
 }
 
 #[derive(Args)]
@@ -1200,6 +1203,7 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
         &mut BTreeSet::new(),
         &mut order,
     )?;
+    let prompt_files = validate_generator_prompt_files(&plan, &order, &arguments.prompt_files)?;
     let mode = if arguments.replace {
         nix_seal_authoring::WriteMode::Replace
     } else {
@@ -1211,7 +1215,8 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
             .generators
             .get(&generator_id)
             .context("generator disappeared from validated plan")?;
-        let generated_values = generate_generator_values(generator)?;
+        let prompt_values = read_generator_prompts(generator, &prompt_files)?;
+        let generated_values = generate_generator_values(generator, &prompt_values)?;
         if generated_values.len() != generator.outputs.len() {
             bail!("generator produced an unexpected output count");
         }
@@ -1278,21 +1283,47 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn validate_generator_prompt_files(
+    plan: &nix_seal_core::PlanV1,
+    order: &[nix_seal_core::Id],
+    values: &[String],
+) -> Result<BTreeMap<nix_seal_core::Id, PathBuf>> {
+    let prompt_files = parse_prompt_files(values)?;
+    let declared_prompts = order
+        .iter()
+        .flat_map(|generator_id| {
+            plan.generators[generator_id]
+                .prompts
+                .iter()
+                .map(|prompt| prompt.id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    if prompt_files.keys().collect::<BTreeSet<_>>() != declared_prompts.iter().collect() {
+        bail!("prompt files must match the declared prompts exactly");
+    }
+    Ok(prompt_files)
+}
+
 fn generate_generator_values(
     generator: &nix_seal_core::Generator,
+    prompts: &[SecretBox<Vec<u8>>],
 ) -> Result<Vec<SecretBox<Vec<u8>>>> {
     if generator.executable.starts_with("builtin:") {
+        if !prompts.is_empty() {
+            bail!("built-in generators do not accept prompts");
+        }
         return generator
             .outputs
             .iter()
             .map(|_| generate_builtin_value(generator))
             .collect();
     }
-    generate_external_values(generator)
+    generate_external_values(generator, prompts)
 }
 
 fn generate_external_values(
     generator: &nix_seal_core::Generator,
+    prompts: &[SecretBox<Vec<u8>>],
 ) -> Result<Vec<SecretBox<Vec<u8>>>> {
     let workspace = tempfile::Builder::new()
         .prefix("nix-seal-generator-")
@@ -1303,6 +1334,16 @@ fn generate_external_values(
     fs::create_dir(&output_directory)
         .context("could not create private generator output directory")?;
     set_private_directory(&output_directory)?;
+    let prompt_directory = workspace.path().join("prompts");
+    fs::create_dir(&prompt_directory)
+        .context("could not create private generator prompt directory")?;
+    set_private_directory(&prompt_directory)?;
+    for (index, value) in prompts.iter().enumerate() {
+        write_private_bytes(
+            &prompt_directory.join(index.to_string()),
+            value.expose_secret(),
+        )?;
+    }
     let runtime_path = std::env::join_paths(
         generator
             .runtime_inputs
@@ -1318,6 +1359,8 @@ fn generate_external_values(
         .env("TMPDIR", workspace.path())
         .env("NIX_SEAL_OUTPUT_DIR", &output_directory)
         .env("NIX_SEAL_OUTPUT_COUNT", generator.outputs.len().to_string())
+        .env("NIX_SEAL_PROMPT_DIR", &prompt_directory)
+        .env("NIX_SEAL_PROMPT_COUNT", prompts.len().to_string())
         .current_dir(workspace.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1390,6 +1433,47 @@ fn read_generator_output(path: &Path, maximum: u64) -> Result<SecretBox<Vec<u8>>
         bail!("constrained generator output exceeded its declared limit");
     }
     Ok(SecretBox::new(Box::new(output)))
+}
+
+fn parse_prompt_files(values: &[String]) -> Result<BTreeMap<nix_seal_core::Id, PathBuf>> {
+    let mut parsed = BTreeMap::new();
+    for value in values {
+        let (id, path) = value
+            .split_once('=')
+            .context("prompt file must use ID=PATH")?;
+        let id = nix_seal_core::Id::parse(id).context("prompt file has an invalid prompt ID")?;
+        let path = PathBuf::from(path);
+        if !path.is_absolute() || parsed.insert(id, path).is_some() {
+            bail!("prompt files must have unique IDs and absolute paths");
+        }
+    }
+    Ok(parsed)
+}
+
+fn read_generator_prompts(
+    generator: &nix_seal_core::Generator,
+    prompt_files: &BTreeMap<nix_seal_core::Id, PathBuf>,
+) -> Result<Vec<SecretBox<Vec<u8>>>> {
+    generator
+        .prompts
+        .iter()
+        .map(|prompt| {
+            let path = prompt_files
+                .get(&prompt.id)
+                .context("declared generator prompt has no private response file")?;
+            let mut input = open_private_identity(path)
+                .context("generator prompt response file has unsafe ownership or permissions")?;
+            let mut value = Vec::new();
+            std::io::Read::by_ref(&mut input)
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut value)
+                .context("could not read generator prompt response")?;
+            if value.len() > 1024 * 1024 {
+                bail!("generator prompt response exceeds the 1 MiB safety limit");
+            }
+            Ok(SecretBox::new(Box::new(value)))
+        })
+        .collect()
 }
 
 fn collect_generator_order(
@@ -2134,6 +2218,19 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .context("could not create private generator prompt file")?;
+    set_private_file(path)?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .context("could not write private generator prompt file")?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn set_private_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -2541,6 +2638,7 @@ mod tests {
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
             outputs: vec![output.clone()],
+            prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "48".to_owned())]),
             validation: None,
         };
@@ -2553,6 +2651,7 @@ mod tests {
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
             outputs: vec![output.clone()],
+            prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
             validation: None,
         };
@@ -2567,6 +2666,7 @@ mod tests {
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
             outputs: vec![output],
+            prompts: Vec::new(),
             parameters: BTreeMap::new(),
             validation: None,
         };
@@ -2592,8 +2692,7 @@ mod tests {
             executable: shell.to_string_lossy().into_owned(),
             arguments: vec![
                 "-c".to_owned(),
-                "printf first > \"$NIX_SEAL_OUTPUT_DIR/0\"; printf second > \"$NIX_SEAL_OUTPUT_DIR/1\""
-                    .to_owned(),
+                "IFS= read -r value < \"$NIX_SEAL_PROMPT_DIR/0\"; printf %s \"$value\" > \"$NIX_SEAL_OUTPUT_DIR/0\"; printf second > \"$NIX_SEAL_OUTPUT_DIR/1\"".to_owned(),
             ],
             runtime_inputs: Vec::new(),
             timeout_seconds: 5,
@@ -2603,10 +2702,18 @@ mod tests {
                 nix_seal_core::Id::parse("generator/one")?,
                 nix_seal_core::Id::parse("generator/two")?,
             ],
+            prompts: vec![nix_seal_core::GeneratorPrompt {
+                id: nix_seal_core::Id::parse("generator/value")?,
+                mode: nix_seal_core::GeneratorPromptMode::Hidden,
+                message: "test prompt".to_owned(),
+                multiline: false,
+                persistent: false,
+            }],
             parameters: BTreeMap::new(),
             validation: None,
         };
-        let values = generate_external_values(&generator)?;
+        let values =
+            generate_external_values(&generator, &[SecretBox::new(Box::new(b"first".to_vec()))])?;
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].expose_secret(), b"first");
         assert_eq!(values[1].expose_secret(), b"second");
@@ -2699,6 +2806,7 @@ mod tests {
                 max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
                 dependencies: Vec::new(),
                 outputs: vec![secret_id, second_secret_id],
+                prompts: Vec::new(),
                 parameters: BTreeMap::from([("bytes".to_owned(), "20".to_owned())]),
                 validation: None,
             },
@@ -2711,6 +2819,7 @@ mod tests {
             repository_root: repository.clone(),
             identity: identity_path.clone(),
             replace: false,
+            prompt_files: Vec::new(),
         };
         run_generate(&request, false)?;
         let ciphertext = repository.join("secrets/application-token.age");
