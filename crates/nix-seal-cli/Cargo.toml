@@ -18,8 +18,10 @@ clap_complete_nushell.workspace = true
 nix-seal-cache.workspace = true
 nix-seal-core.workspace = true
 nix-seal-crypto.workspace = true
+nix-seal-manifest.workspace = true
 nix-seal-policy.workspace = true
 secrecy.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [lints]

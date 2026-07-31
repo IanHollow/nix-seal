@@ -5,6 +5,7 @@ members = [
   "crates/nix-seal-cli",
   "crates/nix-seal-core",
   "crates/nix-seal-crypto",
+  "crates/nix-seal-manifest",
   "crates/nix-seal-policy",
   "crates/nix-seal-runtime",
 ]
@@ -20,14 +21,18 @@ repository = "https://github.com/IanHollow/nix-seal"
 [workspace.dependencies]
 age = { version = "=0.12.1", default-features = false, features = ["armor"] }
 anyhow = "1.0.98"
+base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 blake3 = "1.8.2"
 clap = { version = "4.5.40", features = ["derive"] }
 clap_complete = "4.5.54"
 clap_complete_nushell = "4.6.1"
 fs2 = "0.4.3"
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["fast", "zeroize"] }
+getrandom = "=0.4.3"
 nix-seal-cache = { path = "crates/nix-seal-cache", version = "=0.1.0-alpha.1" }
 nix-seal-core = { path = "crates/nix-seal-core", version = "=0.1.0-alpha.1" }
 nix-seal-crypto = { path = "crates/nix-seal-crypto", version = "=0.1.0-alpha.1" }
+nix-seal-manifest = { path = "crates/nix-seal-manifest", version = "=0.1.0-alpha.1" }
 nix-seal-policy = { path = "crates/nix-seal-policy", version = "=0.1.0-alpha.1" }
 schemars = "1.0.4"
 secrecy = "0.10.3"
@@ -37,6 +42,7 @@ serde_jcs = "0.1.0"
 tempfile = "3.20.0"
 thiserror = "2.0.12"
 toml = "0.9.2"
+zeroize = "=1.9.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

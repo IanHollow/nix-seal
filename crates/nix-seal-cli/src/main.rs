@@ -7,6 +7,7 @@ use secrecy::{ExposeSecret, SecretString};
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Parser)]
@@ -44,6 +45,9 @@ enum Command {
     /// Identity operations.
     #[command(subcommand)]
     Key(KeyCommand),
+    /// Signed target-artifact operations.
+    #[command(subcommand)]
+    Artifact(ArtifactCommand),
     /// Secret authoring operations.
     #[command(subcommand)]
     Secret(SecretCommand),
@@ -67,6 +71,63 @@ enum KeyCommand {
     Inspect {
         #[arg(long)]
         identity: PathBuf,
+    },
+    /// Generate a separate Ed25519 artifact-approval key.
+    GenerateSigning {
+        #[arg(long)]
+        key_out: PathBuf,
+    },
+    /// Print the public key and fingerprint for an approval key.
+    InspectSigning {
+        #[arg(long)]
+        key: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ArtifactCommand {
+    /// Canonicalize and sign a strict target-manifest JSON file.
+    Sign {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        signing_key: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Add a distinct approval signature to an existing envelope.
+    Approve {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        signing_key: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify signatures and every caller-supplied artifact binding.
+    Verify {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long = "trusted-key", required = true)]
+        trusted_keys: Vec<PathBuf>,
+        #[arg(long, default_value_t = 1)]
+        threshold: usize,
+        #[arg(long)]
+        plan_hash: String,
+        #[arg(long)]
+        source_hash: String,
+        #[arg(long)]
+        artifact_hash: String,
+        #[arg(long)]
+        target: nix_seal_core::Id,
+        #[arg(long)]
+        secret: nix_seal_core::Id,
+        #[arg(long)]
+        recipient_fingerprint: String,
+        #[arg(long)]
+        generation: u64,
+        #[arg(long, default_value_t = 300)]
+        allowed_clock_skew: u64,
     },
 }
 
@@ -157,6 +218,7 @@ fn run() -> Result<()> {
             }
         }
         Command::Key(command) => run_key(command, cli.json)?,
+        Command::Artifact(command) => run_artifact(command, cli.json)?,
         Command::Secret(command) => run_secret(command)?,
         Command::Schema => println!("{}", nix_seal_policy::json_schema()?),
         Command::Completions { shell } => completions(shell),
@@ -207,7 +269,171 @@ fn run_key(command: KeyCommand, json: bool) -> Result<()> {
                 println!("{recipient}");
             }
         }
+        KeyCommand::GenerateSigning { key_out } => {
+            let key = nix_seal_manifest::ApprovalSigningKey::generate()?;
+            let private = key.encode_private();
+            write_new_private(&key_out, private.as_bytes())?;
+            print_signing_key(&key, &key_out, json);
+        }
+        KeyCommand::InspectSigning { key } => {
+            let signing_key = read_signing_key(&key)?;
+            print_signing_key(&signing_key, &key, json);
+        }
     }
+    Ok(())
+}
+
+fn print_signing_key(key: &nix_seal_manifest::ApprovalSigningKey, path: &Path, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.output.v1",
+                "publicKey":key.encode_public(),
+                "keyId":key.key_id(),
+                "keyPath":path
+            })
+        );
+    } else {
+        println!("{}", key.encode_public());
+        eprintln!("key ID: {}", key.key_id());
+    }
+}
+
+fn run_artifact(command: ArtifactCommand, json: bool) -> Result<()> {
+    match command {
+        ArtifactCommand::Sign {
+            manifest,
+            signing_key,
+            output,
+        } => {
+            let manifest: nix_seal_manifest::TargetManifestV1 = read_json_bounded(&manifest)?;
+            let key = read_signing_key(&signing_key)?;
+            let envelope = nix_seal_manifest::sign_manifest(&manifest, &key)?;
+            write_new_json(&output, &envelope)?;
+            artifact_written(&output, envelope.signatures.len(), json);
+        }
+        ArtifactCommand::Approve {
+            input,
+            signing_key,
+            output,
+        } => {
+            let mut envelope: nix_seal_manifest::SignedEnvelopeV1 = read_json_bounded(&input)?;
+            let key = read_signing_key(&signing_key)?;
+            nix_seal_manifest::add_signature(&mut envelope, &key)?;
+            write_new_json(&output, &envelope)?;
+            artifact_written(&output, envelope.signatures.len(), json);
+        }
+        ArtifactCommand::Verify {
+            input,
+            trusted_keys,
+            threshold,
+            plan_hash,
+            source_hash,
+            artifact_hash,
+            target,
+            secret,
+            recipient_fingerprint,
+            generation,
+            allowed_clock_skew,
+        } => {
+            let envelope: nix_seal_manifest::SignedEnvelopeV1 = read_json_bounded(&input)?;
+            let trusted = read_trusted_keys(&trusted_keys)?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock is before the Unix epoch")?
+                .as_secs();
+            let expected = nix_seal_manifest::ExpectedBinding {
+                tool_version: env!("CARGO_PKG_VERSION"),
+                plan_hash: &plan_hash,
+                source_ciphertext_hash: &source_hash,
+                artifact_ciphertext_hash: &artifact_hash,
+                target_id: &target,
+                secret_id: &secret,
+                recipient_fingerprint: &recipient_fingerprint,
+                artifact_generation: generation,
+                now,
+                allowed_clock_skew,
+            };
+            let verified = nix_seal_manifest::verify(&envelope, &trusted, threshold, &expected)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema":"nix-seal.output.v1",
+                        "ok":true,
+                        "target":verified.manifest.target_id,
+                        "secret":verified.manifest.secret_id,
+                        "generation":verified.manifest.artifact_generation,
+                        "signers":verified.signers
+                    })
+                );
+            } else {
+                println!(
+                    "verified {} for {} generation {} with {} distinct signature(s)",
+                    verified.manifest.secret_id,
+                    verified.manifest.target_id,
+                    verified.manifest.artifact_generation,
+                    verified.signers.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn artifact_written(path: &Path, signatures: usize, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"schema":"nix-seal.output.v1","path":path,"signatures":signatures})
+        );
+    } else {
+        println!("wrote {} with {signatures} signature(s)", path.display());
+    }
+}
+
+fn read_signing_key(path: &Path) -> Result<nix_seal_manifest::ApprovalSigningKey> {
+    let encoded = read_identity(path)?;
+    Ok(nix_seal_manifest::ApprovalSigningKey::parse(
+        encoded.expose_secret(),
+    )?)
+}
+
+fn read_trusted_keys(paths: &[PathBuf]) -> Result<nix_seal_manifest::TrustedKeys> {
+    let mut trusted = nix_seal_manifest::TrustedKeys::new();
+    for path in paths {
+        let encoded = std::fs::read_to_string(path)
+            .with_context(|| format!("unable to read trusted key {}", path.display()))?;
+        trusted.insert_encoded(&encoded)?;
+    }
+    Ok(trusted)
+}
+
+fn read_json_bounded<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    const LIMIT: u64 = 2 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LIMIT {
+        bail!("public metadata file exceeds the 2 MiB safety limit");
+    }
+    serde_json::from_slice(&bytes).context("invalid strict artifact JSON")
+}
+
+fn write_new_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let parent = path.parent().context("artifact path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("refusing to overwrite {}", path.display()))?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
     Ok(())
 }
 
