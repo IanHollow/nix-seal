@@ -1235,6 +1235,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "age",
  "blake3",
+ "getrandom 0.4.3",
  "secrecy",
  "thiserror 2.0.19",
 ]

@@ -806,10 +806,45 @@ fn validate_approval(id: &Id, policy: &ApprovalPolicy, plan: &PlanV1) -> Result<
 fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
     let mut indegree = BTreeMap::new();
     let mut dependents: BTreeMap<&Id, Vec<&Id>> = BTreeMap::new();
+    let mut generated_outputs = BTreeSet::new();
     for (generator_id, generator) in &plan.generators {
         if generator.dependencies.len() > 10_000 || generator.outputs.len() > 10_000 {
             return Err(PolicyError::Violation(format!(
                 "generator {generator_id} exceeds dependency or output limits"
+            )));
+        }
+        if generator.executable.is_empty()
+            || generator.executable.len() > 16 * 1024
+            || generator
+                .executable
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+        {
+            return Err(PolicyError::Violation(format!(
+                "generator {generator_id} has an invalid executable declaration"
+            )));
+        }
+        if generator.outputs.is_empty() {
+            return Err(PolicyError::Violation(format!(
+                "generator {generator_id} must declare at least one output"
+            )));
+        }
+        for output in &generator.outputs {
+            if !plan.secrets.contains_key(output) || !generated_outputs.insert(output) {
+                return Err(PolicyError::Violation(format!(
+                    "generator {generator_id} has a missing or duplicate secret output {output}"
+                )));
+            }
+        }
+        if generator.parameters.len() > 128
+            || generator.parameters.iter().any(|(key, value)| {
+                !is_generator_parameter_name(key)
+                    || value.len() > 4096
+                    || value.bytes().any(|byte| byte.is_ascii_control())
+            })
+        {
+            return Err(PolicyError::Violation(format!(
+                "generator {generator_id} has invalid public parameters"
             )));
         }
         let dependencies: BTreeSet<_> = generator.dependencies.iter().collect();
@@ -857,6 +892,14 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
         ));
     }
     Ok(())
+}
+
+fn is_generator_parameter_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
 }
 
 /// Returns `RFC 8785` canonical `JSON` bytes.

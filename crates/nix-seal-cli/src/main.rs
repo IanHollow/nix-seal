@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Read, Write},
@@ -71,6 +71,8 @@ enum Command {
     Artifact(ArtifactCommand),
     /// Explicitly create or verify a target-encrypted cache artifact.
     Rekey(RekeyArgs),
+    /// Generate plan-declared canonical ciphertext using a built-in Rust generator.
+    Generate(GenerateArgs),
     /// Internal authenticated runtime activation entrypoint.
     #[command(hide = true)]
     Activate(ActivateArgs),
@@ -195,6 +197,25 @@ struct RekeyArgs {
     /// Override the standard XDG cache root.
     #[arg(long)]
     cache_root: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct GenerateArgs {
+    /// Canonical compiled plan.v1 JSON.
+    #[arg(long, default_value = "plan.v1.json")]
+    plan: PathBuf,
+    /// Generator ID selected from the plan.
+    #[arg(long)]
+    generator: nix_seal_core::Id,
+    /// Repository root used to resolve plan-declared ciphertext destinations.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Administrator/recovery identity authorized to verify each generated output.
+    #[arg(long)]
+    identity: PathBuf,
+    /// Replace existing canonical ciphertext; omission is create-only.
+    #[arg(long)]
+    replace: bool,
 }
 
 #[derive(Args)]
@@ -380,6 +401,7 @@ fn run() -> Result<()> {
         Command::Key(command) => run_key(command, cli.json)?,
         Command::Artifact(command) => run_artifact(command, cli.json)?,
         Command::Rekey(arguments) => run_rekey(arguments, cli.json)?,
+        Command::Generate(arguments) => run_generate(&arguments, cli.json)?,
         Command::Activate(arguments) => run_activate(&arguments, cli.json)?,
         Command::Secret(command) => run_secret(command, cli.json)?,
         Command::Rotate(arguments) => run_secret_write(
@@ -979,6 +1001,175 @@ fn verify_service_projection(
         bail!("activation service actions differ from the canonical target policy");
     }
     Ok(())
+}
+
+fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
+    let plan = read_plan_bounded(&arguments.plan)?;
+    let identity = read_identity(&arguments.identity)?;
+    let mut order = Vec::new();
+    collect_generator_order(
+        &plan,
+        &arguments.generator,
+        &mut BTreeSet::new(),
+        &mut order,
+    )?;
+    let mode = if arguments.replace {
+        nix_seal_authoring::WriteMode::Replace
+    } else {
+        nix_seal_authoring::WriteMode::Create
+    };
+    let mut outputs = Vec::new();
+    for generator_id in order {
+        let generator = plan
+            .generators
+            .get(&generator_id)
+            .context("generator disappeared from validated plan")?;
+        // Built-ins deliberately accept one output in v1. That lets the
+        // existing authoring transaction give every accepted generation an
+        // all-or-nothing ciphertext commit without pretending a partial batch
+        // write has stronger semantics than it does.
+        if generator.outputs.len() != 1 {
+            bail!(
+                "generator {generator_id} has multiple outputs; multi-output generator transactions are not implemented yet"
+            );
+        }
+        let generated = generate_builtin_value(generator)?;
+        let secret_id = generator
+            .outputs
+            .first()
+            .context("generator has no output despite plan validation")?;
+        let secret = plan
+            .secrets
+            .get(secret_id)
+            .context("generator output secret disappeared from validated plan")?;
+        let recipients = nix_seal_policy::secret_recipients(&plan, secret_id)?;
+        let result = nix_seal_authoring::write_secret(
+            &arguments.repository_root,
+            Path::new(&secret.source),
+            std::io::Cursor::new(generated.expose_secret().as_slice()),
+            &recipients.recipients.into_values().collect::<Vec<_>>(),
+            &identity,
+            mode,
+        )?;
+        outputs.push(serde_json::json!({
+            "generator":generator_id,
+            "secretId":secret_id,
+            "ciphertextPath":result.path,
+            "ciphertextHash":result.ciphertext_hash,
+            "plaintextBytes":result.plaintext_bytes
+        }));
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.generation.v1",
+                "replaced":arguments.replace,
+                "outputs":outputs
+            })
+        );
+    } else {
+        for output in outputs {
+            println!(
+                "generated {} -> {}",
+                output["secretId"].as_str().unwrap_or("unknown"),
+                output["ciphertextPath"].as_str().unwrap_or("unknown")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn collect_generator_order(
+    plan: &nix_seal_core::PlanV1,
+    generator_id: &nix_seal_core::Id,
+    visited: &mut BTreeSet<nix_seal_core::Id>,
+    order: &mut Vec<nix_seal_core::Id>,
+) -> Result<()> {
+    if !visited.insert(generator_id.clone()) {
+        return Ok(());
+    }
+    let generator = plan
+        .generators
+        .get(generator_id)
+        .with_context(|| format!("unknown generator {generator_id}"))?;
+    for dependency in &generator.dependencies {
+        collect_generator_order(plan, dependency, visited, order)?;
+    }
+    order.push(generator_id.clone());
+    Ok(())
+}
+
+fn generate_builtin_value(generator: &nix_seal_core::Generator) -> Result<SecretBox<Vec<u8>>> {
+    match generator.executable.as_str() {
+        "builtin:random" => Ok(nix_seal_crypto::random_bytes(generator_byte_length(
+            generator,
+        )?)?),
+        "builtin:hex" => {
+            let input = nix_seal_crypto::random_bytes(generator_byte_length(generator)?)?;
+            let mut output = vec![0_u8; input.expose_secret().len().saturating_mul(2)];
+            hex_encode(input.expose_secret(), &mut output)?;
+            Ok(SecretBox::new(Box::new(output)))
+        }
+        "builtin:uuid" => {
+            if !generator.parameters.is_empty() {
+                bail!("builtin:uuid does not accept parameters");
+            }
+            let mut input = nix_seal_crypto::random_bytes(16)?;
+            let bytes = input.expose_secret_mut();
+            bytes[6] = (bytes[6] & 0x0f) | 0x40;
+            bytes[8] = (bytes[8] & 0x3f) | 0x80;
+            let mut output = Vec::with_capacity(36);
+            for (index, byte) in bytes.iter().enumerate() {
+                if matches!(index, 4 | 6 | 8 | 10) {
+                    output.push(b'-');
+                }
+                output.push(hex_digit(byte >> 4));
+                output.push(hex_digit(byte & 0x0f));
+            }
+            Ok(SecretBox::new(Box::new(output)))
+        }
+        _ => bail!(
+            "generator executable is unsupported; v1 accepts builtin:random, builtin:hex, or builtin:uuid"
+        ),
+    }
+}
+
+fn generator_byte_length(generator: &nix_seal_core::Generator) -> Result<usize> {
+    if generator
+        .parameters
+        .keys()
+        .any(|parameter| parameter != "bytes")
+    {
+        bail!("built-in random generators accept only the bytes parameter");
+    }
+    let length = generator
+        .parameters
+        .get("bytes")
+        .map_or(Ok(32_usize), |value| value.parse::<usize>())
+        .context("generator bytes parameter must be an unsigned integer")?;
+    if !(1..=1024 * 1024).contains(&length) {
+        bail!("generator bytes parameter must be between 1 and 1048576");
+    }
+    Ok(length)
+}
+
+fn hex_encode(input: &[u8], output: &mut [u8]) -> Result<()> {
+    if output.len() != input.len().saturating_mul(2) {
+        bail!("generator hex output length overflow");
+    }
+    for (index, byte) in input.iter().enumerate() {
+        let position = index
+            .checked_mul(2)
+            .context("generator hex index overflow")?;
+        output[position] = hex_digit(byte >> 4);
+        output[position + 1] = hex_digit(byte & 0x0f);
+    }
+    Ok(())
+}
+
+fn hex_digit(value: u8) -> u8 {
+    b"0123456789abcdef"[usize::from(value)]
 }
 
 fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
@@ -2004,6 +2195,127 @@ mod tests {
     use super::*;
     use nix_seal_manifest::{ARTIFACT_SCHEMA, TargetManifestV2};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn built_in_generators_are_bounded_and_format_safe() -> Result<(), Box<dyn std::error::Error>> {
+        let output = nix_seal_core::Id::parse("application/token")?;
+        let random = nix_seal_core::Generator {
+            executable: "builtin:random".to_owned(),
+            dependencies: Vec::new(),
+            outputs: vec![output.clone()],
+            parameters: BTreeMap::from([("bytes".to_owned(), "48".to_owned())]),
+            validation: None,
+        };
+        assert_eq!(generate_builtin_value(&random)?.expose_secret().len(), 48);
+        let hex = nix_seal_core::Generator {
+            executable: "builtin:hex".to_owned(),
+            dependencies: Vec::new(),
+            outputs: vec![output.clone()],
+            parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
+            validation: None,
+        };
+        let hex_value = generate_builtin_value(&hex)?;
+        assert_eq!(hex_value.expose_secret().len(), 48);
+        assert!(hex_value.expose_secret().iter().all(u8::is_ascii_hexdigit));
+        let uuid = nix_seal_core::Generator {
+            executable: "builtin:uuid".to_owned(),
+            dependencies: Vec::new(),
+            outputs: vec![output],
+            parameters: BTreeMap::new(),
+            validation: None,
+        };
+        let uuid = generate_builtin_value(&uuid)?;
+        assert_eq!(uuid.expose_secret().len(), 36);
+        assert_eq!(uuid.expose_secret()[14], b'4');
+        assert!(matches!(
+            uuid.expose_secret()[19],
+            b'8' | b'9' | b'a' | b'b'
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn plan_directed_builtin_generation_encrypts_and_requires_replace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let identity_path = temporary.path().join("administrator.identity");
+        let plan_path = temporary.path().join("plan.v1.json");
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir_all(repository.join("secrets"))?;
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        write_new_private(&identity_path, identity.expose_secret().as_bytes())?;
+        let secret_id = nix_seal_core::Id::parse("application/token")?;
+        let generator_id = nix_seal_core::Id::parse("application-token")?;
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.identities.insert(
+            nix_seal_core::Id::parse("administrator")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: recipient,
+            },
+        );
+        plan.identities.insert(
+            nix_seal_core::Id::parse("signer.release")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Signer,
+                public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public(),
+            },
+        );
+        plan.secrets.insert(
+            secret_id.clone(),
+            nix_seal_core::Secret {
+                source: "secrets/application-token.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: Vec::new(),
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: None,
+            },
+        );
+        plan.generators.insert(
+            generator_id.clone(),
+            nix_seal_core::Generator {
+                executable: "builtin:hex".to_owned(),
+                dependencies: Vec::new(),
+                outputs: vec![secret_id],
+                parameters: BTreeMap::from([("bytes".to_owned(), "20".to_owned())]),
+                validation: None,
+            },
+        );
+        nix_seal_policy::validate(&plan)?;
+        std::fs::write(&plan_path, nix_seal_policy::canonical_json(&plan)?)?;
+        let request = GenerateArgs {
+            plan: plan_path,
+            generator: generator_id,
+            repository_root: repository.clone(),
+            identity: identity_path.clone(),
+            replace: false,
+        };
+        run_generate(&request, false)?;
+        let ciphertext = repository.join("secrets/application-token.age");
+        let mut first = Vec::new();
+        nix_seal_crypto::decrypt(std::fs::File::open(&ciphertext)?, &mut first, &identity)?;
+        assert_eq!(first.len(), 40);
+        assert!(run_generate(&request, false).is_err());
+        let mut unchanged = Vec::new();
+        nix_seal_crypto::decrypt(std::fs::File::open(&ciphertext)?, &mut unchanged, &identity)?;
+        assert_eq!(first, unchanged);
+        run_generate(
+            &GenerateArgs {
+                replace: true,
+                ..request
+            },
+            false,
+        )?;
+        let mut rotated = Vec::new();
+        nix_seal_crypto::decrypt(std::fs::File::open(&ciphertext)?, &mut rotated, &identity)?;
+        assert_eq!(rotated.len(), 40);
+        assert_ne!(first, rotated);
+        Ok(())
+    }
 
     #[test]
     // Exercise the full signed activation document and renderer through the CLI bridge.

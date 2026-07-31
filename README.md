@@ -145,6 +145,18 @@ public-policy and canonical-ciphertext checks used before deployment, then
 reports verified cache inventory and platform/runtime caveats. It emits only
 public metadata and does not decrypt secrets.
 
+## Built-in generation
+
+`nix-seal generate` follows the public plan, derives the canonical recipients,
+and encrypts the generated value through the normal verified authoring path. The
+current Rust-only built-ins are `builtin:random`, `builtin:hex`, and
+`builtin:uuid`. Random and hex generators accept one public `bytes` parameter
+(1–1,048,576; default 32); UUID accepts none. Generation is create-only unless
+`--replace` is explicit. The current safety profile intentionally accepts one
+output per generator; direct executable hooks and multi-output transactions are
+not yet exposed rather than being implemented with weaker partial-commit
+semantics.
+
 ## Development
 
 ```console

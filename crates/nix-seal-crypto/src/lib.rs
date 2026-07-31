@@ -2,6 +2,7 @@
 //! Isolated adapter for the pre-1.0 Rust age implementation.
 
 use age::{Decryptor, Encryptor, Identity, Recipient, secrecy::ExposeSecret};
+use secrecy::{ExposeSecretMut, SecretBox};
 use std::io::{Read, Write};
 use thiserror::Error;
 
@@ -29,6 +30,19 @@ pub enum CryptoError {
     /// Input exceeded the v1 safety bound.
     #[error("secret exceeds the 64 MiB safety limit")]
     InputTooLarge,
+    /// The operating-system CSPRNG failed.
+    #[error("operating-system random generation failed")]
+    Random,
+}
+
+/// Returns CSPRNG bytes in a zeroizing secret container.
+pub fn random_bytes(length: usize) -> Result<SecretBox<Vec<u8>>, CryptoError> {
+    if u64::try_from(length).map_err(|_| CryptoError::InputTooLarge)? > MAX_SECRET_BYTES {
+        return Err(CryptoError::InputTooLarge);
+    }
+    let mut bytes = SecretBox::new(Box::new(vec![0_u8; length]));
+    getrandom::fill(bytes.expose_secret_mut().as_mut_slice()).map_err(|_| CryptoError::Random)?;
+    Ok(bytes)
 }
 
 /// Generates an `X25519` identity and returns `(private, public)`.

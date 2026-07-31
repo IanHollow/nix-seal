@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 age.workspace = true
 blake3.workspace = true
+getrandom.workspace = true
 secrecy.workspace = true
 thiserror.workspace = true
 

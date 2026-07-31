@@ -295,6 +295,9 @@ pub struct Generator {
     pub dependencies: Vec<Id>,
     /// Declared outputs.
     pub outputs: Vec<Id>,
+    /// Strict public generator parameters, such as a random-byte length.
+    #[serde(default)]
+    pub parameters: BTreeMap<String, String>,
     /// Public validation fingerprint.
     pub validation: Option<String>,
 }
