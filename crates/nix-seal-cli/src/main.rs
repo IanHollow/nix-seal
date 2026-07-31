@@ -378,6 +378,30 @@ enum MigrateCommand {
         #[arg(long, default_value = "secrets")]
         directory: PathBuf,
     },
+    /// Stream one legacy age ciphertext into explicit new recipients.
+    Ciphertext {
+        /// Existing repository root; source and destination must remain below it.
+        #[arg(long, default_value = ".")]
+        repository_root: PathBuf,
+        /// Repository-relative legacy age ciphertext source.
+        #[arg(long)]
+        source: PathBuf,
+        /// Repository-relative native nix-seal ciphertext destination.
+        #[arg(long)]
+        destination: PathBuf,
+        /// Private identity authorized to decrypt the legacy source and verify the result.
+        #[arg(long)]
+        identity: PathBuf,
+        /// Explicit canonical age recipient for the replacement; repeat as needed.
+        #[arg(long = "recipient", required = true)]
+        recipients: Vec<String>,
+        /// Replace an existing destination; omission is create-only.
+        #[arg(long)]
+        replace: bool,
+        /// Required acknowledgement that this performs the reported mutation.
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -671,7 +695,98 @@ fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
         MigrateCommand::Secretctl { index } => migrate_secretctl(&index, json),
         MigrateCommand::Agenix { directory } => migrate_agenix_tree(&directory, "agenix", json),
         MigrateCommand::Ragenix { directory } => migrate_agenix_tree(&directory, "ragenix", json),
+        MigrateCommand::Ciphertext {
+            repository_root,
+            source,
+            destination,
+            identity,
+            recipients,
+            replace,
+            execute,
+        } => migrate_ciphertext(
+            &repository_root,
+            &source,
+            &destination,
+            &identity,
+            &recipients,
+            replace,
+            execute,
+            json,
+        ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn migrate_ciphertext(
+    repository_root: &Path,
+    source: &Path,
+    destination: &Path,
+    identity_path: &Path,
+    recipients: &[String],
+    replace: bool,
+    execute: bool,
+    json: bool,
+) -> Result<()> {
+    if recipients.is_empty() {
+        bail!("migration requires at least one replacement recipient");
+    }
+    if !execute {
+        let report = serde_json::json!({
+            "schema":"nix-seal.migration-ciphertext.v1",
+            "dryRun":true,
+            "source":source,
+            "destination":destination,
+            "recipientCount":recipients.len(),
+            "replace":replace,
+        });
+        if json {
+            println!("{report}");
+        } else {
+            println!(
+                "ciphertext migration dry-run: {} -> {}",
+                source.display(),
+                destination.display()
+            );
+            eprintln!(
+                "warning: rerun with --execute only after reviewing recipients and destination"
+            );
+        }
+        return Ok(());
+    }
+    let identity = read_identity(identity_path)?;
+    let mode = if replace {
+        nix_seal_authoring::WriteMode::Replace
+    } else {
+        nix_seal_authoring::WriteMode::Create
+    };
+    let result = nix_seal_authoring::rekey_secret(
+        repository_root,
+        source,
+        destination,
+        recipients,
+        &identity,
+        mode,
+    )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.migration-ciphertext.v1",
+                "dryRun":false,
+                "source":source,
+                "destination":result.path,
+                "ciphertextHash":result.ciphertext_hash,
+                "plaintextBytes":result.plaintext_bytes,
+            })
+        );
+    } else {
+        println!(
+            "ciphertext migrated {} -> {}",
+            source.display(),
+            result.path.display()
+        );
+    }
+    Ok(())
 }
 
 fn migrate_agenix_tree(directory: &Path, source: &str, json: bool) -> Result<()> {

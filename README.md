@@ -184,6 +184,9 @@ nix-seal migrate secretctl --index /tmp/secretctl-index.json --json
 nix-seal migrate agenix --directory ./secrets --json
 # ragenix uses the same standard age ciphertext inventory format
 nix-seal migrate ragenix --directory ./secrets --json
+# First inspect the mutation; then add --execute to stream-reencrypt it.
+nix-seal migrate ciphertext --source legacy/token.age --destination secrets/token.age \
+  --identity /absolute/path/to/administrator.age --recipient age1... --json
 ```
 
 It validates legacy paths, scopes, consumers, IDs, and SSH recipient metadata,
@@ -197,7 +200,11 @@ before automated import.
 The agenix/ragenix adapters recursively inventory only regular `*.age` files,
 validate their age headers, and reject symbolic links or unsafe nesting. Because
 recipient and Nix module policy are not recoverable from ciphertext paths, their
-reports require an explicit nix-seal target/recipient mapping before import.
+reports require an explicit nix-seal target/recipient mapping before import. Use
+`migrate ciphertext --execute` only after reviewing that mapping. It streams one
+source ciphertext directly into replacement recipients, verifies the new
+ciphertext with the named identity, and atomically creates or replaces the
+destination. It never writes plaintext to the repository or Nix store.
 
 ## Development
 

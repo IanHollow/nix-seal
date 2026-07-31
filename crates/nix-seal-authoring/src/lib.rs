@@ -202,6 +202,67 @@ pub fn write_secret<R: Read>(
     })
 }
 
+/// Streams existing canonical age ciphertext into fresh recipients and commits the
+/// verified replacement atomically. Plaintext is never materialized on disk.
+pub fn rekey_secret(
+    repository_root: &Path,
+    relative_source: &Path,
+    relative_destination: &Path,
+    recipients: &[String],
+    verification_identity: &SecretString,
+    mode: WriteMode,
+) -> Result<AuthoringResult, AuthoringError> {
+    let verification_recipient = nix_seal_crypto::recipient_from_identity(verification_identity)?;
+    let normalized_recipients = recipients
+        .iter()
+        .map(|recipient| nix_seal_crypto::normalize_recipient(recipient))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !normalized_recipients.contains(&verification_recipient) {
+        return Err(AuthoringError::VerificationIdentity);
+    }
+    let source = resolve_existing(repository_root, relative_source)?;
+    let source_file = open_nofollow_regular(&source)?;
+    let destination = resolve_destination(repository_root, relative_destination)?;
+    let previous = validate_destination(&destination, mode)?;
+    let parent = destination.parent().ok_or(AuthoringError::UnsafePath)?;
+    let mut staged = NamedTempFile::new_in(parent).map_err(AuthoringError::Io)?;
+    set_private(staged.path()).map_err(AuthoringError::Io)?;
+    nix_seal_crypto::rekey(
+        source_file,
+        staged.as_file_mut(),
+        verification_identity,
+        recipients,
+    )?;
+    staged.as_file().sync_all().map_err(AuthoringError::Io)?;
+    staged.as_file_mut().rewind().map_err(AuthoringError::Io)?;
+    let mut verified = HashingWriter::default();
+    nix_seal_crypto::decrypt(staged.as_file_mut(), &mut verified, verification_identity)?;
+    staged.as_file_mut().rewind().map_err(AuthoringError::Io)?;
+    let ciphertext_hash = hash_file(staged.as_file_mut())?;
+
+    match mode {
+        WriteMode::Create => {
+            staged
+                .persist_noclobber(&destination)
+                .map_err(|error| AuthoringError::Io(error.error))?;
+        }
+        WriteMode::Replace => {
+            ensure_unchanged(&destination, previous.as_ref())?;
+            staged
+                .persist(&destination)
+                .map_err(|error| AuthoringError::Io(error.error))?;
+        }
+    }
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| AuthoringError::DurabilityUnknown)?;
+    Ok(AuthoringResult {
+        path: destination,
+        ciphertext_hash,
+        plaintext_bytes: verified.bytes,
+    })
+}
+
 /// Stages, verifies, and durably commits a group of ciphertext outputs.
 ///
 /// Every output is encrypted and round-trip verified before an existing
@@ -931,6 +992,45 @@ mod tests {
             nix_seal_crypto::decrypt(File::open(&result.path)?, &mut plaintext, &identity)?;
             assert_eq!(plaintext, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn rekey_streams_existing_ciphertext_without_plaintext_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let (administrator_identity, administrator_recipient) = nix_seal_crypto::generate_x25519();
+        let (_, target_recipient) = nix_seal_crypto::generate_x25519();
+        write_secret(
+            &root,
+            Path::new("secrets/source.age"),
+            b"streamed-migration-value".as_slice(),
+            std::slice::from_ref(&administrator_recipient),
+            &administrator_identity,
+            WriteMode::Create,
+        )?;
+        let rekeyed = rekey_secret(
+            &root,
+            Path::new("secrets/source.age"),
+            Path::new("secrets/destination.age"),
+            &[administrator_recipient, target_recipient],
+            &administrator_identity,
+            WriteMode::Create,
+        )?;
+        let ciphertext = std::fs::read(&rekeyed.path)?;
+        assert!(
+            !ciphertext
+                .windows(b"streamed-migration-value".len())
+                .any(|window| window == b"streamed-migration-value")
+        );
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(
+            File::open(&rekeyed.path)?,
+            &mut plaintext,
+            &administrator_identity,
+        )?;
+        assert_eq!(plaintext, b"streamed-migration-value");
         Ok(())
     }
 
