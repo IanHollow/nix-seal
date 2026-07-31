@@ -169,9 +169,9 @@ nix-seal migrate secretctl --index /tmp/secretctl-index.json --json
 
 It validates legacy paths, scopes, consumers, IDs, and SSH recipient metadata,
 then reports normalized nix-seal IDs. It never decrypts or rewrites legacy
-files. New plans should use native age recipients. Existing unencrypted
-OpenSSH Ed25519/RSA identities are supported only as a migration compatibility
-path; encrypted SSH private keys are deliberately rejected in non-interactive
+files. New plans should use native age recipients. Existing unencrypted OpenSSH
+Ed25519/RSA identities are supported only as a migration compatibility path;
+encrypted SSH private keys are deliberately rejected in non-interactive
 workflows, so convert them to a reviewed native-age or hardware-backed identity
 before automated import.
 
