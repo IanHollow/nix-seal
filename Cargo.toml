@@ -7,6 +7,7 @@ members = [
   "crates/nix-seal-crypto",
   "crates/nix-seal-manifest",
   "crates/nix-seal-policy",
+  "crates/nix-seal-rekey",
   "crates/nix-seal-runtime",
 ]
 
@@ -34,6 +35,8 @@ nix-seal-core = { path = "crates/nix-seal-core", version = "=0.1.0-alpha.1" }
 nix-seal-crypto = { path = "crates/nix-seal-crypto", version = "=0.1.0-alpha.1" }
 nix-seal-manifest = { path = "crates/nix-seal-manifest", version = "=0.1.0-alpha.1" }
 nix-seal-policy = { path = "crates/nix-seal-policy", version = "=0.1.0-alpha.1" }
+nix-seal-rekey = { path = "crates/nix-seal-rekey", version = "=0.1.0-alpha.1" }
+rustix = { version = "=1.1.4", features = ["fs"] }
 schemars = "1.0.4"
 secrecy = "0.10.3"
 serde = { version = "1.0.219", features = ["derive"] }

@@ -1109,6 +1109,7 @@ dependencies = [
  "nix-seal-crypto",
  "nix-seal-manifest",
  "nix-seal-policy",
+ "nix-seal-rekey",
  "secrecy",
  "serde",
  "serde_json",
@@ -1138,6 +1139,7 @@ name = "nix-seal-crypto"
 version = "0.1.0-alpha.1"
 dependencies = [
  "age",
+ "blake3",
  "secrecy",
  "thiserror 2.0.19",
 ]
@@ -1169,6 +1171,22 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "nix-seal-rekey"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "blake3",
+ "nix-seal-cache",
+ "nix-seal-core",
+ "nix-seal-crypto",
+ "nix-seal-manifest",
+ "rustix",
+ "secrecy",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

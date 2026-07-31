@@ -1,5 +1,5 @@
 [package]
-name = "nix-seal-crypto"
+name = "nix-seal-rekey"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,9 +7,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-age.workspace = true
 blake3.workspace = true
+nix-seal-cache.workspace = true
+nix-seal-core.workspace = true
+nix-seal-crypto.workspace = true
+nix-seal-manifest.workspace = true
+rustix.workspace = true
 secrecy.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 
 [lints]

@@ -2,7 +2,7 @@
 //! Command-line interface. Plaintext output is limited to `secret reveal`.
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use secrecy::{ExposeSecret, SecretString};
 use std::{
     io::{Read, Write},
@@ -48,6 +48,8 @@ enum Command {
     /// Signed target-artifact operations.
     #[command(subcommand)]
     Artifact(ArtifactCommand),
+    /// Explicitly create or verify a target-encrypted cache artifact.
+    Rekey(RekeyArgs),
     /// Secret authoring operations.
     #[command(subcommand)]
     Secret(SecretCommand),
@@ -129,6 +131,40 @@ enum ArtifactCommand {
         #[arg(long, default_value_t = 300)]
         allowed_clock_skew: u64,
     },
+}
+
+#[derive(Args)]
+struct RekeyArgs {
+    /// Canonical administrator-encrypted age file.
+    #[arg(long)]
+    source: PathBuf,
+    /// Administrator X25519 identity file.
+    #[arg(long)]
+    identity: PathBuf,
+    /// Exact target X25519 recipient.
+    #[arg(long)]
+    recipient: String,
+    /// Canonical plan hash.
+    #[arg(long)]
+    plan_hash: String,
+    /// Bound target ID.
+    #[arg(long)]
+    target: nix_seal_core::Id,
+    /// Bound secret ID.
+    #[arg(long)]
+    secret: nix_seal_core::Id,
+    /// Monotonic artifact generation.
+    #[arg(long)]
+    generation: u64,
+    /// Separate Ed25519 artifact-approval key.
+    #[arg(long)]
+    signing_key: PathBuf,
+    /// Optional approval expiry as Unix seconds.
+    #[arg(long)]
+    expires_at: Option<u64>,
+    /// Override the standard XDG cache root.
+    #[arg(long)]
+    cache_root: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -219,6 +255,7 @@ fn run() -> Result<()> {
         }
         Command::Key(command) => run_key(command, cli.json)?,
         Command::Artifact(command) => run_artifact(command, cli.json)?,
+        Command::Rekey(arguments) => run_rekey(arguments, cli.json)?,
         Command::Secret(command) => run_secret(command)?,
         Command::Schema => println!("{}", nix_seal_policy::json_schema()?),
         Command::Completions { shell } => completions(shell),
@@ -382,6 +419,64 @@ fn run_artifact(command: ArtifactCommand, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_rekey(arguments: RekeyArgs, json: bool) -> Result<()> {
+    let identity = read_identity(&arguments.identity)?;
+    let signing_key = read_signing_key(&arguments.signing_key)?;
+    let issued_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    if arguments
+        .expires_at
+        .is_some_and(|expiry| expiry <= issued_at)
+    {
+        bail!("--expires-at must be later than the current time");
+    }
+    let root = arguments.cache_root.unwrap_or_else(default_cache_root);
+    let cache = nix_seal_cache::Cache::open(root)?;
+    let request = nix_seal_rekey::RekeyRequest {
+        source: &arguments.source,
+        administrator_identity: &identity,
+        target_recipient: &arguments.recipient,
+        plan_hash: &arguments.plan_hash,
+        target_id: &arguments.target,
+        secret_id: &arguments.secret,
+        artifact_generation: arguments.generation,
+        issued_at,
+        expires_at: arguments.expires_at,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        signing_key: &signing_key,
+    };
+    let result = nix_seal_rekey::rekey(&cache, &request)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.output.v1",
+                "cacheKey":result.cache_key,
+                "sourceCiphertextHash":result.source_ciphertext_hash,
+                "artifactCiphertextHash":result.artifact_ciphertext_hash,
+                "recipientFingerprint":result.recipient_fingerprint,
+                "ciphertextPath":result.ciphertext_path,
+                "reused":result.reused,
+                "target":arguments.target,
+                "secret":arguments.secret,
+                "generation":arguments.generation
+            })
+        );
+    } else {
+        println!("{}", result.cache_key);
+        eprintln!(
+            "{} target artifact for {} on {}: {}",
+            if result.reused { "reused" } else { "created" },
+            arguments.secret,
+            arguments.target,
+            result.ciphertext_path.display()
+        );
+    }
+    Ok(())
+}
+
 fn artifact_written(path: &Path, signatures: usize, json: bool) {
     if json {
         println!(
@@ -506,15 +601,25 @@ fn set_private_file(_path: &Path) -> Result<()> {
 fn cache_status(root: Option<PathBuf>, json: bool) -> Result<()> {
     let root = root.unwrap_or_else(default_cache_root);
     let cache = nix_seal_cache::Cache::open(&root)?;
-    let count = std::fs::read_dir(cache.root().join("objects"))
+    let objects = std::fs::read_dir(cache.root().join("objects"))
+        .map_or(0, |entries| entries.filter_map(Result::ok).count());
+    let artifacts = std::fs::read_dir(cache.root().join("artifacts"))
         .map_or(0, |entries| entries.filter_map(Result::ok).count());
     if json {
         println!(
             "{}",
-            serde_json::json!({"schema":"nix-seal.output.v1","root":cache.root(),"objects":count})
+            serde_json::json!({
+                "schema":"nix-seal.output.v1",
+                "root":cache.root(),
+                "objects":objects,
+                "artifacts":artifacts
+            })
         );
     } else {
-        println!("{}: {count} objects", cache.root().display());
+        println!(
+            "{}: {objects} objects, {artifacts} target artifacts",
+            cache.root().display()
+        );
     }
     Ok(())
 }
