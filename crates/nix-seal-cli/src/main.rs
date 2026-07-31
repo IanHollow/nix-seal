@@ -521,6 +521,20 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let templates = spec
+        .templates
+        .iter()
+        .map(|template| {
+            Ok(nix_seal_runtime::ActivationTemplate {
+                source: &template.source,
+                template_id: &template.template_id,
+                placeholders: &template.placeholders,
+                mode: template.parsed_mode()?,
+                owner: &template.owner,
+                group: &template.group,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?
@@ -538,6 +552,7 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
         approval_threshold: spec.approval_threshold,
         target_identity: &identity,
         artifacts: &artifacts,
+        templates: &templates,
         post_switch: spec.post_switch.as_ref(),
     };
     let result = nix_seal_runtime::activate(&request)?;
@@ -550,14 +565,16 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
                 "changed":result.changed,
                 "target":spec.target_id,
                 "generationPath":result.generation_path,
-                "secretCount":result.secret_count
+                "secretCount":result.secret_count,
+                "templateCount":result.template_count
             })
         );
     } else {
         println!("{}", result.generation_path.display());
         eprintln!(
-            "activated {} secret(s) for {} ({})",
+            "activated {} secret(s) and {} template(s) for {} ({})",
             result.secret_count,
+            result.template_count,
             spec.target_id,
             if result.changed {
                 "changed"
@@ -793,14 +810,18 @@ fn completions(shell: CompletionShell) {
 mod tests {
     use super::*;
     use nix_seal_manifest::{ARTIFACT_SCHEMA, TargetManifestV1};
+    use std::collections::BTreeMap;
 
     #[test]
+    // Exercise the full signed activation document and renderer through the CLI bridge.
+    #[allow(clippy::too_many_lines)]
     fn internal_activate_command_materializes_signed_spec() -> Result<(), Box<dyn std::error::Error>>
     {
         let temporary = tempfile::tempdir()?;
         let identity_path = temporary.path().join("target.identity");
         let ciphertext_path = temporary.path().join("artifact.age");
         let envelope_path = temporary.path().join("artifact.json");
+        let template_path = temporary.path().join("application.conf.template");
         let spec_path = temporary.path().join("activation.json");
         let runtime_root = temporary.path().join("runtime");
         let (identity, recipient) = nix_seal_crypto::generate_x25519();
@@ -839,6 +860,13 @@ mod tests {
             &envelope_path,
             &nix_seal_manifest::sign_manifest(&manifest, &signer)?,
         )?;
+        std::fs::write(&template_path, b"password={{nix-seal:password-base64}}\n")?;
+        let owner = uzers::get_user_by_uid(uzers::get_current_uid())
+            .and_then(|user| user.name().to_str().map(str::to_owned))
+            .ok_or("current user is not resolvable")?;
+        let group = uzers::get_group_by_gid(uzers::get_current_gid())
+            .and_then(|group| group.name().to_str().map(str::to_owned))
+            .ok_or("current group is not resolvable")?;
         let mut spec = nix_seal_runtime::ActivationSpecV1 {
             schema: nix_seal_runtime::ACTIVATION_SCHEMA.to_owned(),
             runtime_root: runtime_root.clone(),
@@ -852,16 +880,26 @@ mod tests {
             artifacts: vec![nix_seal_runtime::ActivationArtifactSpecV1 {
                 ciphertext: ciphertext_path,
                 envelope: envelope_path,
-                secret_id,
+                secret_id: secret_id.clone(),
                 source_ciphertext_hash: source_hash,
                 artifact_generation: 1,
                 mode: "0400".to_owned(),
-                owner: uzers::get_user_by_uid(uzers::get_current_uid())
-                    .and_then(|user| user.name().to_str().map(str::to_owned))
-                    .ok_or("current user is not resolvable")?,
-                group: uzers::get_group_by_gid(uzers::get_current_gid())
-                    .and_then(|group| group.name().to_str().map(str::to_owned))
-                    .ok_or("current group is not resolvable")?,
+                owner: owner.clone(),
+                group: group.clone(),
+            }],
+            templates: vec![nix_seal_runtime::ActivationTemplateSpecV1 {
+                source: template_path,
+                template_id: nix_seal_core::Id::parse("application/config")?,
+                placeholders: BTreeMap::from([(
+                    "password-base64".to_owned(),
+                    nix_seal_runtime::TemplatePlaceholderSpecV1 {
+                        secret_id,
+                        encoding: nix_seal_runtime::TemplateEncodingV1::Base64,
+                    },
+                )]),
+                mode: "0400".to_owned(),
+                owner,
+                group,
             }],
             post_switch: None,
         };
@@ -894,6 +932,10 @@ mod tests {
         assert_eq!(
             std::fs::read(runtime_root.join("current/db/password"))?,
             b"cli-activation-canary"
+        );
+        assert_eq!(
+            std::fs::read(runtime_root.join("current/templates/application/config"))?,
+            b"password=Y2xpLWFjdGl2YXRpb24tY2FuYXJ5\n"
         );
         Ok(())
     }

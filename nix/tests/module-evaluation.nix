@@ -9,6 +9,9 @@ let
   digest = character: builtins.concatStringsSep "" (lib.replicate 64 character);
   ciphertext = pkgs.writeText "nix-seal-test-artifact.age" "public ciphertext fixture";
   envelope = pkgs.writeText "nix-seal-test-envelope.json" "public envelope fixture";
+  templateSource = pkgs.writeText "nix-seal-test-template" ''
+    password={{nix-seal:password}}
+  '';
   common = {
     nixSeal = {
       enable = true;
@@ -20,6 +23,11 @@ let
       secrets."db/password" = {
         inherit ciphertext envelope;
         sourceCiphertextHash = digest "2";
+      };
+      templates."application/config" = {
+        source = templateSource;
+        placeholders.password.secret = "db/password";
+        restartUnits = [ "example.service" ];
       };
     };
   };
@@ -67,6 +75,31 @@ let
       }
     ];
   };
+  templatePolicyViolation = inputs.nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = [
+      self.nixosModules.default
+      common
+      {
+        system.stateVersion = "26.05";
+        nixSeal = {
+          secrets."templates/application/config" = {
+            inherit ciphertext envelope;
+            sourceCiphertextHash = digest "4";
+          };
+          secrets."invalid../id" = {
+            inherit ciphertext envelope;
+            sourceCiphertextHash = digest "5";
+          };
+          templates."unknown/config" = {
+            source = templateSource;
+            placeholders.value.secret = "missing/secret";
+          };
+          templates."missing/source".placeholders.value.secret = "db/password";
+        };
+      }
+    ];
+  };
   home = inputs.home-manager.lib.homeManagerConfiguration {
     inherit pkgs;
     modules = [
@@ -88,14 +121,22 @@ let
       jq -e \
         --arg manager ${lib.escapeShellArg manager} \
         --arg owner ${lib.escapeShellArg owner} \
-        --arg group ${lib.escapeShellArg group} '
+        --arg group ${lib.escapeShellArg group} \
+        --arg templateSource ${lib.escapeShellArg (toString templateSource)} '
         .schema == "nix-seal.activation.v1" and
         .targetId == "host.test" and
         .approvalThreshold == 1 and
         (.artifacts | length) == 1 and
+        (.templates | length) == 1 and
         .artifacts[0].secretId == "db/password" and
         .artifacts[0].owner == $owner and
         .artifacts[0].group == $group and
+        .templates[0].templateId == "application/config" and
+        .templates[0].source == $templateSource and
+        .templates[0].placeholders.password.secretId == "db/password" and
+        .templates[0].placeholders.password.encoding == "utf8" and
+        .templates[0].owner == $owner and
+        .templates[0].group == $group and
         .postSwitch.restartUnits == ["example.service"] and
         .postSwitch.manager == $manager
       ' ${spec} >/dev/null
@@ -152,6 +193,18 @@ in
       "systemd service example.service has a LoadCredential name that conflicts with nixSeal"
       credentialCollision;
     pkgs.runCommand "nix-seal-module-credential-policy" { } ''
+      touch "$out"
+    '';
+  module-template-policy =
+    assert hasFailedAssertion "nixSeal secret and template names must be lowercase stable IDs"
+      templatePolicyViolation;
+    assert hasFailedAssertion "every declared nixSeal template requires a public source"
+      templatePolicyViolation;
+    assert hasFailedAssertion "every nixSeal template placeholder must reference a configured secret"
+      templatePolicyViolation;
+    assert hasFailedAssertion "a nixSeal template output cannot collide with a secret runtime path"
+      templatePolicyViolation;
+    pkgs.runCommand "nix-seal-module-template-policy" { } ''
       touch "$out"
     '';
 }

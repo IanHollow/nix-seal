@@ -7,7 +7,7 @@ use nix_seal_manifest::{ExpectedBinding, SignedEnvelopeV1, TrustedKeys};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -17,9 +17,12 @@ use std::{
 };
 use tempfile::TempDir;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 const MAX_CIPHERTEXT_BYTES: u64 = 70 * 1024 * 1024;
 const MAX_ENVELOPE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_TEMPLATE_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_TEMPLATE_OUTPUT_BYTES: u64 = 128 * 1024 * 1024;
 /// Exact schema accepted for public activation metadata.
 pub const ACTIVATION_SCHEMA: &str = "nix-seal.activation.v1";
 
@@ -49,6 +52,9 @@ pub struct ActivationSpecV1 {
     pub trusted_keys: Vec<String>,
     /// Complete all-or-nothing artifact batch.
     pub artifacts: Vec<ActivationArtifactSpecV1>,
+    /// Public templates rendered only after every secret decrypts successfully.
+    #[serde(default)]
+    pub templates: Vec<ActivationTemplateSpecV1>,
     /// Optional platform service actions after a changed successful switch, or
     /// when retrying a pending action set from that switch.
     #[serde(default)]
@@ -110,6 +116,53 @@ pub struct ActivationArtifactSpecV1 {
     pub group: String,
 }
 
+/// One public runtime template declaration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ActivationTemplateSpecV1 {
+    /// Public UTF-8 template source. It may enter the Nix store.
+    pub source: PathBuf,
+    /// Public template ID; output is `templates/<template_id>` in a generation.
+    pub template_id: Id,
+    /// Strict placeholder declarations keyed by placeholder name.
+    pub placeholders: BTreeMap<String, TemplatePlaceholderSpecV1>,
+    /// Restrictive octal mode such as `0400`.
+    pub mode: String,
+    /// Existing operating-system account that owns the rendered file.
+    pub owner: String,
+    /// Existing operating-system group that owns the rendered file.
+    pub group: String,
+}
+
+impl ActivationTemplateSpecV1 {
+    /// Returns the validated numeric runtime mode.
+    pub fn parsed_mode(&self) -> Result<u32, RuntimeError> {
+        parse_mode(&self.mode)
+    }
+}
+
+/// One declared template placeholder.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TemplatePlaceholderSpecV1 {
+    /// Activated secret used for this placeholder.
+    pub secret_id: Id,
+    /// Explicit transformation from arbitrary secret bytes to template text.
+    pub encoding: TemplateEncodingV1,
+}
+
+/// Supported secret-to-text template transformations.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TemplateEncodingV1 {
+    /// Require valid UTF-8 and copy it without modification.
+    Utf8,
+    /// RFC 4648 base64 with padding.
+    Base64,
+    /// Lowercase hexadecimal.
+    Hex,
+}
+
 impl ActivationArtifactSpecV1 {
     /// Returns the validated numeric runtime mode.
     pub fn parsed_mode(&self) -> Result<u32, RuntimeError> {
@@ -143,19 +196,38 @@ impl ActivationSpecV1 {
                 .any(|key| key.is_empty() || key.len() > 16 * 1024)
             || self.artifacts.is_empty()
             || self.artifacts.len() > 10_000
+            || self.templates.len() > 1_024
         {
             return Err(RuntimeError::InvalidSpec);
         }
-        let mut ids = BTreeSet::new();
+        let mut destinations = BTreeSet::new();
+        let mut secret_ids = BTreeSet::new();
         for artifact in &self.artifacts {
             if !artifact.ciphertext.is_absolute()
                 || !artifact.envelope.is_absolute()
                 || !is_digest(&artifact.source_ciphertext_hash)
                 || artifact.artifact_generation == 0
-                || !ids.insert(&artifact.secret_id)
+                || !destinations.insert(artifact.secret_id.as_str().to_owned())
+                || !secret_ids.insert(artifact.secret_id.clone())
                 || parse_mode(&artifact.mode).is_err()
                 || !is_account_name(&artifact.owner)
                 || !is_account_name(&artifact.group)
+            {
+                return Err(RuntimeError::InvalidSpec);
+            }
+        }
+        for template in &self.templates {
+            let destination = template_output_id(&template.template_id)?;
+            if !template.source.is_absolute()
+                || !destinations.insert(destination.as_str().to_owned())
+                || template.placeholders.is_empty()
+                || template.placeholders.len() > 256
+                || parse_mode(&template.mode).is_err()
+                || !is_account_name(&template.owner)
+                || !is_account_name(&template.group)
+                || template.placeholders.iter().any(|(name, placeholder)| {
+                    !is_placeholder_name(name) || !secret_ids.contains(&placeholder.secret_id)
+                })
             {
                 return Err(RuntimeError::InvalidSpec);
             }
@@ -212,6 +284,22 @@ pub struct ActivationArtifact<'a> {
     pub group: &'a str,
 }
 
+/// One public template and its exact runtime policy.
+pub struct ActivationTemplate<'a> {
+    /// Public UTF-8 template source.
+    pub source: &'a Path,
+    /// Template ID and runtime destination suffix.
+    pub template_id: &'a Id,
+    /// Explicit placeholder-to-secret declarations.
+    pub placeholders: &'a BTreeMap<String, TemplatePlaceholderSpecV1>,
+    /// Restrictive runtime mode.
+    pub mode: u32,
+    /// Existing operating-system account that owns the rendered file.
+    pub owner: &'a str,
+    /// Existing operating-system group that owns the rendered file.
+    pub group: &'a str,
+}
+
 /// Complete policy and trust context for one atomic activation.
 pub struct ActivationRequest<'a> {
     /// Restrictive runtime root such as `/run/nix-seal`.
@@ -238,6 +326,8 @@ pub struct ActivationRequest<'a> {
     pub target_identity: &'a SecretString,
     /// Every artifact in the all-or-nothing generation.
     pub artifacts: &'a [ActivationArtifact<'a>],
+    /// Every template in the same all-or-nothing generation.
+    pub templates: &'a [ActivationTemplate<'a>],
     /// Optional changed-generation service actions and pending retry policy.
     pub post_switch: Option<&'a PostSwitchSpecV1>,
 }
@@ -249,6 +339,8 @@ pub struct ActivationResult {
     pub generation_path: PathBuf,
     /// Number of activated secret files.
     pub secret_count: usize,
+    /// Number of rendered template files.
+    pub template_count: usize,
     /// Whether plaintext content or runtime metadata changed.
     pub changed: bool,
 }
@@ -274,6 +366,12 @@ pub enum RuntimeError {
     /// Public activation metadata violated its strict schema or resource limits.
     #[error("invalid activation specification")]
     InvalidSpec,
+    /// A template source or placeholder declaration violated the v1 grammar.
+    #[error("runtime template is malformed")]
+    TemplateSyntax,
+    /// A text placeholder referenced secret bytes that are not valid UTF-8.
+    #[error("runtime template UTF-8 transform failed")]
+    TemplateEncoding,
     /// A declared runtime owner or group does not exist.
     #[error("declared runtime owner or group does not exist")]
     UnknownAccount,
@@ -305,15 +403,28 @@ struct PreparedArtifact<'a> {
     gid: u32,
 }
 
-/// Authenticates every artifact before decrypting any, then atomically switches
-/// a complete runtime generation.
-pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, RuntimeError> {
-    if request.runtime_generation == Some(0) || request.artifacts.is_empty() {
-        return Err(RuntimeError::InvalidDestination);
-    }
+struct PreparedTemplate<'a> {
+    source: Vec<u8>,
+    output_id: Id,
+    placeholders: &'a BTreeMap<String, TemplatePlaceholderSpecV1>,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+fn prepare_artifacts<'a>(
+    request: &ActivationRequest<'a>,
+    secret_ids: &mut BTreeSet<Id>,
+    output_ids: &mut BTreeSet<String>,
+) -> Result<Vec<PreparedArtifact<'a>>, RuntimeError> {
     let mut prepared = Vec::with_capacity(request.artifacts.len());
     for artifact in request.artifacts {
         validate_mode(artifact.mode)?;
+        if !secret_ids.insert(artifact.secret_id.clone())
+            || !output_ids.insert(artifact.secret_id.as_str().to_owned())
+        {
+            return Err(RuntimeError::InvalidSpec);
+        }
         let uid = resolve_user(artifact.owner)?;
         let gid = resolve_group(artifact.group)?;
         let mut ciphertext = open_regular_nofollow(artifact.ciphertext)?;
@@ -350,8 +461,64 @@ pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, Run
             gid,
         });
     }
+    Ok(prepared)
+}
+
+fn prepare_templates<'a>(
+    templates: &'a [ActivationTemplate<'a>],
+    secret_ids: &BTreeSet<Id>,
+    output_ids: &mut BTreeSet<String>,
+) -> Result<Vec<PreparedTemplate<'a>>, RuntimeError> {
+    let mut prepared = Vec::with_capacity(templates.len());
+    for template in templates {
+        validate_mode(template.mode)?;
+        if !template.source.is_absolute()
+            || template.placeholders.is_empty()
+            || template.placeholders.len() > 256
+            || template.placeholders.iter().any(|(name, placeholder)| {
+                !is_placeholder_name(name) || !secret_ids.contains(&placeholder.secret_id)
+            })
+        {
+            return Err(RuntimeError::InvalidSpec);
+        }
+        let output_id = template_output_id(template.template_id)?;
+        if !output_ids.insert(output_id.as_str().to_owned()) {
+            return Err(RuntimeError::InvalidSpec);
+        }
+        let source = read_bounded(
+            open_regular_nofollow(template.source)?,
+            MAX_TEMPLATE_SOURCE_BYTES,
+        )?;
+        validate_template_source(&source, template.placeholders)?;
+        prepared.push(PreparedTemplate {
+            source,
+            output_id,
+            placeholders: template.placeholders,
+            mode: template.mode,
+            uid: resolve_user(template.owner)?,
+            gid: resolve_group(template.group)?,
+        });
+    }
+    Ok(prepared)
+}
+
+/// Authenticates every artifact before decrypting any, then atomically switches
+/// a complete runtime generation.
+pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, RuntimeError> {
+    if request.runtime_generation == Some(0)
+        || request.artifacts.is_empty()
+        || request.artifacts.len() > 10_000
+        || request.templates.len() > 1_024
+    {
+        return Err(RuntimeError::InvalidDestination);
+    }
+    let mut secret_ids = BTreeSet::new();
+    let mut output_ids = BTreeSet::new();
+    let mut prepared = prepare_artifacts(request, &mut secret_ids, &mut output_ids)?;
+    let prepared_templates = prepare_templates(request.templates, &secret_ids, &mut output_ids)?;
 
     let generation = Generation::begin(request.runtime_root)?;
+    let mut activated_outputs = Vec::with_capacity(prepared.len() + prepared_templates.len());
     for artifact in &mut prepared {
         let mut destination = generation.create_file_owned(
             artifact.secret_id,
@@ -365,12 +532,18 @@ pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, Run
             request.target_identity,
         )?;
         destination.sync_all()?;
+        activated_outputs.push(artifact.secret_id.clone());
     }
-    if let Some(generation_path) = generation.matching_current(&prepared)? {
+    for template in &prepared_templates {
+        generation.render_template(template)?;
+        activated_outputs.push(template.output_id.clone());
+    }
+    if let Some(generation_path) = generation.matching_current(&activated_outputs)? {
         generation.finish_unchanged(&generation_path, request.plan_hash, request.post_switch)?;
         return Ok(ActivationResult {
             generation_path,
             secret_count: request.artifacts.len(),
+            template_count: request.templates.len(),
             changed: false,
         });
     }
@@ -382,6 +555,7 @@ pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, Run
     Ok(ActivationResult {
         generation_path,
         secret_count: request.artifacts.len(),
+        template_count: request.templates.len(),
         changed: true,
     })
 }
@@ -472,19 +646,46 @@ impl Generation {
         Ok(())
     }
 
-    fn matching_current(
-        &self,
-        artifacts: &[PreparedArtifact<'_>],
-    ) -> Result<Option<PathBuf>, RuntimeError> {
+    fn render_template(&self, template: &PreparedTemplate<'_>) -> Result<(), RuntimeError> {
+        let mut output = self.create_file_owned(
+            &template.output_id,
+            template.mode,
+            template.uid,
+            template.gid,
+        )?;
+        let mut limited = LimitedWriter::new(&mut output, MAX_TEMPLATE_OUTPUT_BYTES);
+        render_template_source(
+            &template.source,
+            template.placeholders,
+            &mut limited,
+            |placeholder, writer| {
+                let source = self.transaction.path().join(placeholder.secret_id.as_str());
+                let mut secret = open_regular_nofollow(&source)?;
+                if secret.metadata()?.len() > MAX_CIPHERTEXT_BYTES {
+                    return Err(RuntimeError::Limit);
+                }
+                match placeholder.encoding {
+                    TemplateEncodingV1::Utf8 => copy_utf8(&mut secret, writer),
+                    TemplateEncodingV1::Base64 => copy_base64(&mut secret, writer),
+                    TemplateEncodingV1::Hex => copy_hex(&mut secret, writer),
+                }
+            },
+        )?;
+        limited.flush().map_err(template_io_error)?;
+        output.sync_all()?;
+        Ok(())
+    }
+
+    fn matching_current(&self, outputs: &[Id]) -> Result<Option<PathBuf>, RuntimeError> {
         let Some(current) = current_generation(&self.root)? else {
             return Ok(None);
         };
-        if count_regular_files(&current)? != artifacts.len() {
+        if count_regular_files(&current)? != outputs.len() {
             return Ok(None);
         }
-        for artifact in artifacts {
-            let candidate = self.transaction.path().join(artifact.secret_id.as_str());
-            let active = current.join(artifact.secret_id.as_str());
+        for output in outputs {
+            let candidate = self.transaction.path().join(output.as_str());
+            let active = current.join(output.as_str());
             if !regular_files_equal(&candidate, &active)? {
                 return Ok(None);
             }
@@ -813,8 +1014,8 @@ fn regular_files_equal(left: &Path, right: &Path) -> Result<bool, RuntimeError> 
     if left_metadata.len() != right_metadata.len() {
         return Ok(false);
     }
-    Ok(hash_bounded(&mut left_file, MAX_CIPHERTEXT_BYTES)?
-        == hash_bounded(&mut right_file, MAX_CIPHERTEXT_BYTES)?)
+    Ok(hash_bounded(&mut left_file, MAX_TEMPLATE_OUTPUT_BYTES)?
+        == hash_bounded(&mut right_file, MAX_TEMPLATE_OUTPUT_BYTES)?)
 }
 
 fn parse_mode(value: &str) -> Result<u32, RuntimeError> {
@@ -847,6 +1048,237 @@ fn is_unit_name(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'@' | b':')
         })
+}
+
+fn is_placeholder_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        })
+}
+
+fn template_output_id(template_id: &Id) -> Result<Id, RuntimeError> {
+    Id::parse(format!("templates/{}", template_id.as_str())).map_err(|_| RuntimeError::InvalidSpec)
+}
+
+enum TemplatePart<'a> {
+    Literal(&'a [u8]),
+    Placeholder(&'a TemplatePlaceholderSpecV1),
+}
+
+fn visit_template_source<'a, F>(
+    source: &'a [u8],
+    placeholders: &'a BTreeMap<String, TemplatePlaceholderSpecV1>,
+    mut visitor: F,
+) -> Result<(), RuntimeError>
+where
+    F: FnMut(TemplatePart<'a>) -> Result<(), RuntimeError>,
+{
+    let source = std::str::from_utf8(source).map_err(|_| RuntimeError::TemplateSyntax)?;
+    let mut used = BTreeSet::new();
+    let mut literal_start = 0;
+    let mut search_start = 0;
+    while let Some(relative_start) = source[search_start..].find("{{") {
+        let start = search_start
+            .checked_add(relative_start)
+            .ok_or(RuntimeError::Limit)?;
+        let remainder = &source[start..];
+        if remainder.starts_with("{{nix-seal:") {
+            visitor(TemplatePart::Literal(
+                &source.as_bytes()[literal_start..start],
+            ))?;
+            let name_start = start
+                .checked_add("{{nix-seal:".len())
+                .ok_or(RuntimeError::Limit)?;
+            let relative_end = source[name_start..]
+                .find("}}")
+                .ok_or(RuntimeError::TemplateSyntax)?;
+            let end = name_start
+                .checked_add(relative_end)
+                .ok_or(RuntimeError::Limit)?;
+            let name = &source[name_start..end];
+            if !is_placeholder_name(name) {
+                return Err(RuntimeError::TemplateSyntax);
+            }
+            let placeholder = placeholders.get(name).ok_or(RuntimeError::TemplateSyntax)?;
+            used.insert(name);
+            visitor(TemplatePart::Placeholder(placeholder))?;
+            literal_start = end.checked_add(2).ok_or(RuntimeError::Limit)?;
+            search_start = literal_start;
+        } else if remainder.starts_with("{{nix-seal") {
+            return Err(RuntimeError::TemplateSyntax);
+        } else {
+            search_start = start.checked_add(2).ok_or(RuntimeError::Limit)?;
+        }
+    }
+    visitor(TemplatePart::Literal(&source.as_bytes()[literal_start..]))?;
+    if used.len() != placeholders.len()
+        || placeholders
+            .keys()
+            .any(|name| !used.contains(name.as_str()))
+    {
+        return Err(RuntimeError::TemplateSyntax);
+    }
+    Ok(())
+}
+
+fn validate_template_source(
+    source: &[u8],
+    placeholders: &BTreeMap<String, TemplatePlaceholderSpecV1>,
+) -> Result<(), RuntimeError> {
+    visit_template_source(source, placeholders, |_| Ok(()))
+}
+
+fn render_template_source<W, F>(
+    source: &[u8],
+    placeholders: &BTreeMap<String, TemplatePlaceholderSpecV1>,
+    writer: &mut W,
+    mut render_placeholder: F,
+) -> Result<(), RuntimeError>
+where
+    W: Write,
+    F: FnMut(&TemplatePlaceholderSpecV1, &mut W) -> Result<(), RuntimeError>,
+{
+    visit_template_source(source, placeholders, |part| match part {
+        TemplatePart::Literal(literal) => template_write_all(writer, literal),
+        TemplatePart::Placeholder(placeholder) => render_placeholder(placeholder, writer),
+    })
+}
+
+struct LimitedWriter<'a, W> {
+    inner: &'a mut W,
+    written: u64,
+    limit: u64,
+}
+
+impl<'a, W> LimitedWriter<'a, W> {
+    const fn new(inner: &'a mut W, limit: u64) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
+        }
+    }
+}
+
+impl<W: Write> Write for LimitedWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let length = u64::try_from(bytes.len())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::FileTooLarge))?;
+        if length > self.limit.saturating_sub(self.written) {
+            return Err(std::io::ErrorKind::FileTooLarge.into());
+        }
+        let written = self.inner.write(bytes)?;
+        self.written = self
+            .written
+            .checked_add(u64::try_from(written).map_err(|_| std::io::ErrorKind::FileTooLarge)?)
+            .ok_or(std::io::ErrorKind::FileTooLarge)?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn template_io_error(error: std::io::Error) -> RuntimeError {
+    if error.kind() == std::io::ErrorKind::FileTooLarge {
+        RuntimeError::Limit
+    } else {
+        RuntimeError::Io(error)
+    }
+}
+
+fn template_write_all<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<(), RuntimeError> {
+    writer.write_all(bytes).map_err(template_io_error)
+}
+
+fn read_secret<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<usize, RuntimeError> {
+    loop {
+        match reader.read(buffer) {
+            Ok(read) => return Ok(read),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(RuntimeError::Io(error)),
+        }
+    }
+}
+
+fn copy_utf8<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<(), RuntimeError> {
+    let mut buffer = Zeroizing::new(vec![0_u8; 8 * 1024 + 3]);
+    let mut carried = 0_usize;
+    loop {
+        let read = read_secret(reader, &mut buffer[carried..])?;
+        if read == 0 {
+            if carried != 0 {
+                return Err(RuntimeError::TemplateEncoding);
+            }
+            return Ok(());
+        }
+        let total = carried.checked_add(read).ok_or(RuntimeError::Limit)?;
+        match std::str::from_utf8(&buffer[..total]) {
+            Ok(_) => {
+                template_write_all(writer, &buffer[..total])?;
+                carried = 0;
+            }
+            Err(error) if error.error_len().is_none() => {
+                let valid = error.valid_up_to();
+                template_write_all(writer, &buffer[..valid])?;
+                carried = total.checked_sub(valid).ok_or(RuntimeError::Limit)?;
+                if carried > 3 {
+                    return Err(RuntimeError::TemplateEncoding);
+                }
+                buffer.copy_within(valid..total, 0);
+            }
+            Err(_) => return Err(RuntimeError::TemplateEncoding),
+        }
+    }
+}
+
+fn copy_base64<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<(), RuntimeError> {
+    use base64::Engine as _;
+    let mut input = Zeroizing::new(vec![0_u8; 8 * 1024 + 2]);
+    let mut encoded = Zeroizing::new(vec![0_u8; 11 * 1024]);
+    let mut carried = 0_usize;
+    loop {
+        let read = read_secret(reader, &mut input[carried..])?;
+        let total = carried.checked_add(read).ok_or(RuntimeError::Limit)?;
+        let complete = if read == 0 { total } else { total / 3 * 3 };
+        if complete != 0 {
+            let length = base64::engine::general_purpose::STANDARD
+                .encode_slice(&input[..complete], &mut encoded)
+                .map_err(|_| RuntimeError::Limit)?;
+            template_write_all(writer, &encoded[..length])?;
+        }
+        carried = total.checked_sub(complete).ok_or(RuntimeError::Limit)?;
+        if read == 0 {
+            return Ok(());
+        }
+        input.copy_within(complete..total, 0);
+    }
+}
+
+fn copy_hex<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<(), RuntimeError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut input = Zeroizing::new(vec![0_u8; 8 * 1024]);
+    let mut encoded = Zeroizing::new(vec![0_u8; 16 * 1024]);
+    loop {
+        let read = read_secret(reader, &mut input)?;
+        if read == 0 {
+            return Ok(());
+        }
+        for (index, byte) in input[..read].iter().copied().enumerate() {
+            let offset = index.checked_mul(2).ok_or(RuntimeError::Limit)?;
+            encoded[offset] = HEX[usize::from(byte >> 4)];
+            encoded[offset + 1] = HEX[usize::from(byte & 0x0f)];
+        }
+        let length = read.checked_mul(2).ok_or(RuntimeError::Limit)?;
+        template_write_all(writer, &encoded[..length])?;
+    }
 }
 
 #[cfg(unix)]
@@ -1139,10 +1571,12 @@ mod tests {
         ciphertext: PathBuf,
         envelope: PathBuf,
         target_identity: SecretString,
+        target_recipient: String,
         target_id: Id,
         secret_id: Id,
         fingerprint: String,
         trusted: TrustedKeys,
+        signing_key: ApprovalSigningKey,
         owner: String,
         group: String,
     }
@@ -1158,7 +1592,7 @@ mod tests {
         nix_seal_crypto::encrypt(
             b"plaintext-canary".as_slice(),
             &mut output,
-            &[target_recipient],
+            std::slice::from_ref(&target_recipient),
         )?;
         output.sync_all()?;
         let artifact_hash = hash_bounded(&mut File::open(&ciphertext)?, MAX_CIPHERTEXT_BYTES)?;
@@ -1200,10 +1634,12 @@ mod tests {
             ciphertext,
             envelope,
             target_identity,
+            target_recipient,
             target_id,
             secret_id,
             fingerprint,
             trusted,
+            signing_key,
             owner,
             group,
         })
@@ -1226,6 +1662,57 @@ mod tests {
         }
     }
 
+    fn write_artifact(
+        fixture: &Fixture,
+        name: &str,
+        secret_id: &Id,
+        plaintext: &[u8],
+    ) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+        let ciphertext = fixture.temporary.path().join(format!("{name}.age"));
+        let envelope = fixture.temporary.path().join(format!("{name}.json"));
+        let mut output = File::create(&ciphertext)?;
+        nix_seal_crypto::encrypt(
+            plaintext,
+            &mut output,
+            std::slice::from_ref(&fixture.target_recipient),
+        )?;
+        output.sync_all()?;
+        let artifact_hash = hash_bounded(&mut File::open(&ciphertext)?, MAX_CIPHERTEXT_BYTES)?;
+        let manifest = TargetManifestV1 {
+            schema: ARTIFACT_SCHEMA.to_owned(),
+            tool_version: "0.1.0-alpha.1".to_owned(),
+            plan_hash: PLAN_HASH.to_owned(),
+            source_ciphertext_hash: SOURCE_HASH.to_owned(),
+            artifact_ciphertext_hash: artifact_hash,
+            target_id: fixture.target_id.clone(),
+            secret_id: secret_id.clone(),
+            recipient_fingerprint: fixture.fingerprint.clone(),
+            artifact_generation: 1,
+            issued_at: 100,
+            expires_at: Some(200),
+        };
+        let signed = nix_seal_manifest::sign_manifest(&manifest, &fixture.signing_key)?;
+        std::fs::write(&envelope, serde_json::to_vec(&signed)?)?;
+        Ok((ciphertext, envelope))
+    }
+
+    fn placeholders(
+        declarations: &[(&str, &Id, TemplateEncodingV1)],
+    ) -> BTreeMap<String, TemplatePlaceholderSpecV1> {
+        declarations
+            .iter()
+            .map(|(name, secret_id, encoding)| {
+                (
+                    (*name).to_owned(),
+                    TemplatePlaceholderSpecV1 {
+                        secret_id: (*secret_id).clone(),
+                        encoding: *encoding,
+                    },
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn verifies_then_atomically_switches_generation() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture()?;
@@ -1243,6 +1730,7 @@ mod tests {
             approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
+            templates: &[],
             post_switch: None,
         };
         let result = activate(&request)?;
@@ -1286,6 +1774,172 @@ mod tests {
     }
 
     #[test]
+    fn renders_templates_and_detects_template_changes() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture()?;
+        let artifact = owned_artifact(&fixture, &fixture.ciphertext, &fixture.secret_id);
+        let source = fixture.temporary.path().join("application.conf.tmpl");
+        std::fs::write(
+            &source,
+            b"raw={{nix-seal:raw}}\nb64={{nix-seal:b64}}\nhex={{nix-seal:hex}}\n",
+        )?;
+        let template_id = Id::parse("application/config")?;
+        let declarations = placeholders(&[
+            ("raw", &fixture.secret_id, TemplateEncodingV1::Utf8),
+            ("b64", &fixture.secret_id, TemplateEncodingV1::Base64),
+            ("hex", &fixture.secret_id, TemplateEncodingV1::Hex),
+        ]);
+        let template = ActivationTemplate {
+            source: &source,
+            template_id: &template_id,
+            placeholders: &declarations,
+            mode: 0o400,
+            owner: &fixture.owner,
+            group: &fixture.group,
+        };
+        let request = ActivationRequest {
+            runtime_root: &fixture.runtime,
+            runtime_generation: None,
+            plan_hash: PLAN_HASH,
+            target_id: &fixture.target_id,
+            recipient_fingerprint: &fixture.fingerprint,
+            tool_version: "0.1.0-alpha.1",
+            now: 101,
+            allowed_clock_skew: 0,
+            trusted_keys: &fixture.trusted,
+            approval_threshold: 1,
+            target_identity: &fixture.target_identity,
+            artifacts: std::slice::from_ref(&artifact),
+            templates: std::slice::from_ref(&template),
+            post_switch: None,
+        };
+        let first = activate(&request)?;
+        assert!(first.changed);
+        assert_eq!(first.template_count, 1);
+        assert_eq!(
+            std::fs::read(first.generation_path.join("templates/application/config"))?,
+            b"raw=plaintext-canary\nb64=cGxhaW50ZXh0LWNhbmFyeQ==\nhex=706c61696e746578742d63616e617279\n"
+        );
+        let second = activate(&request)?;
+        assert!(!second.changed);
+        assert_eq!(second.generation_path, first.generation_path);
+        std::fs::write(
+            &source,
+            b"changed={{nix-seal:raw}}\nb64={{nix-seal:b64}}\nhex={{nix-seal:hex}}\n",
+        )?;
+        let changed = activate(&request)?;
+        assert!(changed.changed);
+        assert_eq!(
+            changed.generation_path,
+            fixture.runtime.join("generation-2")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn binary_template_encoding_failure_preserves_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture()?;
+        let binary_id = Id::parse("binary/data")?;
+        let (ciphertext, envelope) =
+            write_artifact(&fixture, "binary", &binary_id, &[0xff, 0x00, 0x80])?;
+        let artifact = ActivationArtifact {
+            ciphertext: &ciphertext,
+            envelope: &envelope,
+            secret_id: &binary_id,
+            source_ciphertext_hash: SOURCE_HASH,
+            artifact_generation: 1,
+            mode: 0o400,
+            owner: &fixture.owner,
+            group: &fixture.group,
+        };
+        let source = fixture.temporary.path().join("binary.tmpl");
+        std::fs::write(
+            &source,
+            b"base64={{nix-seal:value}}\nhex={{nix-seal:hex}}\n",
+        )?;
+        let template_id = Id::parse("binary/config")?;
+        let valid_declarations = placeholders(&[
+            ("value", &binary_id, TemplateEncodingV1::Base64),
+            ("hex", &binary_id, TemplateEncodingV1::Hex),
+        ]);
+        let valid_template = ActivationTemplate {
+            source: &source,
+            template_id: &template_id,
+            placeholders: &valid_declarations,
+            mode: 0o400,
+            owner: &fixture.owner,
+            group: &fixture.group,
+        };
+        let valid_request = ActivationRequest {
+            runtime_root: &fixture.runtime,
+            runtime_generation: None,
+            plan_hash: PLAN_HASH,
+            target_id: &fixture.target_id,
+            recipient_fingerprint: &fixture.fingerprint,
+            tool_version: "0.1.0-alpha.1",
+            now: 101,
+            allowed_clock_skew: 0,
+            trusted_keys: &fixture.trusted,
+            approval_threshold: 1,
+            target_identity: &fixture.target_identity,
+            artifacts: std::slice::from_ref(&artifact),
+            templates: std::slice::from_ref(&valid_template),
+            post_switch: None,
+        };
+        let activated = activate(&valid_request)?;
+        assert_eq!(
+            std::fs::read(activated.generation_path.join("templates/binary/config"))?,
+            b"base64=/wCA\nhex=ff0080\n"
+        );
+
+        let invalid_declarations = placeholders(&[
+            ("value", &binary_id, TemplateEncodingV1::Utf8),
+            ("hex", &binary_id, TemplateEncodingV1::Hex),
+        ]);
+        let invalid_template = ActivationTemplate {
+            placeholders: &invalid_declarations,
+            ..valid_template
+        };
+        let invalid_request = ActivationRequest {
+            templates: std::slice::from_ref(&invalid_template),
+            ..valid_request
+        };
+        assert!(matches!(
+            activate(&invalid_request),
+            Err(RuntimeError::TemplateEncoding)
+        ));
+        assert_eq!(
+            std::fs::read_link(fixture.runtime.join("current"))?,
+            Path::new("generation-1")
+        );
+        assert!(!fixture.runtime.join("generation-2").exists());
+        assert_eq!(
+            std::fs::read(fixture.runtime.join("current/templates/binary/config"))?,
+            b"base64=/wCA\nhex=ff0080\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn template_grammar_rejects_missing_unused_and_malformed_placeholders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let secret_id = Id::parse("db/password")?;
+        let declarations = placeholders(&[("declared", &secret_id, TemplateEncodingV1::Utf8)]);
+        for source in [
+            b"{{nix-seal:missing}}".as_slice(),
+            b"no placeholders".as_slice(),
+            b"{{nix-seal declared}}".as_slice(),
+            b"{{nix-seal:declared".as_slice(),
+        ] {
+            assert!(matches!(
+                validate_template_source(source, &declarations),
+                Err(RuntimeError::TemplateSyntax)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn unknown_account_fails_before_runtime_creation() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture()?;
         let artifact = ActivationArtifact {
@@ -1305,6 +1959,7 @@ mod tests {
             approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
+            templates: &[],
             post_switch: None,
         };
         assert!(matches!(
@@ -1316,6 +1971,8 @@ mod tests {
     }
 
     #[test]
+    // Keep the related schema mutation cases against one known-valid baseline.
+    #[allow(clippy::too_many_lines)]
     fn activation_spec_is_strict_and_rejects_duplicate_destinations()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture()?;
@@ -1325,6 +1982,20 @@ mod tests {
             secret_id: fixture.secret_id.clone(),
             source_ciphertext_hash: SOURCE_HASH.to_owned(),
             artifact_generation: 1,
+            mode: "0400".to_owned(),
+            owner: fixture.owner.clone(),
+            group: fixture.group.clone(),
+        };
+        let template = ActivationTemplateSpecV1 {
+            source: fixture.temporary.path().join("public-template"),
+            template_id: Id::parse("application/config")?,
+            placeholders: BTreeMap::from([(
+                "password".to_owned(),
+                TemplatePlaceholderSpecV1 {
+                    secret_id: fixture.secret_id.clone(),
+                    encoding: TemplateEncodingV1::Utf8,
+                },
+            )]),
             mode: "0400".to_owned(),
             owner: fixture.owner.clone(),
             group: fixture.group.clone(),
@@ -1340,6 +2011,7 @@ mod tests {
             approval_threshold: 1,
             trusted_keys: vec!["public-key-placeholder".to_owned()],
             artifacts: vec![artifact.clone()],
+            templates: vec![template],
             post_switch: None,
         };
         spec.validate()?;
@@ -1347,6 +2019,36 @@ mod tests {
         duplicate.artifacts.push(artifact);
         assert!(matches!(
             duplicate.validate(),
+            Err(RuntimeError::InvalidSpec)
+        ));
+        let mut output_collision = spec.clone();
+        let mut colliding_artifact = output_collision.artifacts[0].clone();
+        colliding_artifact.secret_id = Id::parse("templates/application/config")?;
+        output_collision.artifacts.push(colliding_artifact);
+        assert!(matches!(
+            output_collision.validate(),
+            Err(RuntimeError::InvalidSpec)
+        ));
+        let mut unknown_reference = spec.clone();
+        unknown_reference.templates[0]
+            .placeholders
+            .get_mut("password")
+            .ok_or("placeholder missing")?
+            .secret_id = Id::parse("unknown/secret")?;
+        assert!(matches!(
+            unknown_reference.validate(),
+            Err(RuntimeError::InvalidSpec)
+        ));
+        let mut invalid_placeholder = spec.clone();
+        let declaration = invalid_placeholder.templates[0]
+            .placeholders
+            .remove("password")
+            .ok_or("placeholder missing")?;
+        invalid_placeholder.templates[0]
+            .placeholders
+            .insert("INVALID".to_owned(), declaration);
+        assert!(matches!(
+            invalid_placeholder.validate(),
             Err(RuntimeError::InvalidSpec)
         ));
         let mut encoded = serde_json::to_value(&spec)?;
@@ -1407,6 +2109,7 @@ mod tests {
             approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
+            templates: &[],
             post_switch: Some(&actions),
         };
         assert!(matches!(
@@ -1453,6 +2156,7 @@ mod tests {
             approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
+            templates: &[],
             post_switch: None,
         };
         assert!(matches!(
@@ -1493,6 +2197,7 @@ mod tests {
             approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: &artifacts,
+            templates: &[],
             post_switch: None,
         };
         assert!(matches!(
@@ -1527,6 +2232,7 @@ mod tests {
             approval_threshold: 1,
             target_identity: &wrong_identity,
             artifacts: std::slice::from_ref(&artifact),
+            templates: &[],
             post_switch: None,
         };
         assert!(matches!(activate(&request), Err(RuntimeError::Crypto(_))));
@@ -1563,6 +2269,7 @@ mod tests {
             approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
+            templates: &[],
             post_switch: None,
         };
         assert!(matches!(

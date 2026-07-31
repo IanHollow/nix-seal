@@ -19,7 +19,11 @@
     inputs:
     let
       inherit (inputs.nixpkgs) lib;
-      eachSystem = lib.genAttrs (import inputs.systems);
+      # nixpkgs unstable dropped x86_64-darwin in 26.11. Keep the architecture
+      # in the platform contract, but do not publish broken outputs until a
+      # supported runner/package-set combination exists again.
+      supportedSystems = lib.filter (system: system != "x86_64-darwin") (import inputs.systems);
+      eachSystem = lib.genAttrs supportedSystems;
       packageFor =
         system:
         let

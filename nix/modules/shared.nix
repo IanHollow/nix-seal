@@ -17,17 +17,26 @@ let
   inherit (lib) mkIf mkOption types;
   cfg = config.nixSeal;
   digestType = types.strMatching "[0-9a-f]{64}";
+  privateModeType = types.strMatching "0[1-7]00";
+  idIsValid =
+    value: builtins.match "[a-z0-9._-]+(/[a-z0-9._-]+)*" value != null && !lib.hasInfix ".." value;
+  idType = types.addCheck types.str idIsValid;
   unitType = types.strMatching "[A-Za-z0-9_.@:-]{1,256}";
   serviceUnitType = types.strMatching "[A-Za-z0-9_.@:-]{1,247}\\.service";
   credentialNameType = types.addCheck (types.strMatching "[A-Za-z0-9_.@-]{1,255}") (
     name: name != "." && name != ".."
   );
   configuredSecrets = lib.filterAttrs (_: secret: secret.ciphertext != null) cfg.secrets;
+  configuredTemplates = lib.filterAttrs (_: template: template.source != null) cfg.templates;
   explicitReloadUnits = lib.unique (
-    lib.concatMap (secret: secret.reloadUnits) (builtins.attrValues configuredSecrets)
+    lib.concatMap (item: item.reloadUnits) (
+      builtins.attrValues configuredSecrets ++ builtins.attrValues configuredTemplates
+    )
   );
   explicitRestartUnits = lib.unique (
-    lib.concatMap (secret: secret.restartUnits) (builtins.attrValues configuredSecrets)
+    lib.concatMap (item: item.restartUnits) (
+      builtins.attrValues configuredSecrets ++ builtins.attrValues configuredTemplates
+    )
   );
   serviceCredentialBindings = lib.concatMap (
     secretId:
@@ -61,6 +70,15 @@ let
       inherit (secret) owner;
       inherit (secret) group;
     }) configuredSecrets;
+    templates = lib.mapAttrsToList (name: template: {
+      source = toString template.source;
+      templateId = name;
+      placeholders = lib.mapAttrs (_: placeholder: {
+        secretId = placeholder.secret;
+        inherit (placeholder) encoding;
+      }) template.placeholders;
+      inherit (template) mode owner group;
+    }) configuredTemplates;
     postSwitch =
       if reloadUnits == [ ] && restartUnits == [ ] then
         null
@@ -154,7 +172,7 @@ in
                 description = "Existing runtime group that owns the activated file.";
               };
               mode = mkOption {
-                type = types.strMatching "0[0-7]{3}";
+                type = privateModeType;
                 default = "0400";
               };
               ciphertext = mkOption {
@@ -218,10 +236,67 @@ in
       type = types.attrsOf (
         types.submodule (
           { name, ... }: {
-            options.path = mkOption {
-              type = types.str;
-              readOnly = true;
-              default = "${runtimeDirectory}/current/templates/${name}";
+            options = {
+              path = mkOption {
+                type = types.str;
+                readOnly = true;
+                default = "${runtimeDirectory}/current/templates/${name}";
+                description = "Runtime path of the atomically rendered template.";
+              };
+              source = mkOption {
+                type = types.nullOr types.path;
+                default = null;
+                description = "Public template source. This file may enter the Nix store.";
+              };
+              placeholders = mkOption {
+                default = { };
+                type = types.attrsOf (
+                  types.submodule {
+                    options = {
+                      secret = mkOption {
+                        type = idType;
+                        description = "ID of the secret inserted at this placeholder.";
+                      };
+                      encoding = mkOption {
+                        type = types.enum [
+                          "utf8"
+                          "base64"
+                          "hex"
+                        ];
+                        default = "utf8";
+                        description = "Explicit transformation applied while streaming the secret.";
+                      };
+                    };
+                  }
+                );
+                description = "Strict {{nix-seal:name}} placeholder declarations.";
+              };
+              owner = mkOption {
+                type = types.str;
+                default = if homeManagerRuntimeIdentity then config.home.username else "root";
+                description = "Existing runtime account that owns the rendered file.";
+              };
+              group = mkOption {
+                type = types.str;
+                default =
+                  if homeManagerRuntimeIdentity then
+                    (if pkgs.stdenv.hostPlatform.isDarwin then "staff" else config.home.username)
+                  else
+                    "root";
+                description = "Existing runtime group that owns the rendered file.";
+              };
+              mode = mkOption {
+                type = privateModeType;
+                default = "0400";
+              };
+              restartUnits = mkOption {
+                type = types.listOf unitType;
+                default = [ ];
+              };
+              reloadUnits = mkOption {
+                type = types.listOf unitType;
+                default = [ ];
+              };
             };
           }
         )
@@ -241,8 +316,12 @@ in
       {
         assertions = [
           {
-            assertion = builtins.match "[a-z0-9._-]+(/[a-z0-9._-]+)*" cfg.targetId != null;
+            assertion = idIsValid cfg.targetId;
             message = "nixSeal.targetId must be a lowercase stable ID";
+          }
+          {
+            assertion = lib.all idIsValid (builtins.attrNames cfg.secrets ++ builtins.attrNames cfg.templates);
+            message = "nixSeal secret and template names must be lowercase stable IDs";
           }
           {
             assertion = cfg.identityFile != null;
@@ -271,6 +350,44 @@ in
               builtins.length (builtins.attrNames configuredSecrets)
               == builtins.length (builtins.attrNames cfg.secrets);
             message = "every declared nixSeal secret requires a target ciphertext";
+          }
+          {
+            assertion =
+              builtins.length (builtins.attrNames configuredTemplates)
+              == builtins.length (builtins.attrNames cfg.templates);
+            message = "every declared nixSeal template requires a public source";
+          }
+          {
+            assertion = lib.all (
+              template:
+              template.placeholders != { } && builtins.length (builtins.attrNames template.placeholders) <= 256
+            ) (builtins.attrValues configuredTemplates);
+            message = "every nixSeal template requires between 1 and 256 declared placeholders";
+          }
+          {
+            assertion = lib.all (
+              template:
+              lib.all (name: builtins.match "[a-z0-9][a-z0-9_.-]{0,127}" name != null) (
+                builtins.attrNames template.placeholders
+              )
+            ) (builtins.attrValues configuredTemplates);
+            message = "nixSeal template placeholder names must be lowercase stable names";
+          }
+          {
+            assertion = lib.all (
+              template:
+              lib.all (placeholder: builtins.hasAttr placeholder.secret configuredSecrets) (
+                builtins.attrValues template.placeholders
+              )
+            ) (builtins.attrValues configuredTemplates);
+            message = "every nixSeal template placeholder must reference a configured secret";
+          }
+          {
+            assertion =
+              lib.intersectLists (builtins.attrNames configuredSecrets) (
+                map (name: "templates/${name}") (builtins.attrNames configuredTemplates)
+              ) == [ ];
+            message = "a nixSeal template output cannot collide with a secret runtime path";
           }
           {
             assertion =

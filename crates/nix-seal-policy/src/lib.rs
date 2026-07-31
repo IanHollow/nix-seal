@@ -133,11 +133,46 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
                 "secret {id} references missing approval policy {policy}"
             )));
         }
-        let mode =
-            u32::from_str_radix(secret.runtime.mode.trim_start_matches('0'), 8).unwrap_or(u32::MAX);
-        if mode & 0o077 != 0 {
+        if !is_private_runtime_mode(&secret.runtime.mode) {
             return Err(PolicyError::Violation(format!(
-                "secret {id} runtime mode grants group/other access"
+                "secret {id} runtime mode must be a nonzero owner-only four-digit octal mode"
+            )));
+        }
+    }
+    for (id, template) in &plan.templates {
+        if !is_normalized_public_path(&template.source) {
+            return Err(PolicyError::Violation(format!(
+                "template {id} source must be a normalized public path"
+            )));
+        }
+        if template.placeholders.is_empty() || template.placeholders.len() > 256 {
+            return Err(PolicyError::Violation(format!(
+                "template {id} must declare between 1 and 256 placeholders"
+            )));
+        }
+        for (name, placeholder) in &template.placeholders {
+            if !is_placeholder_name(name) {
+                return Err(PolicyError::Violation(format!(
+                    "template {id} has invalid placeholder name {name:?}"
+                )));
+            }
+            if !plan.secrets.contains_key(&placeholder.secret) {
+                return Err(PolicyError::Violation(format!(
+                    "template {id} placeholder {name:?} references missing secret {}",
+                    placeholder.secret
+                )));
+            }
+        }
+        if !is_private_runtime_mode(&template.runtime.mode) {
+            return Err(PolicyError::Violation(format!(
+                "template {id} runtime mode must be a nonzero owner-only four-digit octal mode"
+            )));
+        }
+        let output_id = Id::parse(format!("templates/{id}"))
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        if plan.secrets.contains_key(&output_id) {
+            return Err(PolicyError::Violation(format!(
+                "template {id} output collides with secret {output_id}"
             )));
         }
     }
@@ -145,6 +180,35 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
         validate_approval(id, policy, plan)?;
     }
     validate_generator_graph(plan)
+}
+
+fn is_private_runtime_mode(value: &str) -> bool {
+    value.len() == 4
+        && value.starts_with('0')
+        && u32::from_str_radix(value, 8)
+            .is_ok_and(|mode| mode != 0 && mode <= 0o700 && mode.trailing_zeros() >= 6)
+}
+
+fn is_normalized_public_path(value: &str) -> bool {
+    if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_control()) {
+        return false;
+    }
+    value.split('/').enumerate().all(|(index, segment)| {
+        (index == 0 && segment.is_empty() && value.starts_with('/'))
+            || (!segment.is_empty() && segment != "." && segment != "..")
+    })
+}
+
+fn is_placeholder_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        })
 }
 
 fn validate_approval(id: &Id, policy: &ApprovalPolicy, plan: &PlanV1) -> Result<(), PolicyError> {
@@ -219,6 +283,11 @@ pub fn json_schema() -> Result<String, PolicyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix_seal_core::{
+        ActivationPhase, DeliveryMode, Lifecycle, RuntimeSettings, Secret, Template,
+        TemplateEncoding, TemplatePlaceholder,
+    };
+    use std::collections::BTreeMap;
     #[test]
     fn empty_plan_is_stable_and_valid() -> Result<(), PolicyError> {
         let plan = PlanV1::default();
@@ -233,6 +302,69 @@ mod tests {
         a.groups.insert(id.clone(), nix_seal_core::Group::default());
         b.groups.insert(id, nix_seal_core::Group::default());
         assert!(matches!(merge(a, b), Err(PolicyError::Duplicate { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn templates_require_valid_secret_bindings_and_noncolliding_outputs() -> Result<(), PolicyError>
+    {
+        let mut plan = PlanV1::default();
+        let secret_id =
+            Id::parse("db/password").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let secret = Secret {
+            source: "secrets/db-password.age".to_owned(),
+            delivery: DeliveryMode::Rekeyed,
+            administrators: Vec::new(),
+            consumers: Vec::new(),
+            phase: ActivationPhase::Activation,
+            runtime: RuntimeSettings::default(),
+            lifecycle: Lifecycle::default(),
+            approval_policy: None,
+        };
+        plan.secrets.insert(secret_id.clone(), secret.clone());
+        let template_id = Id::parse("application/config")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.templates.insert(
+            template_id,
+            Template {
+                source: "templates/application.conf".to_owned(),
+                placeholders: BTreeMap::from([(
+                    "password".to_owned(),
+                    TemplatePlaceholder {
+                        secret: secret_id.clone(),
+                        encoding: TemplateEncoding::Utf8,
+                    },
+                )]),
+                runtime: RuntimeSettings::default(),
+            },
+        );
+        validate(&plan)?;
+
+        let missing_id = Id::parse("missing/secret")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.templates
+            .values_mut()
+            .next()
+            .ok_or_else(|| PolicyError::Violation("template missing".to_owned()))?
+            .placeholders
+            .get_mut("password")
+            .ok_or_else(|| PolicyError::Violation("placeholder missing".to_owned()))?
+            .secret = missing_id;
+        assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
+        let template = plan
+            .templates
+            .values_mut()
+            .next()
+            .ok_or_else(|| PolicyError::Violation("template missing".to_owned()))?;
+        template
+            .placeholders
+            .get_mut("password")
+            .ok_or_else(|| PolicyError::Violation("placeholder missing".to_owned()))?
+            .secret = secret_id;
+        let collision_id = Id::parse("templates/application/config")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.secrets.insert(collision_id, secret);
+        assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
         Ok(())
     }
 }

@@ -1198,6 +1198,7 @@ dependencies = [
 name = "nix-seal-runtime"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "base64",
  "blake3",
  "fs2",
  "nix-seal-core",
@@ -1210,6 +1211,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "uzers",
+ "zeroize",
 ]
 
 [[package]]

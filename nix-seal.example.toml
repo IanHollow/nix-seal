@@ -17,3 +17,10 @@ identity = "server"
 source = "secrets/services/example/token.age"
 consumers = ["server"]
 administrators = ["admin"]
+
+[templates."services/example/config"]
+source = "templates/services/example.conf"
+
+[templates."services/example/config".placeholders.token]
+secret = "services/example/token"
+encoding = "utf8"

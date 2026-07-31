@@ -9,9 +9,37 @@ The project is in an early, pre-release foundation phase. The current vertical
 slice provides strict plan parsing and validation, canonical plan hashing,
 native age X25519 encryption/decryption, signed target artifacts, transactional
 ciphertext cache writes, authenticated atomic activation, ownership-aware
-generation changes, post-switch service coordination, JSON Schema output, and
-NixOS/nix-darwin/Home Manager modules. See [SPEC.md](SPEC.md) and
-[ROADMAP.md](ROADMAP.md) before relying on it.
+generation changes, activation-time secret templates, post-switch service
+coordination, JSON Schema output, and NixOS/nix-darwin/Home Manager modules. See
+[SPEC.md](SPEC.md) and [ROADMAP.md](ROADMAP.md) before relying on it.
+
+## Runtime templates
+
+Public template sources may be stored in the Nix store. Secret values are
+streamed into a private candidate generation only during activation:
+
+```nix
+nixSeal.templates."application/config" = {
+  source = pkgs.writeText "application.conf.template" ''
+    password={{nix-seal:database-password}}
+  '';
+  placeholders.database-password = {
+    secret = "db/password";
+    encoding = "utf8";
+  };
+  mode = "0400";
+  restartUnits = [ "my-app.service" ];
+};
+```
+
+The reserved grammar is exactly `{{nix-seal:name}}`, with lowercase stable
+placeholder names. Missing, unused, malformed, or undeclared reserved
+placeholders fail the whole activation before `current` changes.
+`utf8` rejects binary input; explicit `base64` and lowercase `hex` transforms
+support arbitrary bytes. Sources, outputs, declaration counts, and secret reads
+are bounded. Rendered files use the same owner/group/mode controls, unchanged
+generation detection, atomic switch, rollback preservation, and post-switch
+action protocol as ordinary secret files.
 
 ## Systemd service credentials
 

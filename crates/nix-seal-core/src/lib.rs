@@ -301,11 +301,33 @@ pub struct Generator {
 pub struct Template {
     /// Non-secret source path.
     pub source: String,
-    /// Placeholder secret `IDs`.
-    pub secrets: Vec<Id>,
+    /// Strict placeholder declarations keyed by placeholder name.
+    pub placeholders: BTreeMap<String, TemplatePlaceholder>,
     /// Rendered-file runtime settings.
     #[serde(default)]
     pub runtime: RuntimeSettings,
+}
+
+/// One explicit template placeholder binding.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TemplatePlaceholder {
+    /// Secret inserted at the placeholder.
+    pub secret: Id,
+    /// Explicit conversion from arbitrary secret bytes to template text.
+    pub encoding: TemplateEncoding,
+}
+
+/// Supported plan-level secret-to-text transformations.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TemplateEncoding {
+    /// Require valid UTF-8 and copy without modification.
+    Utf8,
+    /// RFC 4648 base64 with padding.
+    Base64,
+    /// Lowercase hexadecimal.
+    Hex,
 }
 
 /// N-of-M artifact signature policy.
