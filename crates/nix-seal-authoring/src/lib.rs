@@ -4,12 +4,13 @@
 use secrecy::SecretString;
 use serde::Serialize;
 use std::{
+    collections::BTreeSet,
     fs::{File, OpenOptions},
     io::{Read, Seek, Write},
     path::{Component, Path, PathBuf},
     process::Command,
 };
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 use thiserror::Error;
 
 /// Whether an authoring transaction creates or atomically replaces ciphertext.
@@ -30,6 +31,24 @@ pub struct AuthoringResult {
     pub ciphertext_hash: String,
     /// Number of encrypted plaintext bytes.
     pub plaintext_bytes: u64,
+}
+
+/// One secret output staged as part of an all-or-recover batch authoring operation.
+pub struct BatchSecretWrite<'a> {
+    /// Repository-relative canonical ciphertext destination.
+    pub relative_destination: &'a Path,
+    /// Plaintext bytes retained by the caller only for the duration of the transaction.
+    pub plaintext: &'a [u8],
+    /// Plan-derived canonical recipients.
+    pub recipients: &'a [String],
+}
+
+struct PreparedBatchWrite {
+    destination: PathBuf,
+    parent: PathBuf,
+    previous: Option<std::fs::Metadata>,
+    staged: Option<NamedTempFile>,
+    result: AuthoringResult,
 }
 
 /// Inputs for a recoverable canonical-ciphertext deletion.
@@ -94,6 +113,12 @@ pub enum AuthoringError {
     /// The atomic change completed but directory durability could not be confirmed.
     #[error("ciphertext changed atomically but filesystem durability could not be confirmed")]
     DurabilityUnknown,
+    /// A multi-output transaction could not commit, but every earlier change was restored.
+    #[error("multi-output ciphertext transaction failed and was rolled back")]
+    BatchRolledBack,
+    /// A multi-output transaction failed and rollback could not be confirmed.
+    #[error("multi-output ciphertext transaction failed and rollback could not be confirmed")]
+    BatchRecoveryUnknown,
     /// Tombstone metadata could not be encoded.
     #[error("recoverable deletion tombstone could not be encoded")]
     Tombstone(#[source] serde_json::Error),
@@ -175,6 +200,163 @@ pub fn write_secret<R: Read>(
         ciphertext_hash,
         plaintext_bytes,
     })
+}
+
+/// Stages, verifies, and durably commits a group of ciphertext outputs.
+///
+/// Every output is encrypted and round-trip verified before an existing
+/// ciphertext is moved. Replacements are temporarily backed up in their own
+/// directory and restored if any later commit fails. This is intentionally a
+/// repository-ciphertext transaction: plaintext never reaches the backup or
+/// journal paths.
+pub fn write_secret_batch(
+    repository_root: &Path,
+    writes: &[BatchSecretWrite<'_>],
+    verification_identity: &SecretString,
+    mode: WriteMode,
+) -> Result<Vec<AuthoringResult>, AuthoringError> {
+    let mut prepared = prepare_batch_writes(repository_root, writes, verification_identity, mode)?;
+
+    for item in &prepared {
+        match mode {
+            WriteMode::Create if item.destination.exists() => {
+                return Err(AuthoringError::DestinationState);
+            }
+            WriteMode::Replace => ensure_unchanged(&item.destination, item.previous.as_ref())?,
+            WriteMode::Create => {}
+        }
+    }
+    let mut backups = Vec::with_capacity(prepared.len());
+    for item in &prepared {
+        if mode == WriteMode::Create {
+            backups.push(None);
+            continue;
+        }
+        let backup = NamedTempFile::new_in(&item.parent).map_err(AuthoringError::Io)?;
+        set_private(backup.path()).map_err(AuthoringError::Io)?;
+        let backup = backup.into_temp_path();
+        if std::fs::rename(&item.destination, &backup).is_err() {
+            if restore_batch(&prepared, &mut backups, &[]) {
+                return Err(AuthoringError::BatchRolledBack);
+            }
+            return Err(AuthoringError::BatchRecoveryUnknown);
+        }
+        backups.push(Some(backup));
+    }
+    let results = commit_prepared_batch(&mut prepared, mode, &mut backups)?;
+    drop(backups);
+    for item in &prepared {
+        File::open(&item.parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| AuthoringError::DurabilityUnknown)?;
+    }
+    Ok(results)
+}
+
+fn prepare_batch_writes(
+    repository_root: &Path,
+    writes: &[BatchSecretWrite<'_>],
+    verification_identity: &SecretString,
+    mode: WriteMode,
+) -> Result<Vec<PreparedBatchWrite>, AuthoringError> {
+    if writes.is_empty() || writes.len() > 10_000 {
+        return Err(AuthoringError::UnsafePath);
+    }
+    let verification_recipient = nix_seal_crypto::recipient_from_identity(verification_identity)?;
+    let mut destinations = BTreeSet::new();
+    let mut prepared = Vec::with_capacity(writes.len());
+    for write in writes {
+        let normalized_recipients = write
+            .recipients
+            .iter()
+            .map(|recipient| nix_seal_crypto::normalize_recipient(recipient))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !normalized_recipients.contains(&verification_recipient) {
+            return Err(AuthoringError::VerificationIdentity);
+        }
+        let destination = resolve_destination(repository_root, write.relative_destination)?;
+        if !destinations.insert(destination.clone()) {
+            return Err(AuthoringError::DestinationState);
+        }
+        let previous = validate_destination(&destination, mode)?;
+        let parent = destination
+            .parent()
+            .ok_or(AuthoringError::UnsafePath)?
+            .to_owned();
+        let mut staged = NamedTempFile::new_in(&parent).map_err(AuthoringError::Io)?;
+        set_private(staged.path()).map_err(AuthoringError::Io)?;
+        let mut input = HashingReader::new(std::io::Cursor::new(write.plaintext));
+        nix_seal_crypto::encrypt(&mut input, staged.as_file_mut(), write.recipients)?;
+        staged.as_file().sync_all().map_err(AuthoringError::Io)?;
+        let (plaintext_hash, plaintext_bytes) = input.finish();
+        staged.as_file_mut().rewind().map_err(AuthoringError::Io)?;
+        let mut verified = HashingWriter::default();
+        nix_seal_crypto::decrypt(staged.as_file_mut(), &mut verified, verification_identity)?;
+        if verified.hash() != plaintext_hash || verified.bytes != plaintext_bytes {
+            return Err(AuthoringError::RoundTrip);
+        }
+        staged.as_file_mut().rewind().map_err(AuthoringError::Io)?;
+        let ciphertext_hash = hash_file(staged.as_file_mut())?;
+        prepared.push(PreparedBatchWrite {
+            destination: destination.clone(),
+            parent,
+            previous,
+            staged: Some(staged),
+            result: AuthoringResult {
+                path: destination,
+                ciphertext_hash,
+                plaintext_bytes,
+            },
+        });
+    }
+    Ok(prepared)
+}
+
+fn commit_prepared_batch(
+    prepared: &mut [PreparedBatchWrite],
+    mode: WriteMode,
+    backups: &mut [Option<TempPath>],
+) -> Result<Vec<AuthoringResult>, AuthoringError> {
+    let mut committed = Vec::with_capacity(prepared.len());
+    for index in 0..prepared.len() {
+        let staged = prepared[index]
+            .staged
+            .take()
+            .ok_or(AuthoringError::BatchRecoveryUnknown)?;
+        let persisted = match mode {
+            WriteMode::Create => staged.persist_noclobber(&prepared[index].destination),
+            WriteMode::Replace => staged.persist(&prepared[index].destination),
+        };
+        if persisted.is_err() {
+            if restore_batch(prepared, &mut *backups, &committed) {
+                return Err(AuthoringError::BatchRolledBack);
+            }
+            return Err(AuthoringError::BatchRecoveryUnknown);
+        }
+        committed.push(prepared[index].destination.clone());
+    }
+    Ok(prepared.iter().map(|item| item.result.clone()).collect())
+}
+
+fn restore_batch(
+    prepared: &[PreparedBatchWrite],
+    backups: &mut [Option<TempPath>],
+    committed: &[PathBuf],
+) -> bool {
+    let committed: BTreeSet<_> = committed.iter().collect();
+    let mut restored = true;
+    for (item, backup) in prepared.iter().zip(backups.iter_mut()).rev() {
+        if committed.contains(&item.destination) && std::fs::remove_file(&item.destination).is_err()
+        {
+            restored = false;
+        }
+        if let Some(backup) = backup.take()
+            && std::fs::rename(&backup, &item.destination).is_err()
+        {
+            restored = false;
+        }
+    }
+    restored
 }
 
 /// Decrypts into a private ephemeral workspace, invokes an explicit editor, and replaces atomically.
@@ -668,6 +850,87 @@ mod tests {
             Err(AuthoringError::Editor)
         ));
         assert_eq!(std::fs::read(&edited.path)?, before_failure);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_generation_validates_every_output_before_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        let recipients = vec![recipient];
+        let first = b"first-created";
+        let second = b"second-created";
+        let created = write_secret_batch(
+            &root,
+            &[
+                BatchSecretWrite {
+                    relative_destination: Path::new("secrets/one.age"),
+                    plaintext: first,
+                    recipients: &recipients,
+                },
+                BatchSecretWrite {
+                    relative_destination: Path::new("secrets/two.age"),
+                    plaintext: second,
+                    recipients: &recipients,
+                },
+            ],
+            &identity,
+            WriteMode::Create,
+        )?;
+        assert_eq!(created.len(), 2);
+        let before_one = std::fs::read(root.join("secrets/one.age"))?;
+        let before_two = std::fs::read(root.join("secrets/two.age"))?;
+
+        let (_, unauthorized_recipient) = nix_seal_crypto::generate_x25519();
+        let unauthorized = vec![unauthorized_recipient];
+        assert!(matches!(
+            write_secret_batch(
+                &root,
+                &[
+                    BatchSecretWrite {
+                        relative_destination: Path::new("secrets/one.age"),
+                        plaintext: b"must-not-commit-one",
+                        recipients: &recipients,
+                    },
+                    BatchSecretWrite {
+                        relative_destination: Path::new("secrets/two.age"),
+                        plaintext: b"must-not-commit-two",
+                        recipients: &unauthorized,
+                    },
+                ],
+                &identity,
+                WriteMode::Replace,
+            ),
+            Err(AuthoringError::VerificationIdentity)
+        ));
+        assert_eq!(std::fs::read(root.join("secrets/one.age"))?, before_one);
+        assert_eq!(std::fs::read(root.join("secrets/two.age"))?, before_two);
+
+        let replacement = write_secret_batch(
+            &root,
+            &[
+                BatchSecretWrite {
+                    relative_destination: Path::new("secrets/one.age"),
+                    plaintext: b"first-replaced",
+                    recipients: &recipients,
+                },
+                BatchSecretWrite {
+                    relative_destination: Path::new("secrets/two.age"),
+                    plaintext: b"second-replaced",
+                    recipients: &recipients,
+                },
+            ],
+            &identity,
+            WriteMode::Replace,
+        )?;
+        let expected: [&[u8]; 2] = [b"first-replaced", b"second-replaced"];
+        for (result, expected) in replacement.iter().zip(expected) {
+            let mut plaintext = Vec::new();
+            nix_seal_crypto::decrypt(File::open(&result.path)?, &mut plaintext, &identity)?;
+            assert_eq!(plaintext, expected);
+        }
         Ok(())
     }
 

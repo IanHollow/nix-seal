@@ -1181,6 +1181,13 @@ fn verify_service_projection(
 }
 
 fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
+    struct GeneratedSecret {
+        id: nix_seal_core::Id,
+        source: String,
+        plaintext: SecretBox<Vec<u8>>,
+        recipients: Vec<String>,
+    }
+
     let plan = read_plan_bounded(&arguments.plan)?;
     let identity = read_identity(&arguments.identity)?;
     let mut order = Vec::new();
@@ -1201,40 +1208,46 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
             .generators
             .get(&generator_id)
             .context("generator disappeared from validated plan")?;
-        // Built-ins deliberately accept one output in v1. That lets the
-        // existing authoring transaction give every accepted generation an
-        // all-or-nothing ciphertext commit without pretending a partial batch
-        // write has stronger semantics than it does.
-        if generator.outputs.len() != 1 {
-            bail!(
-                "generator {generator_id} has multiple outputs; multi-output generator transactions are not implemented yet"
-            );
-        }
-        let generated = generate_builtin_value(generator)?;
-        let secret_id = generator
+        let generated = generator
             .outputs
-            .first()
-            .context("generator has no output despite plan validation")?;
-        let secret = plan
-            .secrets
-            .get(secret_id)
-            .context("generator output secret disappeared from validated plan")?;
-        let recipients = nix_seal_policy::secret_recipients(&plan, secret_id)?;
-        let result = nix_seal_authoring::write_secret(
+            .iter()
+            .map(|secret_id| {
+                let secret = plan
+                    .secrets
+                    .get(secret_id)
+                    .context("generator output secret disappeared from validated plan")?;
+                let recipients = nix_seal_policy::secret_recipients(&plan, secret_id)?;
+                Ok(GeneratedSecret {
+                    id: secret_id.clone(),
+                    source: secret.source.clone(),
+                    plaintext: generate_builtin_value(generator)?,
+                    recipients: recipients.recipients.into_values().collect(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let writes = generated
+            .iter()
+            .map(|output| nix_seal_authoring::BatchSecretWrite {
+                relative_destination: Path::new(&output.source),
+                plaintext: output.plaintext.expose_secret(),
+                recipients: &output.recipients,
+            })
+            .collect::<Vec<_>>();
+        let results = nix_seal_authoring::write_secret_batch(
             &arguments.repository_root,
-            Path::new(&secret.source),
-            std::io::Cursor::new(generated.expose_secret().as_slice()),
-            &recipients.recipients.into_values().collect::<Vec<_>>(),
+            &writes,
             &identity,
             mode,
         )?;
-        outputs.push(serde_json::json!({
-            "generator":generator_id,
-            "secretId":secret_id,
-            "ciphertextPath":result.path,
-            "ciphertextHash":result.ciphertext_hash,
-            "plaintextBytes":result.plaintext_bytes
-        }));
+        for (output, result) in generated.iter().zip(results) {
+            outputs.push(serde_json::json!({
+                "generator":generator_id,
+                "secretId":output.id,
+                "ciphertextPath":result.path,
+                "ciphertextHash":result.ciphertext_hash,
+                "plaintextBytes":result.plaintext_bytes
+            }));
+        }
     }
     if json {
         println!(
@@ -2454,6 +2467,7 @@ mod tests {
         let (identity, recipient) = nix_seal_crypto::generate_x25519();
         write_new_private(&identity_path, identity.expose_secret().as_bytes())?;
         let secret_id = nix_seal_core::Id::parse("application/token")?;
+        let second_secret_id = nix_seal_core::Id::parse("application/secondary-token")?;
         let generator_id = nix_seal_core::Id::parse("application-token")?;
         let mut plan = nix_seal_core::PlanV1::default();
         plan.identities.insert(
@@ -2483,12 +2497,25 @@ mod tests {
                 approval_policy: None,
             },
         );
+        plan.secrets.insert(
+            second_secret_id.clone(),
+            nix_seal_core::Secret {
+                source: "secrets/application-secondary-token.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: Vec::new(),
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: None,
+            },
+        );
         plan.generators.insert(
             generator_id.clone(),
             nix_seal_core::Generator {
                 executable: "builtin:hex".to_owned(),
                 dependencies: Vec::new(),
-                outputs: vec![secret_id],
+                outputs: vec![secret_id, second_secret_id],
                 parameters: BTreeMap::from([("bytes".to_owned(), "20".to_owned())]),
                 validation: None,
             },
@@ -2504,13 +2531,29 @@ mod tests {
         };
         run_generate(&request, false)?;
         let ciphertext = repository.join("secrets/application-token.age");
+        let second_ciphertext = repository.join("secrets/application-secondary-token.age");
         let mut first = Vec::new();
         nix_seal_crypto::decrypt(std::fs::File::open(&ciphertext)?, &mut first, &identity)?;
         assert_eq!(first.len(), 40);
+        let mut second = Vec::new();
+        nix_seal_crypto::decrypt(
+            std::fs::File::open(&second_ciphertext)?,
+            &mut second,
+            &identity,
+        )?;
+        assert_eq!(second.len(), 40);
+        assert_ne!(first, second);
         assert!(run_generate(&request, false).is_err());
         let mut unchanged = Vec::new();
         nix_seal_crypto::decrypt(std::fs::File::open(&ciphertext)?, &mut unchanged, &identity)?;
         assert_eq!(first, unchanged);
+        let mut second_unchanged = Vec::new();
+        nix_seal_crypto::decrypt(
+            std::fs::File::open(&second_ciphertext)?,
+            &mut second_unchanged,
+            &identity,
+        )?;
+        assert_eq!(second, second_unchanged);
         run_generate(
             &GenerateArgs {
                 replace: true,
@@ -2522,6 +2565,14 @@ mod tests {
         nix_seal_crypto::decrypt(std::fs::File::open(&ciphertext)?, &mut rotated, &identity)?;
         assert_eq!(rotated.len(), 40);
         assert_ne!(first, rotated);
+        let mut second_rotated = Vec::new();
+        nix_seal_crypto::decrypt(
+            std::fs::File::open(&second_ciphertext)?,
+            &mut second_rotated,
+            &identity,
+        )?;
+        assert_eq!(second_rotated.len(), 40);
+        assert_ne!(second, second_rotated);
         Ok(())
     }
 

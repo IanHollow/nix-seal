@@ -152,10 +152,10 @@ and encrypts the generated value through the normal verified authoring path. The
 current Rust-only built-ins are `builtin:random`, `builtin:hex`, and
 `builtin:uuid`. Random and hex generators accept one public `bytes` parameter
 (1–1,048,576; default 32); UUID accepts none. Generation is create-only unless
-`--replace` is explicit. The current safety profile intentionally accepts one
-output per generator; direct executable hooks and multi-output transactions are
-not yet exposed rather than being implemented with weaker partial-commit
-semantics.
+`--replace` is explicit. Generators may produce multiple secret outputs: every
+output is encrypted and round-trip verified before an existing ciphertext is
+changed, and replacement failures restore prior ciphertext. Direct executable
+hooks remain unavailable until their constrained execution contract is ready.
 
 ## Migration inspection
 
