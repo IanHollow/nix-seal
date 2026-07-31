@@ -15,7 +15,7 @@ pub const PLAN_SCHEMA: &str = "nix-seal.plan.v1";
 pub struct Id(String);
 
 impl Id {
-    /// Parses and validates an ID.
+    /// Parses and validates an `ID`.
     pub fn parse(value: impl Into<String>) -> Result<Self, IdError> {
         let value = value.into();
         if value.is_empty() || value.starts_with('/') || value.contains("..") {
@@ -57,10 +57,10 @@ impl<'de> Deserialize<'de> for Id {
     }
 }
 
-/// ID validation failure.
+/// `ID` validation failure.
 #[derive(Debug, Error)]
 pub enum IdError {
-    /// The string is outside the public ID grammar.
+    /// The string is outside the public `ID` grammar.
     #[error(
         "invalid ID {0:?}; use lowercase ASCII slugs without absolute paths, '..', or empty segments"
     )]
@@ -76,7 +76,7 @@ pub struct PlanV1 {
     /// Public recipients and signers.
     #[serde(default)]
     pub identities: BTreeMap<Id, Identity>,
-    /// Named sets of object IDs.
+    /// Named sets of object `IDs`.
     #[serde(default)]
     pub groups: BTreeMap<Id, Group>,
     /// Platform consumers.
@@ -141,7 +141,7 @@ pub enum IdentityKind {
     Plugin,
 }
 
-/// Named group of IDs.
+/// Named group of `IDs`.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Group {
@@ -158,7 +158,7 @@ pub struct Target {
     pub kind: TargetKind,
     /// Nix system value.
     pub system: String,
-    /// Recipient identity ID.
+    /// Recipient identity `ID`.
     pub identity: Id,
     /// Optional Home Manager user.
     pub username: Option<String>,
@@ -171,7 +171,7 @@ pub struct Target {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TargetKind {
-    /// NixOS system.
+    /// `NixOS` system.
     NixOs,
     /// nix-darwin system.
     Darwin,
@@ -188,10 +188,10 @@ pub struct Secret {
     /// Artifact delivery model.
     #[serde(default)]
     pub delivery: DeliveryMode,
-    /// Explicit administrator identity/group IDs.
+    /// Explicit administrator identity/group `IDs`.
     #[serde(default)]
     pub administrators: Vec<Id>,
-    /// Explicit target/group IDs.
+    /// Explicit target/group `IDs`.
     #[serde(default)]
     pub consumers: Vec<Id>,
     /// Required activation phase.
@@ -203,7 +203,7 @@ pub struct Secret {
     /// Lifecycle metadata.
     #[serde(default)]
     pub lifecycle: Lifecycle,
-    /// Approval policy ID.
+    /// Approval policy `ID`.
     pub approval_policy: Option<Id>,
 }
 
@@ -301,7 +301,7 @@ pub struct Generator {
 pub struct Template {
     /// Non-secret source path.
     pub source: String,
-    /// Placeholder secret IDs.
+    /// Placeholder secret `IDs`.
     pub secrets: Vec<Id>,
     /// Rendered-file runtime settings.
     #[serde(default)]
@@ -314,7 +314,7 @@ pub struct Template {
 pub struct ApprovalPolicy {
     /// Required distinct signer count.
     pub threshold: u16,
-    /// Trusted signer IDs.
+    /// Trusted signer `IDs`.
     pub signers: Vec<Id>,
 }
 

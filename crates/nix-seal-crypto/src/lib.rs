@@ -30,7 +30,7 @@ pub enum CryptoError {
     InputTooLarge,
 }
 
-/// Generates an X25519 identity and returns `(private, public)`.
+/// Generates an `X25519` identity and returns `(private, public)`.
 #[must_use]
 pub fn generate_x25519() -> (secrecy::SecretString, String) {
     let identity = age::x25519::Identity::generate();
@@ -38,7 +38,7 @@ pub fn generate_x25519() -> (secrecy::SecretString, String) {
     (private, identity.to_public().to_string())
 }
 
-/// Encrypts a stream to standard age X25519 recipients, bounded to 64 MiB.
+/// Encrypts a stream to standard age `X25519` recipients, bounded to 64 MiB.
 pub fn encrypt<R: Read, W: Write>(
     mut input: R,
     output: W,
@@ -74,7 +74,7 @@ pub fn encrypt<R: Read, W: Write>(
     Ok(())
 }
 
-/// Decrypts a stream using a standard X25519 identity, bounded to 64 MiB.
+/// Decrypts a stream using a standard `X25519` identity, bounded to 64 MiB.
 pub fn decrypt<R: Read, W: Write>(
     input: R,
     mut output: W,

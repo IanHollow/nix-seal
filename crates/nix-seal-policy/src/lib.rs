@@ -16,21 +16,21 @@ pub enum PolicyError {
         /// Operating-system error.
         source: std::io::Error,
     },
-    /// TOML decoding failed.
+    /// `TOML` decoding failed.
     #[error("invalid TOML plan: {0}")]
     Toml(#[from] toml::de::Error),
-    /// JSON decoding failed.
+    /// `JSON` decoding failed.
     #[error("invalid JSON plan: {0}")]
     Json(#[from] serde_json::Error),
     /// Schema version is unsupported.
     #[error("unsupported plan schema {0:?}; expected {PLAN_SCHEMA:?}")]
     Schema(String),
-    /// Two sources declare the same object ID.
+    /// Two sources declare the same object `ID`.
     #[error("duplicate {kind} ID {id:?} across Nix and TOML plans")]
     Duplicate {
         /// Object collection.
         kind: &'static str,
-        /// Conflicting ID.
+        /// Conflicting `ID`.
         id: Id,
     },
     /// A policy invariant failed.
@@ -38,7 +38,7 @@ pub enum PolicyError {
     Violation(String),
 }
 
-/// Loads a strict TOML plan.
+/// Loads a strict `TOML` plan.
 pub fn load_toml(path: &Path) -> Result<PlanV1, PolicyError> {
     let value = std::fs::read_to_string(path).map_err(|source| PolicyError::Read {
         path: path.display().to_string(),
@@ -47,7 +47,7 @@ pub fn load_toml(path: &Path) -> Result<PlanV1, PolicyError> {
     Ok(toml::from_str(&value)?)
 }
 
-/// Loads a strict JSON plan, including Nix-emitted plans.
+/// Loads a strict `JSON` plan, including Nix-emitted plans.
 pub fn load_json(path: &Path) -> Result<PlanV1, PolicyError> {
     let value = std::fs::read(path).map_err(|source| PolicyError::Read {
         path: path.display().to_string(),
@@ -56,7 +56,7 @@ pub fn load_json(path: &Path) -> Result<PlanV1, PolicyError> {
     Ok(serde_json::from_slice(&value)?)
 }
 
-/// Merges disjoint authoritative sources. Any overlapping ID is fatal.
+/// Merges disjoint authoritative sources. Any overlapping `ID` is fatal.
 pub fn merge(mut left: PlanV1, right: PlanV1) -> Result<PlanV1, PolicyError> {
     macro_rules! disjoint_append {
         ($field:ident) => {
@@ -199,17 +199,17 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
     Ok(())
 }
 
-/// Returns RFC 8785 canonical JSON bytes.
+/// Returns `RFC 8785` canonical `JSON` bytes.
 pub fn canonical_json(plan: &PlanV1) -> Result<Vec<u8>, PolicyError> {
     Ok(serde_jcs::to_vec(plan)?)
 }
 
-/// Returns the BLAKE3 digest of the canonical plan.
+/// Returns the `BLAKE3` digest of the canonical plan.
 pub fn plan_hash(plan: &PlanV1) -> Result<String, PolicyError> {
     Ok(blake3::hash(&canonical_json(plan)?).to_hex().to_string())
 }
 
-/// Returns the JSON Schema for plan.v1.
+/// Returns the `JSON` Schema for plan.v1.
 pub fn json_schema() -> Result<String, PolicyError> {
     Ok(serde_json::to_string_pretty(&schemars::schema_for!(
         PlanV1

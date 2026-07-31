@@ -18,7 +18,7 @@ use std::{
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// Emit versioned JSON metadata. Plaintext is never encoded as JSON.
+    /// Emit versioned `JSON` metadata. Plaintext is never encoded as `JSON`.
     #[arg(long, global = true)]
     json: bool,
 }
@@ -47,7 +47,7 @@ enum Command {
     /// Secret authoring operations.
     #[command(subcommand)]
     Secret(SecretCommand),
-    /// Print the plan.v1 JSON Schema.
+    /// Print the plan.v1 `JSON` Schema.
     Schema,
     /// Generate shell completion definitions.
     Completions { shell: CompletionShell },
@@ -58,12 +58,12 @@ enum Command {
 
 #[derive(Subcommand)]
 enum KeyCommand {
-    /// Generate an age X25519 identity into a new mode-0600 file.
+    /// Generate an age `X25519` identity into a new mode-0600 file.
     Generate {
         #[arg(long)]
         identity_out: PathBuf,
     },
-    /// Print the public recipient for an age X25519 identity file.
+    /// Print the public recipient for an age `X25519` identity file.
     Inspect {
         #[arg(long)]
         identity: PathBuf,
