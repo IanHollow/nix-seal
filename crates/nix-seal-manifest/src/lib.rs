@@ -347,6 +347,14 @@ pub fn verify(
     Ok(VerifiedManifest { manifest, signers })
 }
 
+/// Parses a strict canonical target manifest without asserting any signature trust.
+///
+/// This is intended for inventory and retention decisions only. Call [`verify`]
+/// before using the returned metadata as an authorization decision.
+pub fn inspect_unverified(envelope: &SignedEnvelopeV1) -> Result<TargetManifestV2, ManifestError> {
+    decode_envelope(envelope).map(|(manifest, _, _)| manifest)
+}
+
 fn decode_envelope(
     envelope: &SignedEnvelopeV1,
 ) -> Result<(TargetManifestV2, Vec<u8>, Vec<u8>), ManifestError> {
@@ -509,6 +517,10 @@ mod tests {
         let mut envelope =
             sign_manifest(&manifest, &one).unwrap_or_else(|error| unreachable!("{error}"));
         add_signature(&mut envelope, &two).unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            inspect_unverified(&envelope).unwrap_or_else(|error| unreachable!("{error}")),
+            manifest
+        );
         let verified = verify(&envelope, &trust(&[&one, &two]), 2, &expected(&manifest))
             .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(verified.manifest, manifest);

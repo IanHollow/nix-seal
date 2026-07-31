@@ -165,6 +165,34 @@ pub struct CacheInventory {
     pub artifact_envelope_bytes: u64,
 }
 
+/// Explicit, validated cache retention policy for one garbage-collection run.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GcRequest {
+    /// Artifact keys that remain reachable from active policy.
+    pub retained_artifacts: BTreeSet<String>,
+    /// Generic object digests that remain reachable from active policy.
+    pub retained_objects: BTreeSet<String>,
+    /// Whether to remove candidates after the dry-run calculation.
+    pub execute: bool,
+}
+
+/// Public result of a validated garbage-collection transaction.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GcReport {
+    /// Whether candidates were actually removed.
+    pub executed: bool,
+    /// Number of retained target artifact bundles.
+    pub retained_artifacts: u64,
+    /// Number of retained generic objects.
+    pub retained_objects: u64,
+    /// Number of target artifact bundles selected for deletion.
+    pub candidate_artifacts: u64,
+    /// Number of generic objects selected for deletion.
+    pub candidate_objects: u64,
+    /// Total candidate bytes, including envelopes.
+    pub candidate_bytes: u64,
+}
+
 /// Versioned ciphertext cache.
 pub struct Cache {
     root: PathBuf,
@@ -355,6 +383,124 @@ impl Cache {
         }
         Ok(inventory)
     }
+
+    /// Returns every strictly validated target artifact record in key order.
+    ///
+    /// Envelope signatures are intentionally not interpreted by the cache; the
+    /// policy layer must authenticate them before treating a record as active.
+    pub fn artifact_records(&self) -> Result<Vec<ArtifactRecord>, CacheError> {
+        let artifacts = self.root.join("artifacts");
+        let Some(entries) = read_directory_if_present(&artifacts)? else {
+            return Ok(Vec::new());
+        };
+        let mut keys = BTreeSet::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let key = name.to_str().ok_or(CacheError::UnsafeMetadata)?;
+            if !is_digest(key) {
+                return Err(CacheError::UnsafeMetadata);
+            }
+            keys.insert(key.to_owned());
+        }
+        keys.into_iter()
+            .map(|key| self.load_artifact_by_key(&key))
+            .collect()
+    }
+
+    /// Validates all entries, reports unreachable candidates, and optionally removes them.
+    ///
+    /// Callers must derive the retention sets from authenticated active policy.
+    /// The default `execute = false` is a dry run.
+    pub fn garbage_collect(&self, request: &GcRequest) -> Result<GcReport, CacheError> {
+        if !request.retained_artifacts.iter().all(|key| is_digest(key))
+            || !request.retained_objects.iter().all(|key| is_digest(key))
+        {
+            return Err(CacheError::InvalidAddress);
+        }
+        let lock = self.lock()?;
+        let mut report = GcReport {
+            executed: request.execute,
+            ..GcReport::default()
+        };
+        let objects = self.root.join("objects");
+        if let Some(entries) = read_directory_if_present(&objects)? {
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let digest = name.to_str().ok_or(CacheError::UnsafeMetadata)?;
+                if !is_digest(digest) {
+                    return Err(CacheError::UnsafeMetadata);
+                }
+                let mut file = open_private_regular(&entry.path())?;
+                let bytes = read_bounded(&mut file, MAX_CIPHERTEXT_BYTES)?;
+                if Self::digest(&bytes) != digest {
+                    return Err(CacheError::HashMismatch);
+                }
+                if request.retained_objects.contains(digest) {
+                    report.retained_objects = report
+                        .retained_objects
+                        .checked_add(1)
+                        .ok_or(CacheError::Limit)?;
+                } else {
+                    report.candidate_objects = report
+                        .candidate_objects
+                        .checked_add(1)
+                        .ok_or(CacheError::Limit)?;
+                    report.candidate_bytes = report
+                        .candidate_bytes
+                        .checked_add(u64::try_from(bytes.len()).map_err(|_| CacheError::Limit)?)
+                        .ok_or(CacheError::Limit)?;
+                    if request.execute {
+                        std::fs::remove_file(entry.path())?;
+                    }
+                }
+            }
+            if request.execute {
+                File::open(&objects)?.sync_all()?;
+            }
+        }
+        let artifacts = self.root.join("artifacts");
+        if let Some(entries) = read_directory_if_present(&artifacts)? {
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let key = name.to_str().ok_or(CacheError::UnsafeMetadata)?;
+                if !is_digest(key) {
+                    return Err(CacheError::UnsafeMetadata);
+                }
+                let record = self.load_artifact_by_key(key)?;
+                let bytes = file_length(&record.ciphertext_path)?
+                    .checked_add(
+                        u64::try_from(record.envelope.len()).map_err(|_| CacheError::Limit)?,
+                    )
+                    .ok_or(CacheError::Limit)?;
+                if request.retained_artifacts.contains(key) {
+                    report.retained_artifacts = report
+                        .retained_artifacts
+                        .checked_add(1)
+                        .ok_or(CacheError::Limit)?;
+                } else {
+                    report.candidate_artifacts = report
+                        .candidate_artifacts
+                        .checked_add(1)
+                        .ok_or(CacheError::Limit)?;
+                    report.candidate_bytes = report
+                        .candidate_bytes
+                        .checked_add(bytes)
+                        .ok_or(CacheError::Limit)?;
+                    if request.execute {
+                        remove_artifact_bundle(&record)?;
+                    }
+                }
+            }
+            if request.execute {
+                File::open(&artifacts)?.sync_all()?;
+            }
+        }
+        FileExt::unlock(&lock)?;
+        Ok(report)
+    }
     /// Returns the cache root.
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -427,6 +573,21 @@ fn file_length(path: &Path) -> Result<u64, CacheError> {
     let metadata = std::fs::symlink_metadata(path)?;
     validate_private_metadata(&metadata, false)?;
     Ok(metadata.len())
+}
+
+fn remove_artifact_bundle(record: &ArtifactRecord) -> Result<(), CacheError> {
+    let directory = record
+        .ciphertext_path
+        .parent()
+        .ok_or(CacheError::UnsafeMetadata)?;
+    let manifest = directory.join("manifest.dsse.json");
+    let ciphertext = directory.join("ciphertext.age");
+    validate_private_metadata(&std::fs::symlink_metadata(&ciphertext)?, false)?;
+    validate_private_metadata(&std::fs::symlink_metadata(&manifest)?, false)?;
+    std::fs::remove_file(ciphertext)?;
+    std::fs::remove_file(manifest)?;
+    std::fs::remove_dir(directory)?;
+    Ok(())
 }
 
 fn read_bounded(file: &mut File, limit: u64) -> Result<Vec<u8>, CacheError> {
@@ -594,6 +755,31 @@ mod tests {
             cache.put_artifact(&address, b"other".as_slice(), b"envelope"),
             Err(CacheError::ArtifactExists)
         ));
+        let report = cache.garbage_collect(&GcRequest {
+            retained_artifacts: BTreeSet::from([artifact.key.clone()]),
+            retained_objects: BTreeSet::new(),
+            execute: false,
+        })?;
+        assert_eq!(
+            report,
+            GcReport {
+                executed: false,
+                retained_artifacts: 1,
+                retained_objects: 0,
+                candidate_artifacts: 0,
+                candidate_objects: 1,
+                candidate_bytes: 15,
+            }
+        );
+        assert_eq!(cache.get(&digest)?, b"ciphertext only");
+        let removed = cache.garbage_collect(&GcRequest {
+            retained_artifacts: BTreeSet::from([artifact.key.clone()]),
+            retained_objects: BTreeSet::new(),
+            execute: true,
+        })?;
+        assert!(removed.executed);
+        assert!(cache.get(&digest).is_err());
+        assert!(cache.load_artifact(&address)?.is_some());
 
         let concurrent = ArtifactAddress::new(
             "4".repeat(64),
