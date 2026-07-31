@@ -45,8 +45,8 @@ is intentionally updated or the ciphertext is restored.
 Cache garbage collection is explicitly dry-run-first and trusts neither cache
 names nor unsigned metadata. It recomputes the active plan and target-policy
 hashes, hashes the canonical source ciphertext through a no-follow descriptor,
-reconstructs the deterministic artifact address, and checks the current
-approval threshold before retaining an artifact:
+reconstructs the deterministic artifact address, and checks the current approval
+threshold before retaining an artifact:
 
 ```console
 nix-seal cache gc --plan plan.v1.json --repository-root .

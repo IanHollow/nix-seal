@@ -85,8 +85,8 @@ exact safe rekey command. Export/import and encrypted closure copy support
 remote builds. GC is dry-run-first and retains only target artifacts that are
 authenticated by the active plan, target policy, canonical source hash,
 deterministic address, and current approval threshold. Generic v1 cache objects
-have no authenticated reachability edge and are candidates until a future
-format introduces one.
+have no authenticated reachability edge and are candidates until a future format
+introduces one.
 
 Activation verifies schema, signatures, hashes, target, and recipient metadata;
 decrypts a complete restrictive generation; and switches only after every value

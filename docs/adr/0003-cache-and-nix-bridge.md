@@ -31,12 +31,12 @@ misleading count. Cache lifecycle operations build on this verified inventory.
 
 `cache gc` is dry-run-first. It retains a target artifact only after compiling
 the current plan, deriving the target projection, hashing the current canonical
-ciphertext through a no-follow descriptor, reconstructing the cache address,
-and verifying the signed envelope against the target secret's current approval
-keys and threshold. Expired, stale, malformed, source-mismatched,
-target-mismatched, and untrusted artifacts are candidates; they are removed
-only with `--execute`. Generic v1 objects have no authenticated reachability
-edge, so GC deliberately treats all of them as candidates rather than guessing
-from filenames or public metadata. The current GC compatibility rule accepts a
-signed producer version because v1 has no producer-version allow-list; future
-policy must add an explicit allow-list before it can tighten this decision.
+ciphertext through a no-follow descriptor, reconstructing the cache address, and
+verifying the signed envelope against the target secret's current approval keys
+and threshold. Expired, stale, malformed, source-mismatched, target-mismatched,
+and untrusted artifacts are candidates; they are removed only with `--execute`.
+Generic v1 objects have no authenticated reachability edge, so GC deliberately
+treats all of them as candidates rather than guessing from filenames or public
+metadata. The current GC compatibility rule accepts a signed producer version
+because v1 has no producer-version allow-list; future policy must add an
+explicit allow-list before it can tighten this decision.
