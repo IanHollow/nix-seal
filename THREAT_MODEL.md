@@ -9,9 +9,9 @@ agents, the ciphertext cache, Nix builders/binary caches, deployment transport,
 target activation, generators/editors, and privileged service consumers.
 
 Repository metadata and ciphertext are attacker-controlled input. Nix store and
-binary caches are public. A target trusts only its configured plan root, approval
-keys, and target identity. Repository authorization remains part of the root of
-trust even when artifacts are signed.
+binary caches are public. A target trusts only its configured plan root,
+approval keys, and target identity. Repository authorization remains part of the
+root of trust even when artifacts are signed.
 
 ## Adversaries
 
@@ -19,7 +19,8 @@ trust even when artifacts are signed.
 - Compromised administrator workstations, decryption keys, or signing keys.
 - Thieves possessing a target private key or historical Git checkout.
 - Unprivileged local users racing or traversing runtime filesystem operations.
-- Malicious plugins, agents, editors, generator executables, and migration tools.
+- Malicious plugins, agents, editors, generator executables, and migration
+  tools.
 - Supply-chain attackers affecting dependencies, CI, release identity, or Nix
   inputs.
 - Attackers causing resource exhaustion, interrupted writes, concurrent races,
@@ -44,7 +45,8 @@ concurrency, secret canaries, and denial-of-service bounds.
 - Root on a target can read that target's runtime plaintext.
 - A compromised administrator identity exposes canonical ciphertext addressed to
   it; a compromised target identity exposes matching direct/historical objects.
-- Re-encryption cannot make already-decrypted historical ciphertext secret again.
+- Re-encryption cannot make already-decrypted historical ciphertext secret
+  again.
 - Secure deletion is not guaranteed on SSDs or copy-on-write filesystems.
 - Zeroization cannot prove every compiler/runtime copy disappeared.
 - Static rotation cannot update an external service without a rotation provider.

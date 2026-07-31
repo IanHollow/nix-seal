@@ -29,18 +29,18 @@ flake-parts modules, `lib`, and checks. Runtime paths are
 
 Typed Nix options and `nix-seal.toml` compile into strict, versioned
 `plan.v1.json`. Unknown fields and overlapping IDs are fatal. Ordering and
-canonicalization are deterministic. IDs are lowercase slugs with `.`, `/`,
-`-`, and `_`; paths, `..`, empty segments, and controls are rejected. Only
-public metadata may enter the Nix store.
+canonicalization are deterministic. IDs are lowercase slugs with `.`, `/`, `-`,
+and `_`; paths, `..`, empty segments, and controls are rejected. Only public
+metadata may enter the Nix store.
 
 The object model includes identities, groups, targets, secrets, generators,
 templates, approval policies, and versioned backends. Secrets support binary or
-text values; groups/selectors; rekeyed or advanced direct delivery; partitioning,
-users, activation, or services phases; owner/group/mode; systemd credential
-mapping; reload/restart lists; lifecycle and incident metadata; generators and
-dependencies; public/secret/intermediary outputs; and runtime templates.
-Structured JSON/TOML/YAML/dotenv editing is a logical authoring view. Storage is
-one interoperable age file per secret/output.
+text values; groups/selectors; rekeyed or advanced direct delivery;
+partitioning, users, activation, or services phases; owner/group/mode; systemd
+credential mapping; reload/restart lists; lifecycle and incident metadata;
+generators and dependencies; public/secret/intermediary outputs; and runtime
+templates. Structured JSON/TOML/YAML/dotenv editing is a logical authoring view.
+Storage is one interoperable age file per secret/output.
 
 ## Trust and artifact model
 
@@ -71,8 +71,8 @@ activation. Commands are introduced only when functional.
 Metadata goes to stdout and diagnostics to stderr. Human and versioned JSON
 modes have stable exit categories. Plaintext JSON is forbidden; plaintext output
 requires `secret reveal`. Non-interactive commands never unexpectedly prompt.
-Secret values are not accepted in argv or ordinary environment variables.
-Errors may identify a secret but never contain values or decrypted fragments.
+Secret values are not accepted in argv or ordinary environment variables. Errors
+may identify a secret but never contain values or decrypted fragments.
 
 ## Cache, Nix bridge, and activation
 
@@ -88,9 +88,9 @@ Activation verifies schema, signatures, hashes, target, and recipient metadata;
 decrypts a complete restrictive generation; and switches only after every value
 is ready. It rejects traversal, links, non-regular files, unsafe parents,
 ownership, and modes. File operations must be directory-relative with no-follow,
-exclusive, close-on-exec, restrictive umask, fsync, and atomic switching. Failure
-keeps the old generation. Old generations retain old plaintext until removed or
-rebooted. NixOS prefers systemd credentials; compatibility files use
+exclusive, close-on-exec, restrictive umask, fsync, and atomic switching.
+Failure keeps the old generation. Old generations retain old plaintext until
+removed or rebooted. NixOS prefers systemd credentials; compatibility files use
 `/run/nix-seal`. Home Manager uses its runtime directory and macOS reports when
 it is not memory-backed. Units change only after a complete switch.
 
@@ -117,15 +117,15 @@ automatically.
 
 ## Rust and security policy
 
-Project crates forbid unsafe Rust. Any exception requires a small isolated crate,
-an ADR, a documented invariant, and independent review. Secret-bearing values use
-`secrecy`/`zeroize`, lack plaintext `Debug`/`Display`, and minimize copies.
-Crypto is streamed with bounds. User input must not panic. Arithmetic, recursion,
-collections, and external processes are bounded. Errors are structured and
-redacted. The application commits `Cargo.lock`, documents an MSRV, applies SemVer
-to CLI/IR/config/protocol/options, and retains deprecations for at least one minor
-release. The pre-1.0 age crate is pinned behind an adapter; upgrades require audit
-and reference/vector interoperability tests.
+Project crates forbid unsafe Rust. Any exception requires a small isolated
+crate, an ADR, a documented invariant, and independent review. Secret-bearing
+values use `secrecy`/`zeroize`, lack plaintext `Debug`/`Display`, and minimize
+copies. Crypto is streamed with bounds. User input must not panic. Arithmetic,
+recursion, collections, and external processes are bounded. Errors are
+structured and redacted. The application commits `Cargo.lock`, documents an
+MSRV, applies SemVer to CLI/IR/config/protocol/options, and retains deprecations
+for at least one minor release. The pre-1.0 age crate is pinned behind an
+adapter; upgrades require audit and reference/vector interoperability tests.
 
 NIST SSDF is the lifecycle baseline. Required controls include disclosure and
 support policies, threat model and compromise runbooks, security ADRs, DCO and
@@ -142,12 +142,13 @@ mutation tests; lock/race/interruption tests; migration goldens; NixOS VMs and
 real macOS CI; store/log/argv leakage canaries; hostile filesystem and plugin
 tests; and approval replay/expiry/rotation/substitution/downgrade tests.
 
-Benchmarks cover 1, 100, 1,000, and 10,000 secrets/targets with streaming memory,
-bounded parallelism, serialized hardware identities, incremental hashes, and
-published hardware. Compatibility fixtures are retained for every release.
+Benchmarks cover 1, 100, 1,000, and 10,000 secrets/targets with streaming
+memory, bounded parallelism, serialized hardware identities, incremental hashes,
+and published hardware. Compatibility fixtures are retained for every release.
 
 1.0 requires the complete platform matrix, dogfooding and rollback in nix-conf,
 all migration fixtures, no plaintext leakage, sustained fuzzing without open
 high-severity findings, current threat model/ADRs, completed external audit and
 remediation, a public release-candidate compatibility cycle, and exercised
-recovery/key-compromise/signer-rotation/target-loss/cache-loss/rollback runbooks.
+recovery/key-compromise/signer-rotation/target-loss/cache-loss/rollback
+runbooks.

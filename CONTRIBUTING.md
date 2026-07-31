@@ -11,7 +11,8 @@ All commits require Developer Certificate of Origin sign-off:
 git commit -s
 ```
 
-Run `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+Run `cargo fmt --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace`, and `nix flake check`. Never put real secrets, private
 identities, prompt answers, or plaintext test fixtures in commits or CI.
 

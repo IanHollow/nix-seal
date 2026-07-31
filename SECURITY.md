@@ -17,8 +17,8 @@ third-party systems is welcome.
 ## Supported versions
 
 No version is production-supported before 1.0 and the required independent
-audit. After 1.0, the latest minor release and the preceding minor release receive
-security fixes. Critical fixes may require an immediate upgrade.
+audit. After 1.0, the latest minor release and the preceding minor release
+receive security fixes. Critical fixes may require an immediate upgrade.
 
 ## Handling requirements
 

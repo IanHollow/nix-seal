@@ -26,5 +26,5 @@ cargo clippy --workspace --all-targets -- -D warnings
 nix flake check
 ```
 
-Licensed under either Apache-2.0 or MIT, at your option. Contributions require
-a Developer Certificate of Origin sign-off.
+Licensed under either Apache-2.0 or MIT, at your option. Contributions require a
+Developer Certificate of Origin sign-off.
