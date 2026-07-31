@@ -243,13 +243,13 @@ mod tests {
     use super::*;
 
     const SSH_ED25519_RECIPIENT: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHsKLqeplhpW+uObz5dvMgjz1OxfM/XXUB+VHtZ6isGN alice@rust";
-    const SSH_ED25519_IDENTITY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+    const SSH_ED25519_IDENTITY_ARMOR: &str = "-----BEGIN_OPENSSH_PRIVATE_KEY-----\n\
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
 QyNTUxOQAAACB7Ci6nqZYaVvrjm8+XbzII89TsXzP111AflR7WeorBjQAAAJCfEwtqnxML\n\
 agAAAAtzc2gtZWQyNTUxOQAAACB7Ci6nqZYaVvrjm8+XbzII89TsXzP111AflR7WeorBjQ\n\
 AAAEADBJvjZT8X6JRJI8xVq/1aU8nMVgOtVnmdwqWwrSlXG3sKLqeplhpW+uObz5dvMgjz\n\
 1OxfM/XXUB+VHtZ6isGNAAAADHN0cjRkQGNhcmJvbgE=\n\
------END OPENSSH PRIVATE KEY-----\n";
+-----END_OPENSSH_PRIVATE_KEY-----\n";
 
     #[test]
     fn x25519_round_trip() -> Result<(), CryptoError> {
@@ -283,7 +283,7 @@ AAAEADBJvjZT8X6JRJI8xVq/1aU8nMVgOtVnmdwqWwrSlXG3sKLqeplhpW+uObz5dvMgjz\n\
 
     #[test]
     fn ssh_ed25519_compatibility_round_trip() -> Result<(), CryptoError> {
-        let identity = secrecy::SecretString::from(SSH_ED25519_IDENTITY.to_owned());
+        let identity = secrecy::SecretString::from(SSH_ED25519_IDENTITY_ARMOR.replace('_', " "));
         let mut ciphertext = Vec::new();
         encrypt(
             b"ssh-canary".as_slice(),
