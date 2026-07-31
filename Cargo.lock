@@ -1193,7 +1193,14 @@ dependencies = [
 name = "nix-seal-runtime"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "blake3",
+ "fs2",
  "nix-seal-core",
+ "nix-seal-crypto",
+ "nix-seal-manifest",
+ "rustix",
+ "secrecy",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.19",
 ]
