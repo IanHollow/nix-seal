@@ -201,13 +201,15 @@ nix-seal migrate ciphertext --source legacy/token.age --destination secrets/toke
   --identity /absolute/path/to/administrator.age --recipient age1... --json
 ```
 
-It validates legacy paths, scopes, consumers, IDs, and SSH recipient metadata,
-then reports normalized nix-seal IDs. It never decrypts or rewrites legacy
-files. New plans should use native age recipients. Existing unencrypted OpenSSH
-Ed25519/RSA identities are supported only as a migration compatibility path;
-encrypted SSH private keys are deliberately rejected in non-interactive
-workflows, so convert them to a reviewed native-age or hardware-backed identity
-before automated import.
+It validates legacy paths, scopes, consumers, IDs, groups, and SSH recipient
+metadata. For `secretctl`, it additionally cross-checks every target recipient
+set against its declared group membership and every secret recipient set against
+its consumer targets before reporting normalized nix-seal IDs. It never decrypts
+or rewrites legacy files. New plans should use native age recipients. Existing
+unencrypted OpenSSH Ed25519/RSA identities are supported only as a migration
+compatibility path; encrypted SSH private keys are deliberately rejected in
+non-interactive workflows, so convert them to a reviewed native-age or
+hardware-backed identity before automated import.
 
 The agenix/ragenix adapters recursively inventory only regular `*.age` files,
 validate their age headers, and reject symbolic links or unsafe nesting. Because

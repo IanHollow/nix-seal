@@ -711,6 +711,7 @@ fn run_schema(kind: SchemaKind) -> Result<()> {
 #[serde(deny_unknown_fields)]
 struct SecretctlIndexV1 {
     version: u64,
+    groups: BTreeMap<String, Vec<String>>,
     targets: BTreeMap<String, SecretctlTargetV1>,
     secrets: BTreeMap<String, SecretctlSecretV1>,
 }
@@ -736,6 +737,29 @@ struct SecretctlSecretV1 {
     file: String,
     recipients: Vec<String>,
     consumers: Vec<String>,
+}
+
+struct SecretctlMigrationReport {
+    groups: Vec<serde_json::Value>,
+    secrets: Vec<serde_json::Value>,
+    targets: Vec<serde_json::Value>,
+    ssh_recipient_count: usize,
+}
+
+struct ValidatedSecretctlGroups {
+    groups: BTreeMap<String, BTreeSet<String>>,
+    ssh_recipients: BTreeSet<String>,
+}
+
+struct ValidatedSecretctlTargets {
+    recipients: BTreeMap<String, String>,
+    mappings: Vec<serde_json::Value>,
+    ssh_recipients: BTreeSet<String>,
+}
+
+struct ValidatedSecretctlSecrets {
+    mappings: Vec<serde_json::Value>,
+    ssh_recipients: BTreeSet<String>,
 }
 
 fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
@@ -946,65 +970,11 @@ fn scan_agenix_ciphertexts(root: &Path, directory: &Path, output: &mut Vec<PathB
 fn migrate_secretctl(index_path: &Path, json: bool) -> Result<()> {
     let index: SecretctlIndexV1 =
         read_json_bounded(index_path).context("invalid strict secretctl secretIndex JSON")?;
-    if index.version != 1 {
-        bail!("unsupported secretctl index version; expected 1");
-    }
-    if index.secrets.is_empty() || index.targets.len() > 10_000 || index.secrets.len() > 10_000 {
-        bail!("secretctl index has unsupported target or secret counts");
-    }
-    let mut mappings = Vec::new();
-    let mut ssh_recipients = BTreeSet::new();
-    for (legacy_id, secret) in &index.secrets {
-        if secret.id != *legacy_id || secret.group.is_empty() || secret.agenix_name.is_empty() {
-            bail!("secretctl index has inconsistent public secret metadata for {legacy_id}");
-        }
-        let new_id = migrated_id(legacy_id)?;
-        let source = migrate_secretctl_source(&secret.file)?;
-        for recipient in &secret.recipients {
-            if !(recipient.starts_with("ssh-ed25519 ") || recipient.starts_with("ssh-rsa ")) {
-                bail!("secretctl secret {legacy_id} has an unsupported recipient format");
-            }
-            ssh_recipients.insert(recipient.clone());
-        }
-        for consumer in &secret.consumers {
-            if !index.targets.contains_key(consumer) {
-                bail!("secretctl secret {legacy_id} references missing target {consumer}");
-            }
-        }
-        mappings.push(serde_json::json!({
-            "legacyId":legacy_id,
-            "nixSealId":new_id,
-            "source":source,
-            "scope":secret.scope,
-            "selector":secret.selector,
-            "agenixName":secret.agenix_name,
-            "consumers":secret.consumers
-        }));
-    }
-    let mut targets = Vec::new();
-    for (legacy_id, target) in &index.targets {
-        if target.target_type != "home" && target.target_type != "host" {
-            bail!("secretctl target {legacy_id} has an unsupported type");
-        }
-        if !(target.public_key.starts_with("ssh-ed25519 ")
-            || target.public_key.starts_with("ssh-rsa "))
-        {
-            bail!("secretctl target {legacy_id} has an unsupported public key");
-        }
-        if target.groups.iter().any(String::is_empty) || target.recipients.is_empty() {
-            bail!("secretctl target {legacy_id} has invalid group or recipient metadata");
-        }
-        targets.push(serde_json::json!({
-            "legacyId":legacy_id,
-            "nixSealId":migrated_id(legacy_id)?,
-            "type":target.target_type,
-            "groups":target.groups
-        }));
-    }
+    let report = build_secretctl_migration_report(&index)?;
     let warnings = vec![
         "dry run only: no ciphertext, configuration, or source manager was changed".to_owned(),
         "secretctl uses SSH recipients; native age is preferred, while unencrypted OpenSSH identities are available only for reviewed migration compatibility".to_owned(),
-        "review normalized IDs and scope selectors before generating a nix-seal plan".to_owned(),
+        "the reported legacy group memberships and direct-recipient sets were cross-checked; review normalized IDs and scope selectors before generating a nix-seal plan".to_owned(),
     ];
     if json {
         println!(
@@ -1013,23 +983,25 @@ fn migrate_secretctl(index_path: &Path, json: bool) -> Result<()> {
                 "schema":"nix-seal.migration-report.v1",
                 "source":"secretctl",
                 "dryRun":true,
-                "secrets":mappings,
-                "targets":targets,
-                "sshRecipientCount":ssh_recipients.len(),
+                "groups":report.groups,
+                "secrets":report.secrets,
+                "targets":report.targets,
+                "sshRecipientCount":report.ssh_recipient_count,
                 "warnings":warnings
             })
         );
     } else {
         println!(
-            "secretctl dry-run: {} secrets and {} targets mapped; {} SSH recipients require a reviewed migration path",
-            mappings.len(),
-            targets.len(),
-            ssh_recipients.len()
+            "secretctl dry-run: {} groups, {} secrets, and {} targets mapped; {} SSH recipients require a reviewed migration path",
+            report.groups.len(),
+            report.secrets.len(),
+            report.targets.len(),
+            report.ssh_recipient_count,
         );
         for warning in warnings {
             eprintln!("warning: {warning}");
         }
-        for mapping in mappings {
+        for mapping in report.secrets {
             println!(
                 "{} -> {} ({})",
                 mapping["legacyId"].as_str().unwrap_or("unknown"),
@@ -1041,6 +1013,202 @@ fn migrate_secretctl(index_path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn build_secretctl_migration_report(index: &SecretctlIndexV1) -> Result<SecretctlMigrationReport> {
+    if index.version != 1 {
+        bail!("unsupported secretctl index version; expected 1");
+    }
+    if index.secrets.is_empty()
+        || index.groups.len() > 10_000
+        || index.targets.len() > 10_000
+        || index.secrets.len() > 10_000
+    {
+        bail!("secretctl index has unsupported group, target, or secret counts");
+    }
+    let groups = validate_secretctl_groups(&index.groups)?;
+    let targets = validate_secretctl_targets(&index.targets, &groups.groups)?;
+    let secrets = validate_secretctl_secrets(&index.secrets, &groups.groups, &targets.recipients)?;
+    let mut ssh_recipients = groups.ssh_recipients;
+    ssh_recipients.extend(targets.ssh_recipients);
+    ssh_recipients.extend(secrets.ssh_recipients);
+    let group_mappings = migration_groups(&groups.groups)?;
+    Ok(SecretctlMigrationReport {
+        groups: group_mappings,
+        secrets: secrets.mappings,
+        targets: targets.mappings,
+        ssh_recipient_count: ssh_recipients.len(),
+    })
+}
+
+fn validate_secretctl_groups(
+    source: &BTreeMap<String, Vec<String>>,
+) -> Result<ValidatedSecretctlGroups> {
+    let mut groups = BTreeMap::new();
+    let mut ssh_recipients = BTreeSet::new();
+    for (legacy_id, recipients) in source {
+        if legacy_id.is_empty() || recipients.is_empty() || recipients.len() > 10_000 {
+            bail!("secretctl group {legacy_id} has invalid recipient metadata");
+        }
+        let normalized =
+            normalize_secretctl_recipients(recipients, &format!("secretctl group {legacy_id}"))?;
+        if normalized.len() != recipients.len() {
+            bail!("secretctl group {legacy_id} contains duplicate recipients");
+        }
+        ssh_recipients.extend(normalized.iter().cloned());
+        groups.insert(legacy_id.clone(), normalized);
+    }
+    Ok(ValidatedSecretctlGroups {
+        groups,
+        ssh_recipients,
+    })
+}
+
+fn validate_secretctl_targets(
+    source: &BTreeMap<String, SecretctlTargetV1>,
+    groups: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<ValidatedSecretctlTargets> {
+    let mut targets = Vec::new();
+    let mut target_recipients = BTreeMap::new();
+    let mut ssh_recipients = BTreeSet::new();
+    for (legacy_id, target) in source {
+        if target.target_type != "home" && target.target_type != "host" {
+            bail!("secretctl target {legacy_id} has an unsupported type");
+        }
+        if target.groups.is_empty()
+            || target.groups.len() > 10_000
+            || target.recipients.is_empty()
+            || target.recipients.len() > 10_000
+        {
+            bail!("secretctl target {legacy_id} has invalid group or recipient metadata");
+        }
+        let public_key = normalize_secretctl_recipient(
+            &target.public_key,
+            &format!("secretctl target {legacy_id}"),
+        )?;
+        let mut expected = BTreeSet::from([public_key.clone()]);
+        for group in &target.groups {
+            let members = groups.get(group).with_context(|| {
+                format!("secretctl target {legacy_id} references missing group {group}")
+            })?;
+            expected.extend(members.iter().cloned());
+        }
+        if target.groups.iter().collect::<BTreeSet<_>>().len() != target.groups.len() {
+            bail!("secretctl target {legacy_id} contains duplicate group references");
+        }
+        let recipients = normalize_secretctl_recipients(
+            &target.recipients,
+            &format!("secretctl target {legacy_id}"),
+        )?;
+        if recipients.len() != target.recipients.len() || recipients != expected {
+            bail!("secretctl target {legacy_id} recipient set does not match its public groups");
+        }
+        ssh_recipients.extend(recipients.iter().cloned());
+        target_recipients.insert(legacy_id.clone(), public_key);
+        targets.push(serde_json::json!({
+            "legacyId":legacy_id,
+            "nixSealId":migrated_id(legacy_id)?,
+            "type":target.target_type,
+            "groups":target.groups,
+            "recipientCount":recipients.len()
+        }));
+    }
+    Ok(ValidatedSecretctlTargets {
+        recipients: target_recipients,
+        mappings: targets,
+        ssh_recipients,
+    })
+}
+
+fn validate_secretctl_secrets(
+    source: &BTreeMap<String, SecretctlSecretV1>,
+    groups: &BTreeMap<String, BTreeSet<String>>,
+    target_recipients: &BTreeMap<String, String>,
+) -> Result<ValidatedSecretctlSecrets> {
+    let mut secrets = Vec::new();
+    let mut ssh_recipients = BTreeSet::new();
+    for (legacy_id, secret) in source {
+        if secret.id != *legacy_id
+            || secret.group.is_empty()
+            || secret.agenix_name.is_empty()
+            || secret.consumers.is_empty()
+            || secret.consumers.len() > 10_000
+            || secret.recipients.is_empty()
+            || secret.recipients.len() > 10_000
+        {
+            bail!("secretctl index has inconsistent public secret metadata for {legacy_id}");
+        }
+        if !groups.contains_key(&secret.group) {
+            bail!(
+                "secretctl secret {legacy_id} references missing group {}",
+                secret.group
+            );
+        }
+        if secret.consumers.iter().collect::<BTreeSet<_>>().len() != secret.consumers.len() {
+            bail!("secretctl secret {legacy_id} contains duplicate consumer targets");
+        }
+        let mut expected = BTreeSet::new();
+        for consumer in &secret.consumers {
+            let recipient = target_recipients.get(consumer).with_context(|| {
+                format!("secretctl secret {legacy_id} references missing target {consumer}")
+            })?;
+            expected.insert(recipient.clone());
+        }
+        let recipients = normalize_secretctl_recipients(
+            &secret.recipients,
+            &format!("secretctl secret {legacy_id}"),
+        )?;
+        if recipients.len() != secret.recipients.len() || recipients != expected {
+            bail!("secretctl secret {legacy_id} recipient set does not match its consumer targets");
+        }
+        ssh_recipients.extend(recipients);
+        let new_id = migrated_id(legacy_id)?;
+        let source = migrate_secretctl_source(&secret.file)?;
+        secrets.push(serde_json::json!({
+            "legacyId":legacy_id,
+            "nixSealId":new_id,
+            "source":source,
+            "scope":secret.scope,
+            "selector":secret.selector,
+            "agenixName":secret.agenix_name,
+            "group":secret.group,
+            "consumers":secret.consumers
+        }));
+    }
+    Ok(ValidatedSecretctlSecrets {
+        mappings: secrets,
+        ssh_recipients,
+    })
+}
+
+fn migration_groups(groups: &BTreeMap<String, BTreeSet<String>>) -> Result<Vec<serde_json::Value>> {
+    let groups = groups
+        .iter()
+        .map(|(legacy_id, recipients)| {
+            Ok(serde_json::json!({
+                "legacyId":legacy_id,
+                "nixSealId":migrated_id(legacy_id)?,
+                "recipientCount":recipients.len()
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(groups)
+}
+
+fn normalize_secretctl_recipients(recipients: &[String], owner: &str) -> Result<BTreeSet<String>> {
+    recipients
+        .iter()
+        .map(|recipient| normalize_secretctl_recipient(recipient, owner))
+        .collect()
+}
+
+fn normalize_secretctl_recipient(recipient: &str, owner: &str) -> Result<String> {
+    let normalized = nix_seal_crypto::normalize_recipient(recipient)
+        .with_context(|| format!("{owner} has an unsupported recipient format"))?;
+    if !(normalized.starts_with("ssh-ed25519 ") || normalized.starts_with("ssh-rsa ")) {
+        bail!("{owner} has an unsupported recipient format");
+    }
+    Ok(normalized)
+}
+
 fn migrated_id(value: &str) -> Result<nix_seal_core::Id> {
     let mut normalized = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -1049,7 +1217,7 @@ fn migrated_id(value: &str) -> Result<nix_seal_core::Id> {
             b'a'..=b'z' | b'0'..=b'9' | b'.' | b'/' | b'-' | b'_' => {
                 normalized.push(char::from(byte));
             }
-            b':' => normalized.push('-'),
+            b':' | b'@' => normalized.push('-'),
             _ => bail!("legacy secretctl ID cannot be represented safely in nix-seal"),
         }
     }
@@ -3107,6 +3275,10 @@ mod tests {
             migrated_id("host:nixos:desktop")?.as_str(),
             "host-nixos-desktop"
         );
+        assert_eq!(
+            migrated_id("home:ianmh@desktop")?.as_str(),
+            "home-ianmh-desktop"
+        );
         assert!(migrated_id("legacy value").is_err());
         assert_eq!(
             migrate_secretctl_source("secrets/IanHollow/token.age")?,
@@ -3114,6 +3286,68 @@ mod tests {
         );
         assert!(migrate_secretctl_source("../secrets/token.age").is_err());
         assert!(migrate_secretctl_source("secrets/token.txt").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn secretctl_migration_cross_checks_groups_targets_and_recipients()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEolRZAKwwqDLSkgezpqNK4WYLjMsE1qp8f3k7nYMVgq"
+                .to_owned();
+        let second =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFwSeiaY3PpNjPDaFA9bDPeFaLU5HYi0PrJKEEYIt3Vs"
+                .to_owned();
+        let group_recipients = vec![first.clone(), second.clone()];
+        let mut index = SecretctlIndexV1 {
+            version: 1,
+            groups: BTreeMap::from([("operators".to_owned(), group_recipients.clone())]),
+            targets: BTreeMap::from([
+                (
+                    "home:ianmh@desktop".to_owned(),
+                    SecretctlTargetV1 {
+                        target_type: "home".to_owned(),
+                        groups: vec!["operators".to_owned()],
+                        public_key: first.clone(),
+                        recipients: group_recipients.clone(),
+                    },
+                ),
+                (
+                    "host:nixos:desktop".to_owned(),
+                    SecretctlTargetV1 {
+                        target_type: "host".to_owned(),
+                        groups: vec!["operators".to_owned()],
+                        public_key: second.clone(),
+                        recipients: group_recipients.clone(),
+                    },
+                ),
+            ]),
+            secrets: BTreeMap::from([(
+                "operators.home.ianmh.token".to_owned(),
+                SecretctlSecretV1 {
+                    id: "operators.home.ianmh.token".to_owned(),
+                    group: "operators".to_owned(),
+                    scope: "home".to_owned(),
+                    selector: Some("ianmh".to_owned()),
+                    agenix_name: "token".to_owned(),
+                    file: "secrets/operators/home/ianmh/token.age".to_owned(),
+                    recipients: vec![first.clone()],
+                    consumers: vec!["home:ianmh@desktop".to_owned()],
+                },
+            )]),
+        };
+        let report = build_secretctl_migration_report(&index)?;
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.targets.len(), 2);
+        assert_eq!(report.secrets.len(), 1);
+        assert_eq!(report.ssh_recipient_count, 2);
+
+        index
+            .targets
+            .get_mut("home:ianmh@desktop")
+            .ok_or("target")?
+            .recipients = vec![first];
+        assert!(build_secretctl_migration_report(&index).is_err());
         Ok(())
     }
 

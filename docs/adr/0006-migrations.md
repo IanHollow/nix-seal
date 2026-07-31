@@ -8,7 +8,10 @@ native age encryption, verifies every result by round trip, and supports
 side-by-side runtime directories. The initial implementation inventories
 `secretctl` public indexes and agenix/ragenix age trees, then provides an
 explicit `migrate ciphertext --execute` path that streams a reviewed source
-ciphertext through replacement recipients without materializing plaintext.
+ciphertext through replacement recipients without materializing plaintext. The
+`secretctl` adapter validates group membership, target recipient expansion, and
+every secret's direct recipient set against its declared consumers before it
+emits a mapping report.
 
 Adapters for agenix-rekey metadata, SOPS/sops-nix, and Clan Vars/Facts remain
 planned. Their format-specific policy mapping must be reviewed before any
