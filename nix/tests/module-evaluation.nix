@@ -20,6 +20,7 @@ let
       secrets."db/password" = {
         inherit ciphertext envelope;
         sourceCiphertextHash = digest "2";
+        restartUnits = [ "example.service" ];
       };
     };
   };
@@ -46,16 +47,18 @@ let
     ];
   };
   checkDocument =
-    name: spec: activationText:
+    name: manager: spec: activationText:
     pkgs.runCommand name { nativeBuildInputs = [ pkgs.jq ]; } ''
-      jq -e '
+      jq -e --arg manager ${lib.escapeShellArg manager} '
         .schema == "nix-seal.activation.v1" and
         .targetId == "host.test" and
         .approvalThreshold == 1 and
         (.artifacts | length) == 1 and
         .artifacts[0].secretId == "db/password" and
         .artifacts[0].owner == "root" and
-        .artifacts[0].group == "root"
+        .artifacts[0].group == "root" and
+        .postSwitch.restartUnits == ["example.service"] and
+        .postSwitch.manager == $manager
       ' ${spec} >/dev/null
       grep -F -- "--identity /run/keys/nix-seal-target" ${activationText} >/dev/null
       touch "$out"
@@ -65,11 +68,11 @@ let
 in
 {
   module-nixos =
-    checkDocument "nix-seal-module-nixos" nixos.config.nixSeal.activationSpec
+    checkDocument "nix-seal-module-nixos" "systemd-system" nixos.config.nixSeal.activationSpec
       nixosActivation;
-  module-home-manager =
-    checkDocument "nix-seal-module-home-manager" home.config.nixSeal.activationSpec
-      homeActivation;
+  module-home-manager = checkDocument "nix-seal-module-home-manager" (
+    if pkgs.stdenv.hostPlatform.isLinux then "systemd-user" else "launchd-user"
+  ) home.config.nixSeal.activationSpec homeActivation;
 }
 // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin (
   let
@@ -87,7 +90,7 @@ in
   in
   {
     module-darwin =
-      checkDocument "nix-seal-module-darwin" darwin.config.nixSeal.activationSpec
+      checkDocument "nix-seal-module-darwin" "launchd-system" darwin.config.nixSeal.activationSpec
         darwinActivation;
   }
 )

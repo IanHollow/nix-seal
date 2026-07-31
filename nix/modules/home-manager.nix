@@ -1,8 +1,18 @@
-self: { config, lib, ... }: {
+self:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
+{
   imports = [
     ((import ./shared.nix) {
       inherit self;
       runtimeDirectory = "%t/nix-seal";
+      serviceManager = if pkgs.stdenv.hostPlatform.isLinux then "systemd-user" else "launchd-user";
+      serviceExecutable =
+        if pkgs.stdenv.hostPlatform.isLinux then "${pkgs.systemd}/bin/systemctl" else "/bin/launchctl";
     })
   ];
   config = lib.mkIf config.nixSeal.enable {

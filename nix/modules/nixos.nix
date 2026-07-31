@@ -3,6 +3,8 @@ self: { config, lib, ... }: {
     ((import ./shared.nix) {
       inherit self;
       runtimeDirectory = "/run/nix-seal";
+      serviceManager = "systemd-system";
+      serviceExecutable = "/run/current-system/sw/bin/systemctl";
     })
   ];
   config = lib.mkIf config.nixSeal.enable {

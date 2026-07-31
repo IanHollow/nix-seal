@@ -538,6 +538,7 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
         approval_threshold: spec.approval_threshold,
         target_identity: &identity,
         artifacts: &artifacts,
+        post_switch: spec.post_switch.as_ref(),
     };
     let result = nix_seal_runtime::activate(&request)?;
     if json {
@@ -546,6 +547,7 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
             serde_json::json!({
                 "schema":"nix-seal.output.v1",
                 "activated":true,
+                "changed":result.changed,
                 "target":spec.target_id,
                 "generationPath":result.generation_path,
                 "secretCount":result.secret_count
@@ -554,8 +556,14 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
     } else {
         println!("{}", result.generation_path.display());
         eprintln!(
-            "activated {} secret(s) for {}",
-            result.secret_count, spec.target_id
+            "activated {} secret(s) for {} ({})",
+            result.secret_count,
+            spec.target_id,
+            if result.changed {
+                "changed"
+            } else {
+                "unchanged"
+            }
         );
     }
     Ok(())
@@ -831,7 +839,7 @@ mod tests {
             &envelope_path,
             &nix_seal_manifest::sign_manifest(&manifest, &signer)?,
         )?;
-        let spec = nix_seal_runtime::ActivationSpecV1 {
+        let mut spec = nix_seal_runtime::ActivationSpecV1 {
             schema: nix_seal_runtime::ACTIVATION_SCHEMA.to_owned(),
             runtime_root: runtime_root.clone(),
             runtime_generation: None,
@@ -855,8 +863,26 @@ mod tests {
                     .and_then(|group| group.name().to_str().map(str::to_owned))
                     .ok_or("current group is not resolvable")?,
             }],
+            post_switch: None,
         };
         write_new_json(&spec_path, &spec)?;
+        run_activate(
+            &ActivateArgs {
+                spec: spec_path.clone(),
+                identity: identity_path.clone(),
+                runtime_root: None,
+            },
+            false,
+        )?;
+        let actions = nix_seal_runtime::PostSwitchSpecV1 {
+            executable: temporary.path().join("missing-service-manager"),
+            manager: nix_seal_runtime::ServiceManagerV1::SystemdSystem,
+            reload_units: Vec::new(),
+            restart_units: vec!["example.service".to_owned()],
+            timeout_seconds: 1,
+        };
+        spec.post_switch = Some(actions);
+        std::fs::write(&spec_path, serde_json::to_vec(&spec)?)?;
         run_activate(
             &ActivateArgs {
                 spec: spec_path,

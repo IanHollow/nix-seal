@@ -9,8 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use thiserror::Error;
@@ -46,6 +49,43 @@ pub struct ActivationSpecV1 {
     pub trusted_keys: Vec<String>,
     /// Complete all-or-nothing artifact batch.
     pub artifacts: Vec<ActivationArtifactSpecV1>,
+    /// Optional platform service actions after a changed successful switch, or
+    /// when retrying a pending action set from that switch.
+    #[serde(default)]
+    pub post_switch: Option<PostSwitchSpecV1>,
+}
+
+/// Supported platform service managers for post-switch actions.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceManagerV1 {
+    /// System systemd manager.
+    SystemdSystem,
+    /// Per-user systemd manager.
+    SystemdUser,
+    /// System launchd domain.
+    LaunchdSystem,
+    /// Current user's launchd GUI domain.
+    LaunchdUser,
+}
+
+/// Strict public service-action declaration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PostSwitchSpecV1 {
+    /// Absolute service-manager executable path.
+    pub executable: PathBuf,
+    /// Manager invocation model.
+    pub manager: ServiceManagerV1,
+    /// Units reloaded after a changed switch or its pending retry.
+    #[serde(default)]
+    pub reload_units: Vec<String>,
+    /// Units restarted after a changed switch or its pending retry.
+    #[serde(default)]
+    pub restart_units: Vec<String>,
+    /// Per-action timeout in seconds.
+    #[serde(default = "default_action_timeout")]
+    pub timeout_seconds: u64,
 }
 
 /// One public artifact entry in [`ActivationSpecV1`].
@@ -81,6 +121,10 @@ const fn default_clock_skew() -> u64 {
     300
 }
 
+const fn default_action_timeout() -> u64 {
+    30
+}
+
 impl ActivationSpecV1 {
     /// Enforces structural and resource constraints before filesystem access.
     pub fn validate(&self) -> Result<(), RuntimeError> {
@@ -113,6 +157,34 @@ impl ActivationSpecV1 {
                 || !is_account_name(&artifact.owner)
                 || !is_account_name(&artifact.group)
             {
+                return Err(RuntimeError::InvalidSpec);
+            }
+        }
+        if let Some(actions) = &self.post_switch {
+            actions.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl PostSwitchSpecV1 {
+    /// Enforces executable, unit-name, cardinality, and timeout bounds.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if !self.executable.is_absolute()
+            || self.timeout_seconds == 0
+            || self.timeout_seconds > 60
+            || self.reload_units.len() > 256
+            || self.restart_units.len() > 256
+            || matches!(
+                self.manager,
+                ServiceManagerV1::LaunchdSystem | ServiceManagerV1::LaunchdUser
+            ) && !self.reload_units.is_empty()
+        {
+            return Err(RuntimeError::InvalidSpec);
+        }
+        let mut units = BTreeSet::new();
+        for unit in self.reload_units.iter().chain(&self.restart_units) {
+            if !is_unit_name(unit) || !units.insert(unit) {
                 return Err(RuntimeError::InvalidSpec);
             }
         }
@@ -166,6 +238,8 @@ pub struct ActivationRequest<'a> {
     pub target_identity: &'a SecretString,
     /// Every artifact in the all-or-nothing generation.
     pub artifacts: &'a [ActivationArtifact<'a>],
+    /// Optional changed-generation service actions and pending retry policy.
+    pub post_switch: Option<&'a PostSwitchSpecV1>,
 }
 
 /// Public result of a successful generation switch.
@@ -175,6 +249,8 @@ pub struct ActivationResult {
     pub generation_path: PathBuf,
     /// Number of activated secret files.
     pub secret_count: usize,
+    /// Whether plaintext content or runtime metadata changed.
+    pub changed: bool,
 }
 
 /// Runtime materialization failure with no plaintext context.
@@ -201,6 +277,12 @@ pub enum RuntimeError {
     /// A declared runtime owner or group does not exist.
     #[error("declared runtime owner or group does not exist")]
     UnknownAccount,
+    /// A public post-switch service action failed.
+    #[error("post-switch service action failed for {0}")]
+    ServiceAction(String),
+    /// A public post-switch service action exceeded its timeout.
+    #[error("post-switch service action timed out for {0}")]
+    ServiceTimeout(String),
     /// Artifact authentication failed before decryption.
     #[error(transparent)]
     Manifest(#[from] nix_seal_manifest::ManifestError),
@@ -270,7 +352,7 @@ pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, Run
     }
 
     let generation = Generation::begin(request.runtime_root)?;
-    for mut artifact in prepared {
+    for artifact in &mut prepared {
         let mut destination = generation.create_file_owned(
             artifact.secret_id,
             artifact.mode,
@@ -284,10 +366,23 @@ pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, Run
         )?;
         destination.sync_all()?;
     }
-    let generation_path = generation.commit_and_switch_optional(request.runtime_generation)?;
+    if let Some(generation_path) = generation.matching_current(&prepared)? {
+        generation.finish_unchanged(&generation_path, request.plan_hash, request.post_switch)?;
+        return Ok(ActivationResult {
+            generation_path,
+            secret_count: request.artifacts.len(),
+            changed: false,
+        });
+    }
+    let generation_path = generation.commit_and_switch_optional(
+        request.runtime_generation,
+        request.plan_hash,
+        request.post_switch,
+    )?;
     Ok(ActivationResult {
         generation_path,
         secret_count: request.artifacts.len(),
+        changed: true,
     })
 }
 
@@ -377,13 +472,54 @@ impl Generation {
         Ok(())
     }
 
+    fn matching_current(
+        &self,
+        artifacts: &[PreparedArtifact<'_>],
+    ) -> Result<Option<PathBuf>, RuntimeError> {
+        let Some(current) = current_generation(&self.root)? else {
+            return Ok(None);
+        };
+        if count_regular_files(&current)? != artifacts.len() {
+            return Ok(None);
+        }
+        for artifact in artifacts {
+            let candidate = self.transaction.path().join(artifact.secret_id.as_str());
+            let active = current.join(artifact.secret_id.as_str());
+            if !regular_files_equal(&candidate, &active)? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(current))
+    }
+
+    fn finish_unchanged(
+        &self,
+        current: &Path,
+        plan_hash: &str,
+        actions: Option<&PostSwitchSpecV1>,
+    ) -> Result<(), RuntimeError> {
+        let pending = pending_matches(&self.root, current, plan_hash)?;
+        if pending && let Some(actions) = actions {
+            run_post_switch(actions)?;
+        }
+        if pending || pending_marker_exists(&self.root)? {
+            clear_pending(&self.root)?;
+        }
+        Ok(())
+    }
+
     /// Atomically publishes and switches the `current` symlink to this complete
     /// generation. Existing generations are never overwritten.
     pub fn commit_and_switch(self, generation: u64) -> Result<PathBuf, RuntimeError> {
-        self.commit_and_switch_optional(Some(generation))
+        self.commit_and_switch_optional(Some(generation), "manual", None)
     }
 
-    fn commit_and_switch_optional(self, generation: Option<u64>) -> Result<PathBuf, RuntimeError> {
+    fn commit_and_switch_optional(
+        self,
+        generation: Option<u64>,
+        plan_hash: &str,
+        actions: Option<&PostSwitchSpecV1>,
+    ) -> Result<PathBuf, RuntimeError> {
         let generation = generation.map_or_else(|| next_generation(&self.root), Ok)?;
         sync_tree(self.transaction.path())?;
         let destination = self.root.join(format!("generation-{generation}"));
@@ -394,9 +530,24 @@ impl Generation {
         std::fs::rename(source, &destination)?;
         File::open(&self.root)?.sync_all()?;
 
-        if let Err(error) = switch_current(&self.root, generation) {
+        let pending_result = if actions.is_some() {
+            write_pending(&self.root, &destination, plan_hash)
+        } else {
+            clear_pending(&self.root)
+        };
+        if let Err(error) = pending_result {
             let _ = std::fs::remove_dir_all(&destination);
             return Err(error);
+        }
+
+        if let Err(error) = switch_current(&self.root, generation) {
+            let _ = std::fs::remove_dir_all(&destination);
+            let _ = clear_pending(&self.root);
+            return Err(error);
+        }
+        if let Some(actions) = actions {
+            run_post_switch(actions)?;
+            clear_pending(&self.root)?;
         }
         Ok(destination)
     }
@@ -429,6 +580,243 @@ fn next_generation(root: &Path) -> Result<u64, RuntimeError> {
         .ok_or(RuntimeError::InvalidDestination)
 }
 
+fn current_generation(root: &Path) -> Result<Option<PathBuf>, RuntimeError> {
+    let current = root.join("current");
+    let metadata = match std::fs::symlink_metadata(&current) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Err(RuntimeError::InvalidDestination);
+    }
+    let target = std::fs::read_link(current)?;
+    let Some(name) = target.to_str() else {
+        return Err(RuntimeError::InvalidDestination);
+    };
+    let Some(suffix) = name.strip_prefix("generation-") else {
+        return Err(RuntimeError::InvalidDestination);
+    };
+    if suffix.is_empty()
+        || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+        || target.components().count() != 1
+    {
+        return Err(RuntimeError::InvalidDestination);
+    }
+    let generation = root.join(target);
+    let metadata = std::fs::symlink_metadata(&generation)?;
+    if !metadata.file_type().is_dir() {
+        return Err(RuntimeError::InvalidDestination);
+    }
+    Ok(Some(generation))
+}
+
+const PENDING_MARKER: &str = ".post-switch-pending-v1";
+
+fn pending_payload(generation: &Path, plan_hash: &str) -> Result<String, RuntimeError> {
+    let name = generation
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(RuntimeError::InvalidDestination)?;
+    Ok(format!("nix-seal.post-switch.v1\n{name}\n{plan_hash}\n"))
+}
+
+fn pending_marker_exists(root: &Path) -> Result<bool, RuntimeError> {
+    match std::fs::symlink_metadata(root.join(PENDING_MARKER)) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(RuntimeError::InvalidDestination),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn pending_matches(root: &Path, generation: &Path, plan_hash: &str) -> Result<bool, RuntimeError> {
+    if !pending_marker_exists(root)? {
+        return Ok(false);
+    }
+    let marker = open_regular_nofollow(&root.join(PENDING_MARKER))?;
+    let bytes = read_bounded(marker, 1024)?;
+    Ok(bytes == pending_payload(generation, plan_hash)?.as_bytes())
+}
+
+fn write_pending(root: &Path, generation: &Path, plan_hash: &str) -> Result<(), RuntimeError> {
+    let next = root.join(".post-switch-next");
+    if std::fs::symlink_metadata(&next).is_ok() {
+        let _ = open_regular_nofollow(&next)?;
+        std::fs::remove_file(&next)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&next)?;
+    set_file_mode(&file, 0o600)?;
+    file.write_all(pending_payload(generation, plan_hash)?.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(next, root.join(PENDING_MARKER))?;
+    File::open(root)?.sync_all()?;
+    Ok(())
+}
+
+fn clear_pending(root: &Path) -> Result<(), RuntimeError> {
+    if pending_marker_exists(root)? {
+        let marker = root.join(PENDING_MARKER);
+        let _ = open_regular_nofollow(&marker)?;
+        std::fs::remove_file(marker)?;
+        File::open(root)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn run_post_switch(actions: &PostSwitchSpecV1) -> Result<(), RuntimeError> {
+    actions.validate()?;
+    for unit in &actions.reload_units {
+        run_manager_action(
+            actions,
+            unit,
+            &manager_arguments(actions.manager, true, unit)?,
+        )?;
+    }
+    for unit in &actions.restart_units {
+        run_manager_action(
+            actions,
+            unit,
+            &manager_arguments(actions.manager, false, unit)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn manager_arguments(
+    manager: ServiceManagerV1,
+    reload: bool,
+    unit: &str,
+) -> Result<Vec<String>, RuntimeError> {
+    match (manager, reload) {
+        (ServiceManagerV1::SystemdSystem, true) => Ok(vec!["reload".to_owned(), unit.to_owned()]),
+        (ServiceManagerV1::SystemdUser, true) => Ok(vec![
+            "--user".to_owned(),
+            "reload".to_owned(),
+            unit.to_owned(),
+        ]),
+        (ServiceManagerV1::LaunchdSystem | ServiceManagerV1::LaunchdUser, true) => {
+            Err(RuntimeError::InvalidSpec)
+        }
+        (ServiceManagerV1::SystemdSystem, false) => {
+            Ok(vec!["try-restart".to_owned(), unit.to_owned()])
+        }
+        (ServiceManagerV1::SystemdUser, false) => Ok(vec![
+            "--user".to_owned(),
+            "try-restart".to_owned(),
+            unit.to_owned(),
+        ]),
+        (ServiceManagerV1::LaunchdSystem, false) => Ok(vec![
+            "kickstart".to_owned(),
+            "-k".to_owned(),
+            format!("system/{unit}"),
+        ]),
+        (ServiceManagerV1::LaunchdUser, false) => Ok(vec![
+            "kickstart".to_owned(),
+            "-k".to_owned(),
+            format!("gui/{}/{unit}", rustix::process::geteuid().as_raw()),
+        ]),
+    }
+}
+
+fn run_manager_action(
+    actions: &PostSwitchSpecV1,
+    unit: &str,
+    arguments: &[String],
+) -> Result<(), RuntimeError> {
+    let mut command = Command::new(&actions.executable);
+    command
+        .args(arguments)
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if actions.manager == ServiceManagerV1::SystemdUser {
+        for name in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| RuntimeError::ServiceAction(unit.to_owned()))?;
+    let deadline = Instant::now() + Duration::from_secs(actions.timeout_seconds);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|_| RuntimeError::ServiceAction(unit.to_owned()))?
+        {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(RuntimeError::ServiceAction(unit.to_owned()))
+            };
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RuntimeError::ServiceTimeout(unit.to_owned()));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn count_regular_files(root: &Path) -> Result<usize, RuntimeError> {
+    let mut directories = vec![root.to_owned()];
+    let mut files = 0_usize;
+    while let Some(directory) = directories.pop() {
+        if directories.len() > 10_000 || files > 10_000 {
+            return Err(RuntimeError::Limit);
+        }
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                directories.push(entry.path());
+            } else if file_type.is_file() {
+                files = files.checked_add(1).ok_or(RuntimeError::Limit)?;
+            } else {
+                return Err(RuntimeError::InvalidDestination);
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn regular_files_equal(left: &Path, right: &Path) -> Result<bool, RuntimeError> {
+    let mut left_file = open_regular_nofollow(left)?;
+    let mut right_file = match open_regular_nofollow(right) {
+        Ok(file) => file,
+        Err(RuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    let left_metadata = left_file.metadata()?;
+    let right_metadata = right_file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if left_metadata.uid() != right_metadata.uid()
+            || left_metadata.gid() != right_metadata.gid()
+            || left_metadata.permissions().mode() & 0o777
+                != right_metadata.permissions().mode() & 0o777
+        {
+            return Ok(false);
+        }
+    }
+    if left_metadata.len() != right_metadata.len() {
+        return Ok(false);
+    }
+    Ok(hash_bounded(&mut left_file, MAX_CIPHERTEXT_BYTES)?
+        == hash_bounded(&mut right_file, MAX_CIPHERTEXT_BYTES)?)
+}
+
 fn parse_mode(value: &str) -> Result<u32, RuntimeError> {
     if value.len() != 4 || !value.starts_with('0') {
         return Err(RuntimeError::InvalidSpec);
@@ -450,6 +838,14 @@ fn is_account_name(value: &str) -> bool {
         && value.len() <= 256
         && !value.bytes().any(|byte| {
             byte.is_ascii_control() || byte == b'/' || byte == b':' || byte.is_ascii_whitespace()
+        })
+}
+
+fn is_unit_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'@' | b':')
         })
 }
 
@@ -847,9 +1243,11 @@ mod tests {
             approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
+            post_switch: None,
         };
         let result = activate(&request)?;
         assert_eq!(result.secret_count, 1);
+        assert!(result.changed);
         assert_eq!(
             std::fs::read(result.generation_path.join("db/password"))?,
             b"plaintext-canary"
@@ -867,7 +1265,19 @@ mod tests {
             Path::new("generation-1")
         );
         let second = activate(&request)?;
-        assert_eq!(second.generation_path, fixture.runtime.join("generation-2"));
+        assert!(!second.changed);
+        assert_eq!(second.generation_path, fixture.runtime.join("generation-1"));
+        assert_eq!(
+            std::fs::read_link(fixture.runtime.join("current"))?,
+            Path::new("generation-1")
+        );
+        set_mode(&fixture.runtime.join("generation-1/db/password"), 0o600)?;
+        let repaired = activate(&request)?;
+        assert!(repaired.changed);
+        assert_eq!(
+            repaired.generation_path,
+            fixture.runtime.join("generation-2")
+        );
         assert_eq!(
             std::fs::read_link(fixture.runtime.join("current"))?,
             Path::new("generation-2")
@@ -895,6 +1305,7 @@ mod tests {
             approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
+            post_switch: None,
         };
         assert!(matches!(
             activate(&request),
@@ -929,6 +1340,7 @@ mod tests {
             approval_threshold: 1,
             trusted_keys: vec!["public-key-placeholder".to_owned()],
             artifacts: vec![artifact.clone()],
+            post_switch: None,
         };
         spec.validate()?;
         let mut duplicate = spec.clone();
@@ -949,6 +1361,72 @@ mod tests {
             excessive_skew.validate(),
             Err(RuntimeError::InvalidSpec)
         ));
+        let invalid_actions = PostSwitchSpecV1 {
+            executable: PathBuf::from("/bin/service-manager"),
+            manager: ServiceManagerV1::SystemdSystem,
+            reload_units: vec!["duplicate.service".to_owned()],
+            restart_units: vec!["duplicate.service".to_owned()],
+            timeout_seconds: 30,
+        };
+        assert!(matches!(
+            invalid_actions.validate(),
+            Err(RuntimeError::InvalidSpec)
+        ));
+        assert_eq!(
+            manager_arguments(ServiceManagerV1::SystemdUser, true, "example.service")?,
+            ["--user", "reload", "example.service"]
+        );
+        assert_eq!(
+            manager_arguments(ServiceManagerV1::LaunchdSystem, false, "example.service")?,
+            ["kickstart", "-k", "system/example.service"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_service_action_is_durably_retried() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture()?;
+        let artifact = owned_artifact(&fixture, &fixture.ciphertext, &fixture.secret_id);
+        let actions = PostSwitchSpecV1 {
+            executable: fixture.temporary.path().join("missing-service-manager"),
+            manager: ServiceManagerV1::SystemdSystem,
+            reload_units: Vec::new(),
+            restart_units: vec!["example.service".to_owned()],
+            timeout_seconds: 1,
+        };
+        let mut request = ActivationRequest {
+            runtime_root: &fixture.runtime,
+            runtime_generation: None,
+            plan_hash: PLAN_HASH,
+            target_id: &fixture.target_id,
+            recipient_fingerprint: &fixture.fingerprint,
+            tool_version: "0.1.0-alpha.1",
+            now: 101,
+            allowed_clock_skew: 0,
+            trusted_keys: &fixture.trusted,
+            approval_threshold: 1,
+            target_identity: &fixture.target_identity,
+            artifacts: std::slice::from_ref(&artifact),
+            post_switch: Some(&actions),
+        };
+        assert!(matches!(
+            activate(&request),
+            Err(RuntimeError::ServiceAction(_))
+        ));
+        assert_eq!(
+            std::fs::read_link(fixture.runtime.join("current"))?,
+            Path::new("generation-1")
+        );
+        assert!(fixture.runtime.join(PENDING_MARKER).exists());
+        assert!(matches!(
+            activate(&request),
+            Err(RuntimeError::ServiceAction(_))
+        ));
+        assert!(!fixture.runtime.join("generation-2").exists());
+        request.post_switch = None;
+        let recovered = activate(&request)?;
+        assert!(!recovered.changed);
+        assert!(!fixture.runtime.join(PENDING_MARKER).exists());
         Ok(())
     }
 
@@ -975,6 +1453,7 @@ mod tests {
             approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
+            post_switch: None,
         };
         assert!(matches!(
             activate(&request),
@@ -1014,6 +1493,7 @@ mod tests {
             approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: &artifacts,
+            post_switch: None,
         };
         assert!(matches!(
             activate(&request),
@@ -1047,6 +1527,7 @@ mod tests {
             approval_threshold: 1,
             target_identity: &wrong_identity,
             artifacts: std::slice::from_ref(&artifact),
+            post_switch: None,
         };
         assert!(matches!(activate(&request), Err(RuntimeError::Crypto(_))));
         assert_eq!(
@@ -1082,6 +1563,7 @@ mod tests {
             approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
+            post_switch: None,
         };
         assert!(matches!(
             activate(&request),

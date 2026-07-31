@@ -31,3 +31,20 @@ created. The runtime applies the resulting numeric IDs with descriptor-based
 `fchown`, then reapplies the restrictive mode with descriptor-based `fchmod` so
 ownership changes cannot clear the intended final permission bits or introduce a
 path-resolution race.
+
+Before publishing, activation compares the complete candidate generation with
+the active generation using bounded in-memory hashes plus owner, group, and mode
+metadata. An identical candidate is discarded without generation churn. Platform
+service actions are declared as bounded unit names and a fixed manager kind, run
+through an absolute executable with a sanitized environment and a hard timeout,
+and are attempted only after a changed generation has switched.
+
+Before switching a changed generation, activation durably records a restrictive
+pending-action marker bound to the generation and plan hash. It clears that
+marker only after every action succeeds. A failed action therefore does not roll
+back the already-atomic secret switch, but the next activation retries the
+actions even when the plaintext generation is unchanged. The activation lock
+remains held through the switch, action execution, and marker update so
+concurrent activations cannot lose or duplicate the pending state. Removing
+actions from a later plan clears a matching or stale marker without executing
+it.

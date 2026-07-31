@@ -1,4 +1,9 @@
-{ self, runtimeDirectory }:
+{
+  self,
+  runtimeDirectory,
+  serviceManager,
+  serviceExecutable,
+}:
 {
   lib,
   config,
@@ -9,7 +14,14 @@ let
   inherit (lib) mkIf mkOption types;
   cfg = config.nixSeal;
   digestType = types.strMatching "[0-9a-f]{64}";
+  unitType = types.strMatching "[A-Za-z0-9_.@:-]{1,256}";
   configuredSecrets = lib.filterAttrs (_: secret: secret.ciphertext != null) cfg.secrets;
+  reloadUnits = lib.unique (
+    lib.concatMap (secret: secret.reloadUnits) (builtins.attrValues configuredSecrets)
+  );
+  restartUnits = lib.unique (
+    lib.concatMap (secret: secret.restartUnits) (builtins.attrValues configuredSecrets)
+  );
   activationDocument = {
     schema = "nix-seal.activation.v1";
     runtimeRoot = cfg.runtimeDirectory;
@@ -29,6 +41,16 @@ let
       inherit (secret) owner;
       inherit (secret) group;
     }) configuredSecrets;
+    postSwitch =
+      if reloadUnits == [ ] && restartUnits == [ ] then
+        null
+      else
+        {
+          executable = serviceExecutable;
+          manager = serviceManager;
+          inherit reloadUnits restartUnits;
+          timeoutSeconds = cfg.serviceActionTimeout;
+        };
   };
 in
 {
@@ -73,6 +95,11 @@ in
       type = types.ints.between 0 86400;
       default = 300;
       description = "Maximum accepted artifact issue-time lead in seconds, capped at one day.";
+    };
+    serviceActionTimeout = mkOption {
+      type = types.ints.between 1 60;
+      default = 30;
+      description = "Per-unit post-switch service action timeout in seconds.";
     };
     runtimeDirectory = mkOption {
       type = types.str;
@@ -125,11 +152,11 @@ in
                 description = "Exact signed artifact generation.";
               };
               restartUnits = mkOption {
-                type = types.listOf types.str;
+                type = types.listOf unitType;
                 default = [ ];
               };
               reloadUnits = mkOption {
-                type = types.listOf types.str;
+                type = types.listOf unitType;
                 default = [ ];
               };
             };
@@ -194,6 +221,15 @@ in
           builtins.length (builtins.attrNames configuredSecrets)
           == builtins.length (builtins.attrNames cfg.secrets);
         message = "every declared nixSeal secret requires a target ciphertext";
+      }
+      {
+        assertion =
+          serviceManager != "launchd-system" && serviceManager != "launchd-user" || reloadUnits == [ ];
+        message = "nixSeal reloadUnits are unsupported by launchd; use restartUnits";
+      }
+      {
+        assertion = lib.intersectLists reloadUnits restartUnits == [ ];
+        message = "a nixSeal unit cannot appear in both reloadUnits and restartUnits";
       }
     ];
     warnings = [ "nix-seal is pre-1.0 and has not passed its required external security audit" ];
