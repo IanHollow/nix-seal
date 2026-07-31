@@ -90,6 +90,9 @@ enum Command {
     },
     /// Generate shell completion definitions.
     Completions { shell: CompletionShell },
+    /// Dry-run-first migration inspection adapters.
+    #[command(subcommand)]
+    Migrate(MigrateCommand),
     /// Ciphertext cache operations.
     #[command(subcommand)]
     Cache(CacheCommand),
@@ -349,6 +352,16 @@ enum CacheCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum MigrateCommand {
+    /// Inspect a public secretctl `secretIndex` JSON export without changing files.
+    Secretctl {
+        /// `nix eval --json .#secretIndex` output saved to a public JSON file.
+        #[arg(long)]
+        index: PathBuf,
+    },
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum CompletionShell {
     Bash,
@@ -413,6 +426,7 @@ fn run() -> Result<()> {
         Command::Recipients(arguments) => run_recipients(&arguments, cli.json)?,
         Command::Schema { kind } => run_schema(kind)?,
         Command::Completions { shell } => completions(shell),
+        Command::Migrate(command) => run_migrate(command, cli.json)?,
         Command::Cache(CacheCommand::Status { root }) => cache_status(root, cli.json)?,
         Command::Cache(CacheCommand::Gc {
             plan,
@@ -601,6 +615,169 @@ fn run_schema(kind: SchemaKind) -> Result<()> {
         }
     );
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretctlIndexV1 {
+    version: u64,
+    targets: BTreeMap<String, SecretctlTargetV1>,
+    secrets: BTreeMap<String, SecretctlSecretV1>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SecretctlTargetV1 {
+    #[serde(rename = "type")]
+    target_type: String,
+    groups: Vec<String>,
+    public_key: String,
+    recipients: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SecretctlSecretV1 {
+    id: String,
+    group: String,
+    scope: String,
+    selector: Option<String>,
+    agenix_name: String,
+    file: String,
+    recipients: Vec<String>,
+    consumers: Vec<String>,
+}
+
+fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
+    match command {
+        MigrateCommand::Secretctl { index } => migrate_secretctl(&index, json),
+    }
+}
+
+fn migrate_secretctl(index_path: &Path, json: bool) -> Result<()> {
+    let index: SecretctlIndexV1 =
+        read_json_bounded(index_path).context("invalid strict secretctl secretIndex JSON")?;
+    if index.version != 1 {
+        bail!("unsupported secretctl index version; expected 1");
+    }
+    if index.secrets.is_empty() || index.targets.len() > 10_000 || index.secrets.len() > 10_000 {
+        bail!("secretctl index has unsupported target or secret counts");
+    }
+    let mut mappings = Vec::new();
+    let mut ssh_recipients = BTreeSet::new();
+    for (legacy_id, secret) in &index.secrets {
+        if secret.id != *legacy_id || secret.group.is_empty() || secret.agenix_name.is_empty() {
+            bail!("secretctl index has inconsistent public secret metadata for {legacy_id}");
+        }
+        let new_id = migrated_id(legacy_id)?;
+        let source = migrate_secretctl_source(&secret.file)?;
+        for recipient in &secret.recipients {
+            if !(recipient.starts_with("ssh-ed25519 ") || recipient.starts_with("ssh-rsa ")) {
+                bail!("secretctl secret {legacy_id} has an unsupported recipient format");
+            }
+            ssh_recipients.insert(recipient.clone());
+        }
+        for consumer in &secret.consumers {
+            if !index.targets.contains_key(consumer) {
+                bail!("secretctl secret {legacy_id} references missing target {consumer}");
+            }
+        }
+        mappings.push(serde_json::json!({
+            "legacyId":legacy_id,
+            "nixSealId":new_id,
+            "source":source,
+            "scope":secret.scope,
+            "selector":secret.selector,
+            "agenixName":secret.agenix_name,
+            "consumers":secret.consumers
+        }));
+    }
+    let mut targets = Vec::new();
+    for (legacy_id, target) in &index.targets {
+        if target.target_type != "home" && target.target_type != "host" {
+            bail!("secretctl target {legacy_id} has an unsupported type");
+        }
+        if !(target.public_key.starts_with("ssh-ed25519 ")
+            || target.public_key.starts_with("ssh-rsa "))
+        {
+            bail!("secretctl target {legacy_id} has an unsupported public key");
+        }
+        if target.groups.iter().any(String::is_empty) || target.recipients.is_empty() {
+            bail!("secretctl target {legacy_id} has invalid group or recipient metadata");
+        }
+        targets.push(serde_json::json!({
+            "legacyId":legacy_id,
+            "nixSealId":migrated_id(legacy_id)?,
+            "type":target.target_type,
+            "groups":target.groups
+        }));
+    }
+    let warnings = vec![
+        "dry run only: no ciphertext, configuration, or source manager was changed".to_owned(),
+        "secretctl uses SSH recipients; migrate targets to native age or an approved age SSH compatibility identity before importing ciphertext".to_owned(),
+        "review normalized IDs and scope selectors before generating a nix-seal plan".to_owned(),
+    ];
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.migration-report.v1",
+                "source":"secretctl",
+                "dryRun":true,
+                "secrets":mappings,
+                "targets":targets,
+                "sshRecipientCount":ssh_recipients.len(),
+                "warnings":warnings
+            })
+        );
+    } else {
+        println!(
+            "secretctl dry-run: {} secrets and {} targets mapped; {} SSH recipients need identity migration",
+            mappings.len(),
+            targets.len(),
+            ssh_recipients.len()
+        );
+        for warning in warnings {
+            eprintln!("warning: {warning}");
+        }
+        for mapping in mappings {
+            println!(
+                "{} -> {} ({})",
+                mapping["legacyId"].as_str().unwrap_or("unknown"),
+                mapping["nixSealId"].as_str().unwrap_or("unknown"),
+                mapping["source"].as_str().unwrap_or("unknown"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn migrated_id(value: &str) -> Result<nix_seal_core::Id> {
+    let mut normalized = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' => normalized.push(char::from(byte.to_ascii_lowercase())),
+            b'a'..=b'z' | b'0'..=b'9' | b'.' | b'/' | b'-' | b'_' => {
+                normalized.push(char::from(byte));
+            }
+            b':' => normalized.push('-'),
+            _ => bail!("legacy secretctl ID cannot be represented safely in nix-seal"),
+        }
+    }
+    nix_seal_core::Id::parse(normalized).context("legacy ID normalization is invalid")
+}
+
+fn migrate_secretctl_source(value: &str) -> Result<&str> {
+    let path = Path::new(value);
+    if path.extension().is_none_or(|extension| extension != "age")
+        || !path.starts_with("secrets")
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("secretctl ciphertext source is not a normalized secrets/*.age path");
+    }
+    Ok(value)
 }
 
 fn load_plan(toml: &Path, nix_plan: Option<&Path>) -> Result<nix_seal_core::PlanV1> {
@@ -2231,6 +2408,27 @@ mod tests {
             uuid.expose_secret()[19],
             b'8' | b'9' | b'a' | b'b'
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn secretctl_migration_normalizes_only_representable_public_identifiers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            migrated_id("IanHollow.home.ianmh.token")?.as_str(),
+            "ianhollow.home.ianmh.token"
+        );
+        assert_eq!(
+            migrated_id("host:nixos:desktop")?.as_str(),
+            "host-nixos-desktop"
+        );
+        assert!(migrated_id("legacy value").is_err());
+        assert_eq!(
+            migrate_secretctl_source("secrets/IanHollow/token.age")?,
+            "secrets/IanHollow/token.age"
+        );
+        assert!(migrate_secretctl_source("../secrets/token.age").is_err());
+        assert!(migrate_secretctl_source("secrets/token.txt").is_err());
         Ok(())
     }
 

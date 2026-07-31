@@ -157,6 +157,21 @@ output per generator; direct executable hooks and multi-output transactions are
 not yet exposed rather than being implemented with weaker partial-commit
 semantics.
 
+## Migration inspection
+
+The first migration adapter is deliberately report-only. Export the existing
+public index and inspect the stable mapping before touching ciphertext:
+
+```console
+nix eval --json .#secretIndex > /tmp/secretctl-index.json
+nix-seal migrate secretctl --index /tmp/secretctl-index.json --json
+```
+
+It validates legacy paths, scopes, consumers, IDs, and SSH recipient metadata,
+then reports normalized nix-seal IDs. It never decrypts or rewrites legacy
+files. SSH-recipient deployments need an explicit native-age or reviewed SSH
+compatibility identity migration before ciphertext import is enabled.
+
 ## Development
 
 ```console
