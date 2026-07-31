@@ -34,12 +34,12 @@ nixSeal.templates."application/config" = {
 
 The reserved grammar is exactly `{{nix-seal:name}}`, with lowercase stable
 placeholder names. Missing, unused, malformed, or undeclared reserved
-placeholders fail the whole activation before `current` changes.
-`utf8` rejects binary input; explicit `base64` and lowercase `hex` transforms
-support arbitrary bytes. Sources, outputs, declaration counts, and secret reads
-are bounded. Rendered files use the same owner/group/mode controls, unchanged
-generation detection, atomic switch, rollback preservation, and post-switch
-action protocol as ordinary secret files.
+placeholders fail the whole activation before `current` changes. `utf8` rejects
+binary input; explicit `base64` and lowercase `hex` transforms support arbitrary
+bytes. Sources, outputs, declaration counts, and secret reads are bounded.
+Rendered files use the same owner/group/mode controls, unchanged generation
+detection, atomic switch, rollback preservation, and post-switch action protocol
+as ordinary secret files.
 
 ## Systemd service credentials
 

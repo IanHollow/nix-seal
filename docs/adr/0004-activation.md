@@ -63,13 +63,13 @@ because launchd has no equivalent contract.
 
 Public runtime templates use the reserved placeholder grammar
 `{{nix-seal:name}}`. Placeholder names and their source secret IDs are declared
-separately in the activation document; missing, unused, malformed, or
-undeclared reserved placeholders reject the complete transaction. A
-placeholder must select an explicit `utf8`, padded RFC 4648 `base64`, or
-lowercase `hex` transform. UTF-8 validation and all transforms stream from the
-already-decrypted private candidate files through zeroizing bounded buffers.
-Template sources are public, opened as no-follow single-link regular files, and
-bounded to 2 MiB; rendered output is bounded to 128 MiB. Rendered files are
-created exclusively inside the candidate generation with the same ownership,
-mode, fsync, equality comparison, atomic switch, rollback preservation, and
-post-switch service semantics as direct secret outputs.
+separately in the activation document; missing, unused, malformed, or undeclared
+reserved placeholders reject the complete transaction. A placeholder must select
+an explicit `utf8`, padded RFC 4648 `base64`, or lowercase `hex` transform.
+UTF-8 validation and all transforms stream from the already-decrypted private
+candidate files through zeroizing bounded buffers. Template sources are public,
+opened as no-follow single-link regular files, and bounded to 2 MiB; rendered
+output is bounded to 128 MiB. Rendered files are created exclusively inside the
+candidate generation with the same ownership, mode, fsync, equality comparison,
+atomic switch, rollback preservation, and post-switch service semantics as
+direct secret outputs.
