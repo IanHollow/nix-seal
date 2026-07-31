@@ -159,14 +159,14 @@ private scalar in the standard WireGuard base64 format and accepts no
 parameters; UUID accepts none. Generation is create-only unless `--replace` is
 explicit. Generators may produce multiple secret outputs: every output is
 encrypted and round-trip verified before an existing ciphertext is changed, and
-replacement failures restore prior ciphertext. Direct executable
-generators use an explicit protocol: `executable` and every `runtimeInputs`
-entry must be under `/nix/store`; `arguments` are literal public values; and the
-process runs with a cleared environment, null standard streams, a private
-workspace, and a bounded timeout. It must write exactly one regular file named
-`0`, `1`, and so on for each declared output beneath `$NIX_SEAL_OUTPUT_DIR`.
-Unlisted files, links, oversized output, nonzero exits, and timeouts fail the
-full transaction without exposing process output.
+replacement failures restore prior ciphertext. Direct executable generators use
+an explicit protocol: `executable` and every `runtimeInputs` entry must be under
+`/nix/store`; `arguments` are literal public values; and the process runs with a
+cleared environment, null standard streams, a private workspace, and a bounded
+timeout. It must write exactly one regular file named `0`, `1`, and so on for
+each declared output beneath `$NIX_SEAL_OUTPUT_DIR`. Unlisted files, links,
+oversized output, nonzero exits, and timeouts fail the full transaction without
+exposing process output.
 
 Declared external-generator prompts are non-interactive by default. Supply each
 response with
