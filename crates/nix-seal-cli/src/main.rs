@@ -397,6 +397,12 @@ enum MigrateCommand {
         #[arg(long, default_value = "secrets")]
         directory: PathBuf,
     },
+    /// Inspect structured SOPS JSON files without decrypting values or invoking SOPS.
+    SopsJson {
+        /// Existing directory containing SOPS-encrypted `*.json` files.
+        #[arg(long, default_value = "secrets")]
+        directory: PathBuf,
+    },
     /// Stream one legacy age ciphertext into explicit new recipients.
     Ciphertext {
         /// Existing repository root; source and destination must remain below it.
@@ -787,6 +793,7 @@ fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
         ),
         MigrateCommand::Agenix { directory } => migrate_agenix_tree(&directory, "agenix", json),
         MigrateCommand::Ragenix { directory } => migrate_agenix_tree(&directory, "ragenix", json),
+        MigrateCommand::SopsJson { directory } => migrate_sops_json_tree(&directory, json),
         MigrateCommand::Ciphertext {
             repository_root,
             source,
@@ -985,6 +992,212 @@ fn scan_agenix_ciphertexts(root: &Path, directory: &Path, output: &mut Vec<PathB
         }
     }
     Ok(())
+}
+
+struct SopsJsonInventory {
+    path: PathBuf,
+    providers: BTreeSet<String>,
+    age_recipient_count: usize,
+}
+
+/// Produces a public-only SOPS JSON inventory. This does not implement SOPS
+/// decryption or authenticate encrypted values; it validates only the bounded,
+/// cleartext SOPS metadata required to plan a later explicit migration.
+fn migrate_sops_json_tree(directory: &Path, json: bool) -> Result<()> {
+    let supplied_metadata =
+        fs::symlink_metadata(directory).context("could not inspect SOPS JSON directory")?;
+    if supplied_metadata.file_type().is_symlink() || !supplied_metadata.file_type().is_dir() {
+        bail!("SOPS JSON root must be a non-symlink directory");
+    }
+    let root = directory
+        .canonicalize()
+        .context("could not resolve SOPS JSON directory")?;
+    let mut files = Vec::new();
+    scan_sops_json_files(&root, &root, &mut files)?;
+    if files.is_empty() {
+        bail!("SOPS JSON directory contains no encrypted JSON files");
+    }
+    let mappings = files
+        .iter()
+        .map(|entry| {
+            let relative = entry
+                .path
+                .strip_prefix(&root)
+                .context("SOPS JSON file escaped its canonical root")?;
+            let stem = relative.with_extension("");
+            let legacy_id = stem.to_str().context("SOPS JSON path is not UTF-8")?;
+            Ok(serde_json::json!({
+                "legacyId":legacy_id,
+                "nixSealId":migrated_id(&format!("sops/{legacy_id}"))?,
+                "source":relative,
+                "providers":entry.providers,
+                "ageRecipientCount":entry.age_recipient_count,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let warnings = vec![
+        "dry run only: no ciphertext, configuration, or source manager was changed",
+        "this inventory validates cleartext SOPS JSON metadata only; it does not decrypt values or authenticate the SOPS MAC",
+        "structured SOPS files may contain multiple logical values; supply an explicit extraction and target-recipient mapping before streaming an individual value into a nix-seal age file",
+        "only regular JSON files with bounded, top-level SOPS metadata were accepted; links and non-regular entries are rejected",
+    ];
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.migration-report.v1",
+                "source":"sops-json",
+                "dryRun":true,
+                "secrets":mappings,
+                "warnings":warnings
+            })
+        );
+    } else {
+        println!(
+            "sops-json dry-run: {} structured files mapped",
+            mappings.len()
+        );
+        for warning in warnings {
+            eprintln!("warning: {warning}");
+        }
+        for mapping in mappings {
+            println!(
+                "{} -> {} ({})",
+                mapping["legacyId"].as_str().unwrap_or("unknown"),
+                mapping["nixSealId"].as_str().unwrap_or("unknown"),
+                mapping["source"].as_str().unwrap_or("unknown"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn scan_sops_json_files(
+    root: &Path,
+    directory: &Path,
+    output: &mut Vec<SopsJsonInventory>,
+) -> Result<()> {
+    if output.len() >= 10_000 {
+        bail!("SOPS JSON tree exceeds the 10000-file safety limit");
+    }
+    let mut entries = fs::read_dir(directory)
+        .with_context(|| format!("could not read SOPS JSON directory {}", directory.display()))?
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            bail!("SOPS JSON tree contains a symlink");
+        }
+        if metadata.file_type().is_dir() {
+            let relative = path.strip_prefix(root)?;
+            if relative.components().count() > 32 {
+                bail!("SOPS JSON path nesting exceeds the safety limit");
+            }
+            scan_sops_json_files(root, &path, output)?;
+        } else if metadata.file_type().is_file() {
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                output.push(inspect_sops_json(&path)?);
+            }
+        } else {
+            bail!("SOPS JSON tree contains a non-regular entry");
+        }
+    }
+    Ok(())
+}
+
+fn inspect_sops_json(path: &Path) -> Result<SopsJsonInventory> {
+    const LIMIT: u64 = 2 * 1024 * 1024;
+    let input = open_public_ciphertext(path).with_context(|| {
+        format!(
+            "SOPS JSON file {} has unsafe filesystem metadata",
+            path.display()
+        )
+    })?;
+    if input.metadata()?.len() > LIMIT {
+        bail!("SOPS JSON file exceeds the 2 MiB safety limit");
+    }
+    let mut bytes = Vec::new();
+    input.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LIMIT {
+        bail!("SOPS JSON file exceeds the 2 MiB safety limit");
+    }
+    let document: serde_json::Value =
+        serde_json::from_slice(&bytes).context("SOPS JSON file is malformed")?;
+    let root = document
+        .as_object()
+        .context("SOPS JSON document must be a top-level object")?;
+    let metadata = root
+        .get("sops")
+        .and_then(serde_json::Value::as_object)
+        .context("SOPS JSON document lacks top-level sops metadata")?;
+    if metadata
+        .get("mac")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        bail!("SOPS JSON metadata lacks a nonempty MAC");
+    }
+    if metadata
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        bail!("SOPS JSON metadata lacks a nonempty version");
+    }
+    let mut providers = BTreeSet::new();
+    let mut age_recipient_count = 0_usize;
+    for provider in ["age", "kms", "gcp_kms", "azure_kv", "hc_vault", "pgp"] {
+        let Some(entries) = metadata.get(provider) else {
+            continue;
+        };
+        let entries = entries
+            .as_array()
+            .with_context(|| format!("SOPS JSON {provider} metadata is not an array"))?;
+        if entries.is_empty() || entries.len() > 1024 {
+            bail!("SOPS JSON {provider} metadata exceeds safety limits");
+        }
+        if entries.iter().any(|entry| !entry.is_object()) {
+            bail!("SOPS JSON {provider} metadata contains a non-object entry");
+        }
+        if provider == "age" {
+            for entry in entries {
+                let recipient = entry
+                    .as_object()
+                    .and_then(|entry| entry.get("recipient"))
+                    .and_then(serde_json::Value::as_str)
+                    .context("SOPS JSON age metadata lacks a recipient")?;
+                nix_seal_crypto::normalize_recipient(recipient)
+                    .context("SOPS JSON age metadata has an invalid recipient")?;
+            }
+            age_recipient_count = entries.len();
+        }
+        providers.insert(provider.to_owned());
+    }
+    if let Some(key_groups) = metadata.get("key_groups") {
+        let key_groups = key_groups
+            .as_array()
+            .context("SOPS JSON key_groups metadata is not an array")?;
+        if key_groups.is_empty() || key_groups.len() > 1024 {
+            bail!("SOPS JSON key_groups metadata exceeds safety limits");
+        }
+        if key_groups.iter().any(|entry| !entry.is_object()) {
+            bail!("SOPS JSON key_groups metadata contains a non-object entry");
+        }
+        providers.insert("key_groups".to_owned());
+    }
+    if providers.is_empty() {
+        bail!("SOPS JSON metadata has no recognized key provider");
+    }
+    Ok(SopsJsonInventory {
+        path: path.to_owned(),
+        providers,
+        age_recipient_count,
+    })
 }
 
 fn migrate_secretctl(
@@ -3634,6 +3847,39 @@ mod tests {
             migrated_id("agenix/nested/token")?.as_str(),
             "agenix/nested/token"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sops_json_migration_accepts_bounded_age_metadata() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = tempfile::tempdir()?;
+        let directory = temporary.path().join("secrets");
+        std::fs::create_dir_all(directory.join("nested"))?;
+        let (_, recipient) = nix_seal_crypto::generate_x25519();
+        let document = serde_json::json!({
+            "token": "ENC[AES256_GCM,data:placeholder,type:str]",
+            "sops": {
+                "age": [{"recipient":recipient, "enc":"-----BEGIN AGE ENCRYPTED FILE-----"}],
+                "mac": "ENC[AES256_GCM,data:placeholder,type:str]",
+                "version": "3.9.0"
+            }
+        });
+        let path = directory.join("nested/token.json");
+        std::fs::write(&path, serde_json::to_vec(&document)?)?;
+        let canonical = directory.canonicalize()?;
+        let mut discovered = Vec::new();
+        scan_sops_json_files(&canonical, &canonical, &mut discovered)?;
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].providers, BTreeSet::from(["age".to_owned()]));
+        assert_eq!(discovered[0].age_recipient_count, 1);
+        assert_eq!(
+            migrated_id("sops/nested/token")?.as_str(),
+            "sops/nested/token"
+        );
+
+        std::fs::write(directory.join("not-sops.json"), b"{}")?;
+        assert!(scan_sops_json_files(&canonical, &canonical, &mut Vec::new()).is_err());
         Ok(())
     }
 

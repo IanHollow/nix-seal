@@ -15,6 +15,11 @@ emits a mapping report. With explicit target-system and approval-signer mappings
 it may also write a separate valid direct-delivery candidate plan; it never
 mutates the legacy configuration or ciphertext.
 
+SOPS JSON inspection is similarly non-destructive: it validates bounded
+cleartext metadata (including provider and age-recipient declarations) without
+decrypting values or invoking SOPS. Structured extraction and mutation remain
+separate, explicit operations.
+
 Adapters for agenix-rekey metadata, SOPS/sops-nix, and Clan Vars/Facts remain
 planned. Their format-specific policy mapping must be reviewed before any
 mutation path is added. Removal of a source manager is a separate explicit

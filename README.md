@@ -196,6 +196,8 @@ nix-seal migrate secretctl --index /tmp/secretctl-index.json --json
 nix-seal migrate agenix --directory ./secrets --json
 # ragenix uses the same standard age ciphertext inventory format
 nix-seal migrate ragenix --directory ./secrets --json
+# inspect structured SOPS JSON metadata without decrypting values or invoking SOPS
+nix-seal migrate sops-json --directory ./secrets --json
 # First inspect the mutation; then add --execute to stream-reencrypt it.
 nix-seal migrate ciphertext --source legacy/token.age --destination secrets/token.age \
   --identity /absolute/path/to/administrator.age --recipient age1... --json
@@ -239,6 +241,14 @@ root-only runtime permissions because those private runtime choices are absent
 from `secretIndex`. Review and replace those defaults, add lifecycle/template
 metadata, and migrate to administrator/recovery-backed `rekeyed` delivery before
 activation.
+
+`migrate sops-json` is intentionally a metadata-only adapter for SOPS JSON
+files. It accepts only bounded regular files, validates the top-level `sops`
+object, MAC/version fields, provider metadata, age recipients, and SOPS key
+groups, then reports public provider types. It does not decrypt or authenticate
+the document values; structured extraction and SOPS invocation remain an
+explicit later migration step. YAML, dotenv, INI, and binary SOPS inputs are not
+silently treated as JSON.
 
 ## Development
 
