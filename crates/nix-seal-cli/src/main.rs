@@ -34,6 +34,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a valid empty public plan without generating keys or secrets.
+    Init {
+        /// New TOML plan path. The command refuses to overwrite an existing file.
+        #[arg(long, default_value = "nix-seal.toml")]
+        config: PathBuf,
+    },
     /// Compile, validate, hash, and print the public plan.
     Plan {
         #[arg(long, default_value = "nix-seal.toml")]
@@ -434,6 +440,7 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Init { config } => run_init(&config, cli.json)?,
         Command::Plan {
             toml,
             nix_plan,
@@ -486,6 +493,43 @@ fn run() -> Result<()> {
         Command::Cache(CacheCommand::Import { source, root }) => {
             cache_import(&source, root, cli.json)?;
         }
+    }
+    Ok(())
+}
+
+fn run_init(config: &Path, json: bool) -> Result<()> {
+    if config
+        .extension()
+        .is_none_or(|extension| extension != "toml")
+    {
+        bail!("initial plan path must use a .toml extension");
+    }
+    let parent = config.parent().context("initial plan path has no parent")?;
+    let metadata = fs::symlink_metadata(parent)
+        .with_context(|| format!("initial plan parent {} does not exist", parent.display()))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        bail!("initial plan parent must be an existing non-symlink directory");
+    }
+    let plan = nix_seal_core::PlanV1::default();
+    nix_seal_policy::validate(&plan)?;
+    let text = toml::to_string_pretty(&plan).context("could not encode initial public plan")?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(config)
+        .with_context(|| format!("refusing to overwrite {}", config.display()))?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .context("initial plan was written but directory durability could not be confirmed")?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"schema":"nix-seal.output.v1","initialized":true,"planPath":config})
+        );
+    } else {
+        println!("initialized public plan at {}", config.display());
     }
     Ok(())
 }
@@ -2994,6 +3038,21 @@ mod tests {
             uuid.expose_secret()[19],
             b'8' | b'9' | b'a' | b'b'
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn init_creates_a_valid_empty_public_plan_without_overwriting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let config = temporary.path().join("nix-seal.toml");
+        run_init(&config, true)?;
+        let plan = nix_seal_policy::load_toml(&config)?;
+        nix_seal_policy::validate(&plan)?;
+        assert!(plan.identities.is_empty());
+        assert!(plan.secrets.is_empty());
+        assert!(run_init(&config, false).is_err());
+        assert!(run_init(&temporary.path().join("nix-seal.json"), false).is_err());
         Ok(())
     }
 

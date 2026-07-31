@@ -13,6 +13,13 @@ that projection rather than trusting duplicate command-line or Nix options.
 Signed artifact v2 manifests bind its hash, so policy substitution fails before
 decryption.
 
+Start a repository with an empty, valid public plan; this does not generate keys
+or create secrets and refuses to overwrite an existing file:
+
+```console
+nix-seal init
+```
+
 Canonical authoring is plan-directed and reads values only from stdin or an
 explicit editor transaction:
 
