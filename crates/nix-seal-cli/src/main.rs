@@ -207,6 +207,8 @@ enum SecretCommand {
     Import(SecretWriteArgs),
     /// Edit through an explicit executable in a private ephemeral workspace.
     Edit(SecretEditArgs),
+    /// Move canonical ciphertext into a private recoverable quarantine.
+    Delete(SecretDeleteArgs),
     /// Decrypt to stdout. This is the only command that emits plaintext.
     Reveal(SecretWriteArgs),
     /// List plan-declared secret IDs without reading ciphertext.
@@ -256,6 +258,21 @@ struct SecretEditArgs {
     /// Existing private/runtime directory used as the temporary workspace parent.
     #[arg(long)]
     workspace_root: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct SecretDeleteArgs {
+    #[command(flatten)]
+    policy: SecretPlanArgs,
+    /// Repository root used to resolve the plan's canonical ciphertext source.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Repository-relative private tombstone directory.
+    #[arg(long, default_value = ".nix-seal/trash/v1")]
+    quarantine_root: PathBuf,
+    /// Required non-interactive acknowledgement that policy must be updated separately.
+    #[arg(long, required = true)]
+    yes: bool,
 }
 
 #[derive(Subcommand)]
@@ -1082,6 +1099,7 @@ fn run_secret(command: SecretCommand, json: bool) -> Result<()> {
             "imported",
         )?,
         SecretCommand::Edit(arguments) => run_secret_edit(arguments, json)?,
+        SecretCommand::Delete(arguments) => run_secret_delete(&arguments, json)?,
         SecretCommand::Reveal(arguments) => {
             if json {
                 bail!("secret reveal refuses --json because plaintext JSON output is forbidden");
@@ -1150,6 +1168,52 @@ fn run_secret(command: SecretCommand, json: bool) -> Result<()> {
                 println!("phase: {:?}", secret.phase);
             }
         }
+    }
+    Ok(())
+}
+
+fn run_secret_delete(arguments: &SecretDeleteArgs, json: bool) -> Result<()> {
+    if !arguments.yes {
+        bail!("secret deletion requires the explicit --yes acknowledgement");
+    }
+    let plan = read_plan_bounded(&arguments.policy.plan)?;
+    let secret = plan
+        .secrets
+        .get(&arguments.policy.secret)
+        .context("secret is absent from plan")?;
+    let root = arguments
+        .repository_root
+        .canonicalize()
+        .context("repository root must exist")?;
+    let deleted_at = jiff::Timestamp::try_from(SystemTime::now())
+        .map(|timestamp| timestamp.to_string())
+        .context("system time is outside supported lifecycle range")?;
+    let result = nix_seal_authoring::delete_secret(&nix_seal_authoring::DeleteRequest {
+        repository_root: &root,
+        relative_source: Path::new(&secret.source),
+        quarantine_root: &arguments.quarantine_root,
+        secret_id: arguments.policy.secret.as_str(),
+        deleted_at: &deleted_at,
+    })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.output.v1",
+                "operation":"deleted",
+                "secretId":arguments.policy.secret,
+                "originalPath":result.original_path,
+                "tombstonePath":result.tombstone_path,
+                "ciphertextHash":result.ciphertext_hash,
+                "deletedAt":deleted_at
+            })
+        );
+    } else {
+        println!("{}", result.tombstone_path.display());
+        eprintln!(
+            "quarantined canonical ciphertext for {}; update the authoritative plan separately",
+            arguments.policy.secret
+        );
     }
     Ok(())
 }

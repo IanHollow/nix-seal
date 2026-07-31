@@ -101,6 +101,91 @@ fn plan_directed_create_rotate_and_reveal() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+#[test]
+fn plan_directed_delete_is_explicit_and_recoverable() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture()?;
+    let create = run_with_stdin(
+        &fixture.root,
+        &[
+            "secret",
+            "create",
+            "--plan",
+            path_text(&fixture.plan_path)?,
+            "--repository-root",
+            path_text(&fixture.root)?,
+            "--secret",
+            "db/password",
+            "--identity",
+            path_text(&fixture.identity_path)?,
+        ],
+        b"delete-canary",
+    )?;
+    assert!(create.status.success());
+    let source = fixture.root.join("secrets/db.age");
+    let ciphertext = std::fs::read(&source)?;
+
+    let without_acknowledgement = run(
+        &fixture.root,
+        &[
+            "secret",
+            "delete",
+            "--plan",
+            path_text(&fixture.plan_path)?,
+            "--repository-root",
+            path_text(&fixture.root)?,
+            "--secret",
+            "db/password",
+        ],
+    )?;
+    assert!(!without_acknowledgement.status.success());
+    assert_eq!(std::fs::read(&source)?, ciphertext);
+
+    let deleted = run(
+        &fixture.root,
+        &[
+            "--json",
+            "secret",
+            "delete",
+            "--plan",
+            path_text(&fixture.plan_path)?,
+            "--repository-root",
+            path_text(&fixture.root)?,
+            "--secret",
+            "db/password",
+            "--yes",
+        ],
+    )?;
+    assert!(deleted.status.success());
+    assert!(!source.exists());
+    assert!(
+        !deleted
+            .stdout
+            .windows(13)
+            .any(|value| value == b"delete-canary")
+    );
+    let output: serde_json::Value = serde_json::from_slice(&deleted.stdout)?;
+    let tombstone = PathBuf::from(
+        output["tombstonePath"]
+            .as_str()
+            .ok_or("missing tombstone path")?,
+    );
+    assert_eq!(std::fs::read(tombstone.join("ciphertext.age"))?, ciphertext);
+
+    let deep_check = run(
+        &fixture.root,
+        &[
+            "check",
+            "--nix-plan",
+            path_text(&fixture.plan_path)?,
+            "--deep",
+            "--repository-root",
+            path_text(&fixture.root)?,
+        ],
+    )?;
+    assert!(!deep_check.status.success());
+    Ok(())
+}
+
 struct Fixture {
     _temporary: tempfile::TempDir,
     root: PathBuf,

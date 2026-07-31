@@ -1,6 +1,6 @@
 # ADR 0008: Plan-directed authoring and lifecycle
 
-Status: accepted; create/import/edit/reveal/rotate foundation implemented
+Status: accepted; create/import/edit/reveal/delete/rotate foundation implemented
 
 Canonical ciphertext authoring must derive its recipients and source path from
 the validated plan. Arbitrary recipient and output arguments are not an
@@ -29,6 +29,15 @@ current user with no group/other permissions. The normal verified replacement
 transaction then re-encrypts it. The workspace is removed on every return path.
 Editors remain in the threat model: a malicious editor can read plaintext and
 may deliberately copy it elsewhere.
+
+Delete is deliberately recoverable and non-interactive. It requires an explicit
+`--yes`, validates the plan-derived source without following links, hashes the
+ciphertext, writes and synchronizes a versioned public tombstone, then
+atomically renames the single-link regular ciphertext into a private,
+collision-safe repository quarantine. It never edits policy or unlinks the
+source directly. Cross-filesystem moves fail without a copy/delete fallback;
+after a successful rename, a directory synchronization failure is reported as
+durability-unknown and the tombstone path remains the recovery authority.
 
 Lifecycle timestamps are strict offset-bearing RFC 3339 values. Rotation due
 dates use checked elapsed-day arithmetic from the last rotation or creation

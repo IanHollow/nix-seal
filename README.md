@@ -21,6 +21,7 @@ nix-seal secret create --plan plan.v1.json --secret db/password \
   --identity ~/.config/age/keys.txt < password.txt
 nix-seal secret edit --plan plan.v1.json --secret db/password \
   --identity ~/.config/age/keys.txt --editor /absolute/path/to/editor
+nix-seal secret delete --plan plan.v1.json --secret db/password --yes
 nix-seal rotate --plan plan.v1.json --secret db/password \
   --identity ~/.config/age/keys.txt < replacement.txt
 nix-seal secret list --plan plan.v1.json --due
@@ -33,6 +34,13 @@ same-directory transaction, round-trip decrypted and hashed, then atomically
 committed. Editor execution uses no shell, inherits no environment, and runs in
 a private ephemeral workspace. `rekey` changes encryption recipients; `rotate`
 changes the application credential.
+
+Deletion never unlinks canonical ciphertext directly. It requires `--yes` and
+atomically moves the ciphertext into a private, collision-safe
+`.nix-seal/trash/v1` tombstone containing its public secret ID, original source,
+ciphertext hash, and deletion time. The authoritative plan is never rewritten
+implicitly, so recovery remains possible and `check --deep` fails until policy
+is intentionally updated or the ciphertext is restored.
 
 The project is in an early, pre-release foundation phase. The current vertical
 slice provides strict plan parsing and validation, canonical plan hashing,

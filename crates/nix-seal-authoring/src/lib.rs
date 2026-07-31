@@ -2,6 +2,7 @@
 //! Transactional, plan-directed canonical ciphertext authoring.
 
 use secrecy::SecretString;
+use serde::Serialize;
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, Write},
@@ -31,6 +32,41 @@ pub struct AuthoringResult {
     pub plaintext_bytes: u64,
 }
 
+/// Inputs for a recoverable canonical-ciphertext deletion.
+pub struct DeleteRequest<'a> {
+    /// Existing repository root.
+    pub repository_root: &'a Path,
+    /// Repository-relative canonical ciphertext source from the plan.
+    pub relative_source: &'a Path,
+    /// Repository-relative private quarantine directory.
+    pub quarantine_root: &'a Path,
+    /// Public plan secret ID recorded in the tombstone.
+    pub secret_id: &'a str,
+    /// RFC 3339 deletion time recorded in the tombstone.
+    pub deleted_at: &'a str,
+}
+
+/// Public metadata for a recoverable deletion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeletionResult {
+    /// Directory containing `ciphertext.age` and `tombstone.json`.
+    pub tombstone_path: PathBuf,
+    /// Original canonical ciphertext path.
+    pub original_path: PathBuf,
+    /// BLAKE3 hash of the quarantined ciphertext.
+    pub ciphertext_hash: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TombstoneV1<'a> {
+    schema: &'static str,
+    secret_id: &'a str,
+    original_source: &'a str,
+    ciphertext_hash: &'a str,
+    deleted_at: &'a str,
+}
+
 /// Redacted canonical authoring failure.
 #[derive(Debug, Error)]
 pub enum AuthoringError {
@@ -58,6 +94,9 @@ pub enum AuthoringError {
     /// The atomic change completed but directory durability could not be confirmed.
     #[error("ciphertext changed atomically but filesystem durability could not be confirmed")]
     DurabilityUnknown,
+    /// Tombstone metadata could not be encoded.
+    #[error("recoverable deletion tombstone could not be encoded")]
+    Tombstone(#[source] serde_json::Error),
 }
 
 /// Explicit editor invocation. No shell or inherited environment is used.
@@ -187,6 +226,74 @@ pub fn edit_secret(request: &EditRequest<'_>) -> Result<AuthoringResult, Authori
     )
 }
 
+/// Atomically moves canonical ciphertext into a private, collision-safe quarantine tombstone.
+pub fn delete_secret(request: &DeleteRequest<'_>) -> Result<DeletionResult, AuthoringError> {
+    if request.secret_id.is_empty() || request.deleted_at.is_empty() {
+        return Err(AuthoringError::UnsafePath);
+    }
+    let source = resolve_existing(request.repository_root, request.relative_source)?;
+    let previous = validate_destination(&source, WriteMode::Replace)?
+        .ok_or(AuthoringError::DestinationState)?;
+    let mut ciphertext = open_nofollow_regular(&source)?;
+    let ciphertext_hash = hash_file(&mut ciphertext)?;
+    let quarantine_root =
+        resolve_private_directory(request.repository_root, request.quarantine_root)?;
+    let tombstone = tempfile::Builder::new()
+        .prefix("secret-")
+        .tempdir_in(&quarantine_root)
+        .map_err(AuthoringError::Io)?;
+    set_private_directory(tombstone.path()).map_err(AuthoringError::Io)?;
+
+    let metadata = TombstoneV1 {
+        schema: "nix-seal.deleted-secret.v1",
+        secret_id: request.secret_id,
+        original_source: request
+            .relative_source
+            .to_str()
+            .ok_or(AuthoringError::UnsafePath)?,
+        ciphertext_hash: &ciphertext_hash,
+        deleted_at: request.deleted_at,
+    };
+    let metadata_bytes = serde_json::to_vec(&metadata).map_err(AuthoringError::Tombstone)?;
+    let metadata_path = tombstone.path().join("tombstone.json");
+    let mut metadata_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&metadata_path)
+        .map_err(AuthoringError::Io)?;
+    set_private(&metadata_path).map_err(AuthoringError::Io)?;
+    metadata_file
+        .write_all(&metadata_bytes)
+        .and_then(|()| metadata_file.write_all(b"\n"))
+        .and_then(|()| metadata_file.sync_all())
+        .map_err(AuthoringError::Io)?;
+
+    ensure_unchanged(&source, Some(&previous))?;
+    let quarantined = tombstone.path().join("ciphertext.age");
+    std::fs::rename(&source, &quarantined).map_err(AuthoringError::Io)?;
+    let tombstone_path = tombstone.keep();
+
+    let moved = std::fs::symlink_metadata(&quarantined).map_err(AuthoringError::Io)?;
+    if !safe_regular(&moved) || !same_file(&previous, &moved) {
+        return Err(AuthoringError::DurabilityUnknown);
+    }
+    File::open(&tombstone_path)
+        .and_then(|directory| directory.sync_all())
+        .and_then(|()| File::open(&quarantine_root)?.sync_all())
+        .and_then(|()| {
+            File::open(source.parent().ok_or_else(|| {
+                std::io::Error::other("canonical source has no parent directory")
+            })?)?
+            .sync_all()
+        })
+        .map_err(|_| AuthoringError::DurabilityUnknown)?;
+    Ok(DeletionResult {
+        tombstone_path,
+        original_path: source,
+        ciphertext_hash,
+    })
+}
+
 fn resolve_destination(root: &Path, relative: &Path) -> Result<PathBuf, AuthoringError> {
     if !root.is_absolute()
         || relative.is_absolute()
@@ -219,6 +326,64 @@ fn resolve_destination(root: &Path, relative: &Path) -> Result<PathBuf, Authorin
     }
     let file_name = relative.file_name().ok_or(AuthoringError::UnsafePath)?;
     Ok(canonical_parent.join(file_name))
+}
+
+fn resolve_existing(root: &Path, relative: &Path) -> Result<PathBuf, AuthoringError> {
+    validate_relative(relative)?;
+    let canonical_root = root.canonicalize().map_err(AuthoringError::Io)?;
+    if !canonical_root.is_absolute() {
+        return Err(AuthoringError::UnsafePath);
+    }
+    let mut path = canonical_root.clone();
+    for component in relative.components() {
+        let Component::Normal(segment) = component else {
+            return Err(AuthoringError::UnsafePath);
+        };
+        path.push(segment);
+        let metadata = std::fs::symlink_metadata(&path).map_err(AuthoringError::Io)?;
+        if path != canonical_root.join(relative) && !metadata.file_type().is_dir() {
+            return Err(AuthoringError::UnsafePath);
+        }
+    }
+    Ok(path)
+}
+
+fn resolve_private_directory(root: &Path, relative: &Path) -> Result<PathBuf, AuthoringError> {
+    validate_relative(relative)?;
+    let canonical_root = root.canonicalize().map_err(AuthoringError::Io)?;
+    let mut path = canonical_root.clone();
+    for component in relative.components() {
+        let Component::Normal(segment) = component else {
+            return Err(AuthoringError::UnsafePath);
+        };
+        path.push(segment);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Err(AuthoringError::UnsafePath),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&path).map_err(AuthoringError::Io)?;
+            }
+            Err(error) => return Err(AuthoringError::Io(error)),
+        }
+    }
+    let canonical = path.canonicalize().map_err(AuthoringError::Io)?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(AuthoringError::UnsafePath);
+    }
+    set_private_directory(&canonical).map_err(AuthoringError::Io)?;
+    Ok(canonical)
+}
+
+fn validate_relative(relative: &Path) -> Result<(), AuthoringError> {
+    if relative.is_absolute()
+        || relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            !matches!(component, Component::Normal(_)) || component.as_os_str().is_empty()
+        })
+    {
+        return Err(AuthoringError::UnsafePath);
+    }
+    Ok(())
 }
 
 fn validate_destination(
@@ -470,12 +635,13 @@ mod tests {
         let editor_value = root.join("editor-value");
         std::fs::write(&editor_value, b"edited-value")?;
         set_private(&editor_value)?;
+        let copy_editor = find_test_executable("cp")?;
         let edited = edit_secret(&EditRequest {
             repository_root: &root,
             relative_destination: destination,
             identity: &identity,
             recipients: &recipients,
-            editor: Path::new("/bin/cp"),
+            editor: &copy_editor,
             editor_arguments: &[editor_value.to_string_lossy().into_owned()],
             workspace_root: &root,
         })?;
@@ -484,19 +650,100 @@ mod tests {
         assert_eq!(plaintext, b"edited-value");
 
         let before_failure = std::fs::read(&edited.path)?;
+        let failing_editor = find_test_executable("false")?;
         assert!(matches!(
             edit_secret(&EditRequest {
                 repository_root: &root,
                 relative_destination: destination,
                 identity: &identity,
                 recipients: &recipients,
-                editor: Path::new("/usr/bin/false"),
+                editor: &failing_editor,
                 editor_arguments: &[],
                 workspace_root: &root,
             }),
             Err(AuthoringError::Editor)
         ));
         assert_eq!(std::fs::read(&edited.path)?, before_failure);
+        Ok(())
+    }
+
+    fn find_test_executable(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        std::env::split_paths(&std::env::var_os("PATH").ok_or("test PATH is absent")?)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+            .ok_or_else(|| format!("test executable {name} is absent from PATH").into())
+    }
+
+    #[test]
+    fn deletion_is_recoverable_private_and_collision_safe() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let destination = Path::new("secrets/db.age");
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        let recipients = vec![recipient];
+        let created = write_secret(
+            &root,
+            destination,
+            b"recoverable-value".as_slice(),
+            &recipients,
+            &identity,
+            WriteMode::Create,
+        )?;
+        let ciphertext = std::fs::read(&created.path)?;
+        let deleted = delete_secret(&DeleteRequest {
+            repository_root: &root,
+            relative_source: destination,
+            quarantine_root: Path::new(".nix-seal/trash/v1"),
+            secret_id: "db/password",
+            deleted_at: "2026-07-31T22:00:00Z",
+        })?;
+
+        assert!(!created.path.exists());
+        assert_eq!(
+            std::fs::read(deleted.tombstone_path.join("ciphertext.age"))?,
+            ciphertext
+        );
+        let tombstone: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            deleted.tombstone_path.join("tombstone.json"),
+        )?)?;
+        assert_eq!(tombstone["schema"], "nix-seal.deleted-secret.v1");
+        assert_eq!(tombstone["secretId"], "db/password");
+        assert_eq!(tombstone["originalSource"], "secrets/db.age");
+        assert_eq!(tombstone["ciphertextHash"], deleted.ciphertext_hash);
+        assert_eq!(tombstone["deletedAt"], "2026-07-31T22:00:00Z");
+
+        write_secret(
+            &root,
+            destination,
+            b"second-value".as_slice(),
+            &recipients,
+            &identity,
+            WriteMode::Create,
+        )?;
+        let second = delete_secret(&DeleteRequest {
+            repository_root: &root,
+            relative_source: destination,
+            quarantine_root: Path::new(".nix-seal/trash/v1"),
+            secret_id: "db/password",
+            deleted_at: "2026-07-31T22:00:01Z",
+        })?;
+        assert_ne!(deleted.tombstone_path, second.tombstone_path);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let quarantine = root.join(".nix-seal/trash/v1");
+            assert_eq!(std::fs::metadata(quarantine)?.mode() & 0o777, 0o700);
+            assert_eq!(
+                std::fs::metadata(&second.tombstone_path)?.mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(second.tombstone_path.join("ciphertext.age"))?.nlink(),
+                1
+            );
+        }
         Ok(())
     }
 
@@ -520,6 +767,32 @@ mod tests {
             Err(AuthoringError::UnsafePath)
         ));
         assert!(!outside.path().join("db.age").exists());
+
+        let delete_root = tempfile::tempdir()?;
+        let delete_root = delete_root.path().canonicalize()?;
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        let created = write_secret(
+            &delete_root,
+            Path::new("secrets/db.age"),
+            b"preserve-me".as_slice(),
+            &[recipient],
+            &identity,
+            WriteMode::Create,
+        )?;
+        let before_delete = std::fs::read(&created.path)?;
+        symlink(outside.path(), delete_root.join(".nix-seal"))?;
+        assert!(matches!(
+            delete_secret(&DeleteRequest {
+                repository_root: &delete_root,
+                relative_source: Path::new("secrets/db.age"),
+                quarantine_root: Path::new(".nix-seal/trash/v1"),
+                secret_id: "db/password",
+                deleted_at: "2026-07-31T22:00:00Z",
+            }),
+            Err(AuthoringError::UnsafePath)
+        ));
+        assert!(created.path.exists());
+        assert_eq!(std::fs::read(created.path)?, before_delete);
         Ok(())
     }
 }
