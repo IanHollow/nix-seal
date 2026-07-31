@@ -366,6 +366,18 @@ enum MigrateCommand {
         #[arg(long)]
         index: PathBuf,
     },
+    /// Inspect an agenix ciphertext tree without changing files or decrypting data.
+    Agenix {
+        /// Existing directory containing canonical `*.age` ciphertext files.
+        #[arg(long, default_value = "secrets")]
+        directory: PathBuf,
+    },
+    /// Inspect a ragenix ciphertext tree; its ciphertext layout is agenix-compatible.
+    Ragenix {
+        /// Existing directory containing canonical `*.age` ciphertext files.
+        #[arg(long, default_value = "secrets")]
+        directory: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -657,7 +669,110 @@ struct SecretctlSecretV1 {
 fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
     match command {
         MigrateCommand::Secretctl { index } => migrate_secretctl(&index, json),
+        MigrateCommand::Agenix { directory } => migrate_agenix_tree(&directory, "agenix", json),
+        MigrateCommand::Ragenix { directory } => migrate_agenix_tree(&directory, "ragenix", json),
     }
+}
+
+fn migrate_agenix_tree(directory: &Path, source: &str, json: bool) -> Result<()> {
+    let root = directory
+        .canonicalize()
+        .with_context(|| format!("could not resolve {source} ciphertext directory"))?;
+    let metadata = fs::symlink_metadata(&root)?;
+    if !metadata.file_type().is_dir() {
+        bail!("{source} ciphertext root is not a directory");
+    }
+    let mut ciphertexts = Vec::new();
+    scan_agenix_ciphertexts(&root, &root, &mut ciphertexts)?;
+    if ciphertexts.is_empty() {
+        bail!("{source} ciphertext directory contains no .age files");
+    }
+    let mappings = ciphertexts
+        .iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(&root)
+                .context("agenix ciphertext escaped its canonical root")?;
+            let stem = relative.with_extension("");
+            let legacy_id = stem
+                .to_str()
+                .context("agenix ciphertext path is not UTF-8")?;
+            Ok(serde_json::json!({
+                "legacyId":legacy_id,
+                "nixSealId":migrated_id(&format!("{source}/{legacy_id}"))?,
+                "source":relative,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let warnings = vec![
+        "dry run only: no ciphertext, configuration, or source manager was changed",
+        "ciphertext headers were validated but recipient policy is not encoded in agenix ciphertext paths; supply an explicit nix-seal recipient and target mapping before import",
+        "only regular .age files were accepted; symlinks and non-regular entries are rejected",
+    ];
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.migration-report.v1",
+                "source":source,
+                "dryRun":true,
+                "secrets":mappings,
+                "warnings":warnings
+            })
+        );
+    } else {
+        println!("{source} dry-run: {} ciphertexts mapped", mappings.len());
+        for warning in warnings {
+            eprintln!("warning: {warning}");
+        }
+        for mapping in mappings {
+            println!(
+                "{} -> {} ({})",
+                mapping["legacyId"].as_str().unwrap_or("unknown"),
+                mapping["nixSealId"].as_str().unwrap_or("unknown"),
+                mapping["source"].as_str().unwrap_or("unknown"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn scan_agenix_ciphertexts(root: &Path, directory: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
+    if output.len() > 10_000 {
+        bail!("agenix ciphertext tree exceeds the 10000-file safety limit");
+    }
+    let mut entries = fs::read_dir(directory)
+        .with_context(|| {
+            format!(
+                "could not read ciphertext directory {}",
+                directory.display()
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            bail!("agenix ciphertext tree contains a symlink");
+        }
+        if metadata.file_type().is_dir() {
+            scan_agenix_ciphertexts(root, &path, output)?;
+        } else if metadata.file_type().is_file() {
+            if path.extension().is_some_and(|extension| extension == "age") {
+                let relative = path.strip_prefix(root)?;
+                if relative.components().count() > 32 {
+                    bail!("agenix ciphertext path nesting exceeds the safety limit");
+                }
+                nix_seal_crypto::validate_ciphertext_header(open_public_ciphertext(&path)?)
+                    .context("agenix ciphertext has an invalid age header")?;
+                output.push(path);
+            }
+        } else {
+            bail!("agenix ciphertext tree contains a non-regular entry");
+        }
+    }
+    Ok(())
 }
 
 fn migrate_secretctl(index_path: &Path, json: bool) -> Result<()> {
@@ -2738,6 +2853,32 @@ mod tests {
         );
         assert!(migrate_secretctl_source("../secrets/token.age").is_err());
         assert!(migrate_secretctl_source("secrets/token.txt").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn agenix_migration_inventory_accepts_only_valid_age_ciphertexts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let directory = temporary.path().join("secrets");
+        std::fs::create_dir_all(directory.join("nested"))?;
+        let (_, recipient) = nix_seal_crypto::generate_x25519();
+        let ciphertext = directory.join("nested/token.age");
+        let mut output = std::fs::File::create(&ciphertext)?;
+        nix_seal_crypto::encrypt(
+            b"migration-canary".as_slice(),
+            &mut output,
+            std::slice::from_ref(&recipient),
+        )?;
+        output.sync_all()?;
+        let canonical = directory.canonicalize()?;
+        let mut discovered = Vec::new();
+        scan_agenix_ciphertexts(&canonical, &canonical, &mut discovered)?;
+        assert_eq!(discovered, vec![ciphertext.canonicalize()?]);
+        assert_eq!(
+            migrated_id("agenix/nested/token")?.as_str(),
+            "agenix/nested/token"
+        );
         Ok(())
     }
 

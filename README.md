@@ -181,6 +181,9 @@ public index and inspect the stable mapping before touching ciphertext:
 ```console
 nix eval --json .#secretIndex > /tmp/secretctl-index.json
 nix-seal migrate secretctl --index /tmp/secretctl-index.json --json
+nix-seal migrate agenix --directory ./secrets --json
+# ragenix uses the same standard age ciphertext inventory format
+nix-seal migrate ragenix --directory ./secrets --json
 ```
 
 It validates legacy paths, scopes, consumers, IDs, and SSH recipient metadata,
@@ -190,6 +193,11 @@ Ed25519/RSA identities are supported only as a migration compatibility path;
 encrypted SSH private keys are deliberately rejected in non-interactive
 workflows, so convert them to a reviewed native-age or hardware-backed identity
 before automated import.
+
+The agenix/ragenix adapters recursively inventory only regular `*.age` files,
+validate their age headers, and reject symbolic links or unsafe nesting. Because
+recipient and Nix module policy are not recoverable from ciphertext paths, their
+reports require an explicit nix-seal target/recipient mapping before import.
 
 ## Development
 
