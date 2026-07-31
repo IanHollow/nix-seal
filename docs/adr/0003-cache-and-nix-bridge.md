@@ -20,3 +20,11 @@ all target-bound envelope identity fields prevents otherwise-valid targets that
 share a recipient or source from colliding on one incompatible signed envelope.
 Existing entries are reused only after recalculating the ciphertext hash and
 verifying every signed binding. No plaintext transaction file is created.
+
+Cache reads are fail-closed. The cache root and every artifact bundle must have
+private permissions; generic objects, target ciphertext, and envelopes are
+opened with no-follow semantics and must be single-link regular files. Inventory
+validates each content hash, artifact bundle name, exact bundle member set, byte
+bound, and private metadata before reporting aggregate counts. This deliberately
+makes `cache status` fail on unexpected cache mutations instead of presenting a
+misleading count. Cache lifecycle operations build on this verified inventory.

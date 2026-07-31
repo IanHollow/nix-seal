@@ -1215,6 +1215,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "blake3",
  "fs2",
+ "rustix",
  "tempfile",
  "thiserror 2.0.19",
 ]

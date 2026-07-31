@@ -1502,24 +1502,29 @@ fn set_private_file(_path: &Path) -> Result<()> {
 fn cache_status(root: Option<PathBuf>, json: bool) -> Result<()> {
     let root = root.unwrap_or_else(default_cache_root);
     let cache = nix_seal_cache::Cache::open(&root)?;
-    let objects = std::fs::read_dir(cache.root().join("objects"))
-        .map_or(0, |entries| entries.filter_map(Result::ok).count());
-    let artifacts = std::fs::read_dir(cache.root().join("artifacts"))
-        .map_or(0, |entries| entries.filter_map(Result::ok).count());
+    let inventory = cache.inventory()?;
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "schema":"nix-seal.output.v1",
                 "root":cache.root(),
-                "objects":objects,
-                "artifacts":artifacts
+                "objects":inventory.object_count,
+                "objectBytes":inventory.object_bytes,
+                "artifacts":inventory.artifact_count,
+                "artifactCiphertextBytes":inventory.artifact_ciphertext_bytes,
+                "artifactEnvelopeBytes":inventory.artifact_envelope_bytes
             })
         );
     } else {
         println!(
-            "{}: {objects} objects, {artifacts} target artifacts",
-            cache.root().display()
+            "{}: {} objects ({} bytes), {} target artifacts ({} ciphertext bytes, {} envelope bytes)",
+            cache.root().display(),
+            inventory.object_count,
+            inventory.object_bytes,
+            inventory.artifact_count,
+            inventory.artifact_ciphertext_bytes,
+            inventory.artifact_envelope_bytes
         );
     }
     Ok(())
