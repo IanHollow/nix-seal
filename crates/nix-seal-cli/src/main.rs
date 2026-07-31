@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use secrecy::{ExposeSecret, SecretString};
 use std::{
+    collections::BTreeSet,
     io::{Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -32,6 +33,12 @@ enum Command {
         toml: PathBuf,
         #[arg(long)]
         nix_plan: Option<PathBuf>,
+        /// Emit only the deterministic policy authorized for this target.
+        #[arg(long)]
+        target: Option<nix_seal_core::Id>,
+        /// Write canonical public JSON to a new file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Validate policy and public references.
     Check {
@@ -56,8 +63,11 @@ enum Command {
     /// Secret authoring operations.
     #[command(subcommand)]
     Secret(SecretCommand),
-    /// Print the plan.v1 `JSON` Schema.
-    Schema,
+    /// Print a versioned public `JSON` Schema.
+    Schema {
+        #[arg(long, value_enum, default_value_t = SchemaKind::Plan)]
+        kind: SchemaKind,
+    },
     /// Generate shell completion definitions.
     Completions { shell: CompletionShell },
     /// Ciphertext cache operations.
@@ -120,6 +130,8 @@ enum ArtifactCommand {
         #[arg(long)]
         plan_hash: String,
         #[arg(long)]
+        target_policy_hash: String,
+        #[arg(long)]
         source_hash: String,
         #[arg(long)]
         artifact_hash: String,
@@ -138,18 +150,15 @@ enum ArtifactCommand {
 
 #[derive(Args)]
 struct RekeyArgs {
-    /// Canonical administrator-encrypted age file.
-    #[arg(long)]
-    source: PathBuf,
+    /// Canonical compiled plan.v1 JSON.
+    #[arg(long, default_value = "plan.v1.json")]
+    plan: PathBuf,
+    /// Repository root used to resolve canonical relative ciphertext paths.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
     /// Administrator X25519 identity file.
     #[arg(long)]
     identity: PathBuf,
-    /// Exact target X25519 recipient.
-    #[arg(long)]
-    recipient: String,
-    /// Canonical plan hash.
-    #[arg(long)]
-    plan_hash: String,
     /// Bound target ID.
     #[arg(long)]
     target: nix_seal_core::Id,
@@ -218,6 +227,13 @@ enum CompletionShell {
     Nushell,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum SchemaKind {
+    Plan,
+    TargetPolicy,
+    Activation,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("nix-seal: {error:#}");
@@ -228,21 +244,58 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Plan { toml, nix_plan } => {
+        Command::Plan {
+            toml,
+            nix_plan,
+            target,
+            output,
+        } => {
             let plan = load_plan(&toml, nix_plan.as_deref())?;
             nix_seal_policy::validate(&plan)?;
-            let hash = nix_seal_policy::plan_hash(&plan)?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"schema":"nix-seal.output.v1","planHash":hash,"plan":plan})
-                );
+            let plan_hash = nix_seal_policy::plan_hash(&plan)?;
+            if let Some(target) = target {
+                let policy = nix_seal_policy::target_policy(&plan, &target)?;
+                let policy_hash = nix_seal_policy::target_policy_hash(&policy)?;
+                let canonical = nix_seal_policy::canonical_target_policy_json(&policy)?;
+                eprintln!("plan hash: {plan_hash}");
+                eprintln!("target policy hash: {policy_hash}");
+                if cli.json {
+                    if let Some(output) = output.as_deref() {
+                        emit_canonical_public_json(Some(output), &canonical)?;
+                    }
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema":"nix-seal.output.v1",
+                            "planHash":plan_hash,
+                            "targetPolicyHash":policy_hash,
+                            "target":target,
+                            "targetPolicy":(output.is_none()).then_some(&policy),
+                            "output":output
+                        })
+                    );
+                } else {
+                    emit_canonical_public_json(output.as_deref(), &canonical)?;
+                }
             } else {
-                eprintln!("plan hash: {hash}");
-                println!(
-                    "{}",
-                    String::from_utf8(nix_seal_policy::canonical_json(&plan)?)?
-                );
+                let canonical = nix_seal_policy::canonical_json(&plan)?;
+                eprintln!("plan hash: {plan_hash}");
+                if cli.json {
+                    if let Some(output) = output.as_deref() {
+                        emit_canonical_public_json(Some(output), &canonical)?;
+                    }
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema":"nix-seal.output.v1",
+                            "planHash":plan_hash,
+                            "plan":(output.is_none()).then_some(&plan),
+                            "output":output
+                        })
+                    );
+                } else {
+                    emit_canonical_public_json(output.as_deref(), &canonical)?;
+                }
             }
         }
         Command::Check {
@@ -274,7 +327,14 @@ fn run() -> Result<()> {
         Command::Rekey(arguments) => run_rekey(arguments, cli.json)?,
         Command::Activate(arguments) => run_activate(&arguments, cli.json)?,
         Command::Secret(command) => run_secret(command)?,
-        Command::Schema => println!("{}", nix_seal_policy::json_schema()?),
+        Command::Schema { kind } => println!(
+            "{}",
+            match kind {
+                SchemaKind::Plan => nix_seal_policy::json_schema()?,
+                SchemaKind::TargetPolicy => nix_seal_policy::target_policy_json_schema()?,
+                SchemaKind::Activation => nix_seal_runtime::activation_json_schema()?,
+            }
+        ),
         Command::Completions { shell } => completions(shell),
         Command::Cache(CacheCommand::Status { root }) => cache_status(root, cli.json)?,
     }
@@ -361,7 +421,7 @@ fn run_artifact(command: ArtifactCommand, json: bool) -> Result<()> {
             signing_key,
             output,
         } => {
-            let manifest: nix_seal_manifest::TargetManifestV1 = read_json_bounded(&manifest)?;
+            let manifest: nix_seal_manifest::TargetManifestV2 = read_json_bounded(&manifest)?;
             let key = read_signing_key(&signing_key)?;
             let envelope = nix_seal_manifest::sign_manifest(&manifest, &key)?;
             write_new_json(&output, &envelope)?;
@@ -383,6 +443,7 @@ fn run_artifact(command: ArtifactCommand, json: bool) -> Result<()> {
             trusted_keys,
             threshold,
             plan_hash,
+            target_policy_hash,
             source_hash,
             artifact_hash,
             target,
@@ -400,6 +461,7 @@ fn run_artifact(command: ArtifactCommand, json: bool) -> Result<()> {
             let expected = nix_seal_manifest::ExpectedBinding {
                 tool_version: env!("CARGO_PKG_VERSION"),
                 plan_hash: &plan_hash,
+                target_policy_hash: &target_policy_hash,
                 source_ciphertext_hash: &source_hash,
                 artifact_ciphertext_hash: &artifact_hash,
                 target_id: &target,
@@ -437,8 +499,36 @@ fn run_artifact(command: ArtifactCommand, json: bool) -> Result<()> {
 }
 
 fn run_rekey(arguments: RekeyArgs, json: bool) -> Result<()> {
+    let plan: nix_seal_core::PlanV1 = read_plan_bounded(&arguments.plan)?;
+    let policy = nix_seal_policy::target_policy(&plan, &arguments.target)?;
+    let target_policy_hash = nix_seal_policy::target_policy_hash(&policy)?;
+    let secret_policy = policy.secrets.get(&arguments.secret).with_context(|| {
+        format!(
+            "secret {} is not authorized for target {}",
+            arguments.secret, arguments.target
+        )
+    })?;
+    if !matches!(secret_policy.delivery, nix_seal_core::DeliveryMode::Rekeyed) {
+        bail!(
+            "secret {} uses direct delivery and cannot be target-rekeyed",
+            arguments.secret
+        );
+    }
+    let source = arguments.repository_root.join(&secret_policy.source);
     let identity = read_identity(&arguments.identity)?;
     let signing_key = read_signing_key(&arguments.signing_key)?;
+    let signing_public = signing_key.encode_public();
+    if !secret_policy
+        .approval
+        .signers
+        .values()
+        .any(|public| public == &signing_public)
+    {
+        bail!(
+            "signing key is not authorized by the approval policy for secret {}",
+            arguments.secret
+        );
+    }
     let issued_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?
@@ -452,10 +542,11 @@ fn run_rekey(arguments: RekeyArgs, json: bool) -> Result<()> {
     let root = arguments.cache_root.unwrap_or_else(default_cache_root);
     let cache = nix_seal_cache::Cache::open(root)?;
     let request = nix_seal_rekey::RekeyRequest {
-        source: &arguments.source,
+        source: &source,
         administrator_identity: &identity,
-        target_recipient: &arguments.recipient,
-        plan_hash: &arguments.plan_hash,
+        target_recipient: &policy.recipient,
+        plan_hash: &policy.plan_hash,
+        target_policy_hash: &target_policy_hash,
         target_id: &arguments.target,
         secret_id: &arguments.secret,
         artifact_generation: arguments.generation,
@@ -494,27 +585,195 @@ fn run_rekey(arguments: RekeyArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn verify_activation_projection(
+    spec: &nix_seal_runtime::ActivationSpecV2,
+    policy: &nix_seal_policy::TargetPolicyV1,
+) -> Result<()> {
+    if spec.target_id != policy.target_id {
+        bail!("activation metadata does not match the deterministic target policy");
+    }
+
+    let artifact_ids: BTreeSet<_> = spec
+        .artifacts
+        .iter()
+        .map(|artifact| &artifact.secret_id)
+        .collect();
+    let policy_secret_ids: BTreeSet<_> = policy.secrets.keys().collect();
+    if artifact_ids != policy_secret_ids {
+        bail!("activation artifact set does not exactly match target policy");
+    }
+    for artifact in &spec.artifacts {
+        let secret = policy.secrets.get(&artifact.secret_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "artifact secret {} is absent from target policy",
+                artifact.secret_id
+            )
+        })?;
+        if artifact.owner != secret.runtime.owner
+            || artifact.group != secret.runtime.group
+            || artifact.mode != secret.runtime.mode
+        {
+            bail!(
+                "runtime policy for secret {} differs from the canonical plan",
+                artifact.secret_id
+            );
+        }
+    }
+
+    let template_ids: BTreeSet<_> = spec
+        .templates
+        .iter()
+        .map(|template| &template.template_id)
+        .collect();
+    let policy_template_ids: BTreeSet<_> = policy.templates.keys().collect();
+    if template_ids != policy_template_ids {
+        bail!("activation template set does not exactly match target policy");
+    }
+    let plan_parent = spec
+        .plan
+        .parent()
+        .context("compiled plan path has no parent")?;
+    for template in &spec.templates {
+        let expected = policy.templates.get(&template.template_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "template {} is absent from target policy",
+                template.template_id
+            )
+        })?;
+        let expected_source = Path::new(&expected.source);
+        let expected_source = if expected_source.is_absolute() {
+            expected_source.to_owned()
+        } else {
+            plan_parent.join(expected_source)
+        };
+        let placeholders_match = template.placeholders.len() == expected.placeholders.len()
+            && template.placeholders.iter().all(|(name, actual)| {
+                expected.placeholders.get(name).is_some_and(|expected| {
+                    actual.secret_id == expected.secret
+                        && matches!(
+                            (actual.encoding, expected.encoding),
+                            (
+                                nix_seal_runtime::TemplateEncodingV1::Utf8,
+                                nix_seal_core::TemplateEncoding::Utf8
+                            ) | (
+                                nix_seal_runtime::TemplateEncodingV1::Base64,
+                                nix_seal_core::TemplateEncoding::Base64
+                            ) | (
+                                nix_seal_runtime::TemplateEncodingV1::Hex,
+                                nix_seal_core::TemplateEncoding::Hex
+                            )
+                        )
+                })
+            });
+        if template.source != expected_source
+            || template.owner != expected.runtime.owner
+            || template.group != expected.runtime.group
+            || template.mode != expected.runtime.mode
+            || !placeholders_match
+        {
+            bail!(
+                "runtime policy for template {} differs from the canonical plan",
+                template.template_id
+            );
+        }
+    }
+
+    verify_service_projection(spec, policy)
+}
+
+fn verify_service_projection(
+    spec: &nix_seal_runtime::ActivationSpecV2,
+    policy: &nix_seal_policy::TargetPolicyV1,
+) -> Result<()> {
+    let mut restart_units = BTreeSet::new();
+    let mut reload_units = BTreeSet::new();
+    for runtime in policy
+        .secrets
+        .values()
+        .map(|secret| &secret.runtime)
+        .chain(policy.templates.values().map(|template| &template.runtime))
+    {
+        restart_units.extend(runtime.restart_units.iter().cloned());
+        reload_units.extend(runtime.reload_units.iter().cloned());
+    }
+    if !restart_units.is_disjoint(&reload_units) {
+        bail!("canonical plan assigns a unit to both restart and reload actions");
+    }
+    if restart_units.is_empty() && reload_units.is_empty() {
+        if spec.post_switch.is_some() {
+            bail!("activation declares service actions absent from target policy");
+        }
+        return Ok(());
+    }
+    let actions = spec
+        .post_switch
+        .as_ref()
+        .context("activation omits service actions required by target policy")?;
+    let expected_manager = match policy.target_kind {
+        nix_seal_core::TargetKind::NixOs => nix_seal_runtime::ServiceManagerV1::SystemdSystem,
+        nix_seal_core::TargetKind::Darwin => nix_seal_runtime::ServiceManagerV1::LaunchdSystem,
+        nix_seal_core::TargetKind::HomeManager if policy.system.ends_with("-linux") => {
+            nix_seal_runtime::ServiceManagerV1::SystemdUser
+        }
+        nix_seal_core::TargetKind::HomeManager if policy.system.ends_with("-darwin") => {
+            nix_seal_runtime::ServiceManagerV1::LaunchdUser
+        }
+        nix_seal_core::TargetKind::HomeManager => {
+            bail!("Home Manager target has an unsupported system value")
+        }
+    };
+    if actions.manager != expected_manager
+        || actions
+            .restart_units
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != restart_units
+        || actions
+            .reload_units
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != reload_units
+    {
+        bail!("activation service actions differ from the canonical target policy");
+    }
+    Ok(())
+}
+
 fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
-    let mut spec: nix_seal_runtime::ActivationSpecV1 = read_json_bounded(&arguments.spec)?;
+    let mut spec: nix_seal_runtime::ActivationSpecV2 = read_json_bounded(&arguments.spec)?;
     if let Some(runtime_root) = &arguments.runtime_root {
         spec.runtime_root.clone_from(runtime_root);
     }
     spec.validate()?;
+    let plan = read_plan_bounded(&spec.plan)?;
+    let policy = nix_seal_policy::target_policy(&plan, &spec.target_id)?;
+    verify_activation_projection(&spec, &policy)?;
     let identity = read_identity(&arguments.identity)?;
-    let mut trusted = nix_seal_manifest::TrustedKeys::new();
-    for key in &spec.trusted_keys {
-        trusted.insert_encoded(key)?;
+    if nix_seal_crypto::recipient_from_identity(&identity)? != policy.recipient {
+        bail!("target identity does not match the recipient selected by plan policy");
     }
+    let target_policy_hash = nix_seal_policy::target_policy_hash(&policy)?;
+    let recipient_fingerprint = nix_seal_crypto::recipient_fingerprint(&policy.recipient)?;
     let artifacts = spec
         .artifacts
         .iter()
         .map(|artifact| {
+            let secret_policy = policy.secrets.get(&artifact.secret_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "artifact secret {} is absent from target policy",
+                    artifact.secret_id
+                )
+            })?;
             Ok(nix_seal_runtime::ActivationArtifact {
                 ciphertext: &artifact.ciphertext,
                 envelope: &artifact.envelope,
                 secret_id: &artifact.secret_id,
                 source_ciphertext_hash: &artifact.source_ciphertext_hash,
                 artifact_generation: artifact.artifact_generation,
+                approval_signers: &secret_policy.approval.signers,
+                approval_threshold: usize::from(secret_policy.approval.threshold),
                 mode: artifact.parsed_mode()?,
                 owner: &artifact.owner,
                 group: &artifact.group,
@@ -542,14 +801,13 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
     let request = nix_seal_runtime::ActivationRequest {
         runtime_root: &spec.runtime_root,
         runtime_generation: spec.runtime_generation,
-        plan_hash: &spec.plan_hash,
+        plan_hash: &policy.plan_hash,
+        target_policy_hash: &target_policy_hash,
         target_id: &spec.target_id,
-        recipient_fingerprint: &spec.recipient_fingerprint,
+        recipient_fingerprint: &recipient_fingerprint,
         tool_version: env!("CARGO_PKG_VERSION"),
         now,
         allowed_clock_skew: spec.allowed_clock_skew,
-        trusted_keys: &trusted,
-        approval_threshold: spec.approval_threshold,
         target_identity: &identity,
         artifacts: &artifacts,
         templates: &templates,
@@ -626,6 +884,21 @@ fn read_json_bounded<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_slice(&bytes).context("invalid strict artifact JSON")
 }
 
+fn read_plan_bounded(path: &Path) -> Result<nix_seal_core::PlanV1> {
+    const LIMIT: u64 = 16 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LIMIT {
+        bail!("compiled plan exceeds the 16 MiB safety limit");
+    }
+    let plan: nix_seal_core::PlanV1 =
+        serde_json::from_slice(&bytes).context("invalid strict plan.v1 JSON")?;
+    nix_seal_policy::validate(&plan)?;
+    Ok(plan)
+}
+
 fn write_new_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
     let parent = path.parent().context("artifact path has no parent")?;
@@ -638,6 +911,27 @@ fn write_new_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     file.write_all(&bytes)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
+    Ok(())
+}
+
+fn emit_canonical_public_json(output: Option<&Path>, bytes: &[u8]) -> Result<()> {
+    if let Some(path) = output {
+        let parent = path.parent().context("public JSON output has no parent")?;
+        std::fs::create_dir_all(parent)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("refusing to overwrite {}", path.display()))?;
+        file.write_all(bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    } else {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(bytes)?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
+    }
     Ok(())
 }
 
@@ -809,7 +1103,7 @@ fn completions(shell: CompletionShell) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix_seal_manifest::{ARTIFACT_SCHEMA, TargetManifestV1};
+    use nix_seal_manifest::{ARTIFACT_SCHEMA, TargetManifestV2};
     use std::collections::BTreeMap;
 
     #[test]
@@ -822,6 +1116,7 @@ mod tests {
         let ciphertext_path = temporary.path().join("artifact.age");
         let envelope_path = temporary.path().join("artifact.json");
         let template_path = temporary.path().join("application.conf.template");
+        let plan_path = temporary.path().join("plan.v1.json");
         let spec_path = temporary.path().join("activation.json");
         let runtime_root = temporary.path().join("runtime");
         let (identity, recipient) = nix_seal_crypto::generate_x25519();
@@ -836,22 +1131,95 @@ mod tests {
         let artifact_hash = blake3::hash(&std::fs::read(&ciphertext_path)?)
             .to_hex()
             .to_string();
-        let plan_hash = "0".repeat(64);
         let source_hash = "1".repeat(64);
         let target_id = nix_seal_core::Id::parse("host.test")?;
         let secret_id = nix_seal_core::Id::parse("db/password")?;
-        let fingerprint = nix_seal_crypto::recipient_fingerprint(&recipient)?;
         let signer = nix_seal_manifest::ApprovalSigningKey::generate()?;
+        std::fs::write(&template_path, b"password={{nix-seal:password-base64}}\n")?;
+        let owner = uzers::get_user_by_uid(uzers::get_current_uid())
+            .and_then(|user| user.name().to_str().map(str::to_owned))
+            .ok_or("current user is not resolvable")?;
+        let group = uzers::get_group_by_gid(uzers::get_current_gid())
+            .and_then(|group| group.name().to_str().map(str::to_owned))
+            .ok_or("current group is not resolvable")?;
+        let target_identity_id = nix_seal_core::Id::parse("target.host-test")?;
+        let signer_id = nix_seal_core::Id::parse("signer.release")?;
+        let template_id = nix_seal_core::Id::parse("application/config")?;
+        let runtime = nix_seal_core::RuntimeSettings {
+            owner: owner.clone(),
+            group: group.clone(),
+            mode: "0400".to_owned(),
+            restart_units: Vec::new(),
+            reload_units: Vec::new(),
+        };
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.identities.insert(
+            target_identity_id.clone(),
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Target,
+                public: recipient.clone(),
+            },
+        );
+        plan.identities.insert(
+            signer_id,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Signer,
+                public: signer.encode_public(),
+            },
+        );
+        plan.targets.insert(
+            target_id.clone(),
+            nix_seal_core::Target {
+                kind: nix_seal_core::TargetKind::NixOs,
+                system: "x86_64-linux".to_owned(),
+                identity: target_identity_id,
+                username: None,
+                tags: Vec::new(),
+            },
+        );
+        plan.secrets.insert(
+            secret_id.clone(),
+            nix_seal_core::Secret {
+                source: "secrets/db.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: vec![target_id.clone()],
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: runtime.clone(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: None,
+            },
+        );
+        plan.templates.insert(
+            template_id.clone(),
+            nix_seal_core::Template {
+                source: template_path.to_string_lossy().into_owned(),
+                placeholders: BTreeMap::from([(
+                    "password-base64".to_owned(),
+                    nix_seal_core::TemplatePlaceholder {
+                        secret: secret_id.clone(),
+                        encoding: nix_seal_core::TemplateEncoding::Base64,
+                    },
+                )]),
+                runtime: runtime.clone(),
+            },
+        );
+        nix_seal_policy::validate(&plan)?;
+        std::fs::write(&plan_path, nix_seal_policy::canonical_json(&plan)?)?;
+        let policy = nix_seal_policy::target_policy(&plan, &target_id)?;
+        let target_policy_hash = nix_seal_policy::target_policy_hash(&policy)?;
+        let fingerprint = nix_seal_crypto::recipient_fingerprint(&recipient)?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let manifest = TargetManifestV1 {
+        let manifest = TargetManifestV2 {
             schema: ARTIFACT_SCHEMA.to_owned(),
             tool_version: env!("CARGO_PKG_VERSION").to_owned(),
-            plan_hash: plan_hash.clone(),
+            plan_hash: policy.plan_hash.clone(),
+            target_policy_hash,
             source_ciphertext_hash: source_hash.clone(),
             artifact_ciphertext_hash: artifact_hash,
             target_id: target_id.clone(),
             secret_id: secret_id.clone(),
-            recipient_fingerprint: fingerprint.clone(),
+            recipient_fingerprint: fingerprint,
             artifact_generation: 1,
             issued_at: now.saturating_sub(1),
             expires_at: now.checked_add(60),
@@ -860,24 +1228,14 @@ mod tests {
             &envelope_path,
             &nix_seal_manifest::sign_manifest(&manifest, &signer)?,
         )?;
-        std::fs::write(&template_path, b"password={{nix-seal:password-base64}}\n")?;
-        let owner = uzers::get_user_by_uid(uzers::get_current_uid())
-            .and_then(|user| user.name().to_str().map(str::to_owned))
-            .ok_or("current user is not resolvable")?;
-        let group = uzers::get_group_by_gid(uzers::get_current_gid())
-            .and_then(|group| group.name().to_str().map(str::to_owned))
-            .ok_or("current group is not resolvable")?;
-        let mut spec = nix_seal_runtime::ActivationSpecV1 {
+        let mut spec = nix_seal_runtime::ActivationSpecV2 {
             schema: nix_seal_runtime::ACTIVATION_SCHEMA.to_owned(),
             runtime_root: runtime_root.clone(),
             runtime_generation: None,
-            plan_hash,
+            plan: plan_path,
             target_id,
-            recipient_fingerprint: fingerprint,
             allowed_clock_skew: 0,
-            approval_threshold: 1,
-            trusted_keys: vec![signer.encode_public()],
-            artifacts: vec![nix_seal_runtime::ActivationArtifactSpecV1 {
+            artifacts: vec![nix_seal_runtime::ActivationArtifactSpecV2 {
                 ciphertext: ciphertext_path,
                 envelope: envelope_path,
                 secret_id: secret_id.clone(),
@@ -889,7 +1247,7 @@ mod tests {
             }],
             templates: vec![nix_seal_runtime::ActivationTemplateSpecV1 {
                 source: template_path,
-                template_id: nix_seal_core::Id::parse("application/config")?,
+                template_id,
                 placeholders: BTreeMap::from([(
                     "password-base64".to_owned(),
                     nix_seal_runtime::TemplatePlaceholderSpecV1 {
@@ -912,23 +1270,6 @@ mod tests {
             },
             false,
         )?;
-        let actions = nix_seal_runtime::PostSwitchSpecV1 {
-            executable: temporary.path().join("missing-service-manager"),
-            manager: nix_seal_runtime::ServiceManagerV1::SystemdSystem,
-            reload_units: Vec::new(),
-            restart_units: vec!["example.service".to_owned()],
-            timeout_seconds: 1,
-        };
-        spec.post_switch = Some(actions);
-        std::fs::write(&spec_path, serde_json::to_vec(&spec)?)?;
-        run_activate(
-            &ActivateArgs {
-                spec: spec_path,
-                identity: identity_path,
-                runtime_root: None,
-            },
-            false,
-        )?;
         assert_eq!(
             std::fs::read(runtime_root.join("current/db/password"))?,
             b"cli-activation-canary"
@@ -936,6 +1277,28 @@ mod tests {
         assert_eq!(
             std::fs::read(runtime_root.join("current/templates/application/config"))?,
             b"password=Y2xpLWFjdGl2YXRpb24tY2FuYXJ5\n"
+        );
+        spec.artifacts[0].mode = "0600".to_owned();
+        std::fs::write(&spec_path, serde_json::to_vec(&spec)?)?;
+        let error = match run_activate(
+            &ActivateArgs {
+                spec: spec_path,
+                identity: identity_path,
+                runtime_root: None,
+            },
+            false,
+        ) {
+            Ok(()) => return Err("caller-supplied runtime policy drift was accepted".into()),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("differs from the canonical plan")
+        );
+        assert_eq!(
+            std::fs::read(runtime_root.join("current/db/password"))?,
+            b"cli-activation-canary"
         );
         Ok(())
     }

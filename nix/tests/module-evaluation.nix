@@ -12,14 +12,15 @@ let
   templateSource = pkgs.writeText "nix-seal-test-template" ''
     password={{nix-seal:password}}
   '';
+  planFile = pkgs.writeText "nix-seal-test-plan-v1.json" ''
+    {"schema":"nix-seal.plan.v1"}
+  '';
   common = {
     nixSeal = {
       enable = true;
       targetId = "host.test";
       identityFile = "/run/keys/nix-seal-target";
-      planHash = digest "0";
-      recipientFingerprint = digest "1";
-      trustedKeys = [ "nix-seal-ed25519-public-v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" ];
+      inherit planFile;
       secrets."db/password" = {
         inherit ciphertext envelope;
         sourceCiphertextHash = digest "2";
@@ -122,10 +123,16 @@ let
         --arg manager ${lib.escapeShellArg manager} \
         --arg owner ${lib.escapeShellArg owner} \
         --arg group ${lib.escapeShellArg group} \
+        --arg planFile ${lib.escapeShellArg (toString planFile)} \
         --arg templateSource ${lib.escapeShellArg (toString templateSource)} '
-        .schema == "nix-seal.activation.v1" and
+        .schema == "nix-seal.activation.v2" and
         .targetId == "host.test" and
-        .approvalThreshold == 1 and
+        .plan == $planFile and
+        (has("planHash") | not) and
+        (has("targetPolicyHash") | not) and
+        (has("recipientFingerprint") | not) and
+        (has("trustedKeys") | not) and
+        (has("approvalThreshold") | not) and
         (.artifacts | length) == 1 and
         (.templates | length) == 1 and
         .artifacts[0].secretId == "db/password" and

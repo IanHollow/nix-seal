@@ -10,9 +10,9 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Exact artifact schema accepted by this implementation.
-pub const ARTIFACT_SCHEMA: &str = "nix-seal.artifact.v1";
+pub const ARTIFACT_SCHEMA: &str = "nix-seal.artifact.v2";
 /// DSSE payload type for target manifests.
-pub const PAYLOAD_TYPE: &str = "application/vnd.nix-seal.target-manifest.v1+json";
+pub const PAYLOAD_TYPE: &str = "application/vnd.nix-seal.target-manifest.v2+json";
 /// On-disk private signing-key prefix.
 pub const PRIVATE_KEY_PREFIX: &str = "NIX-SEAL-ED25519-PRIVATE-v1:";
 /// Public verification-key prefix used in plans and files.
@@ -23,13 +23,15 @@ const MAX_SIGNATURES: usize = 256;
 /// Public metadata cryptographically bound to one target ciphertext.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct TargetManifestV1 {
+pub struct TargetManifestV2 {
     /// Must equal [`ARTIFACT_SCHEMA`].
     pub schema: String,
     /// Version of the tool that produced this artifact.
     pub tool_version: String,
     /// Hash of canonical `plan.v1.json`.
     pub plan_hash: String,
+    /// Hash of the deterministic target policy derived from that exact plan.
+    pub target_policy_hash: String,
     /// Hash of the canonical administrator ciphertext.
     pub source_ciphertext_hash: String,
     /// Hash of the target ciphertext transported to activation.
@@ -132,6 +134,8 @@ pub struct ExpectedBinding<'a> {
     pub tool_version: &'a str,
     /// Expected plan hash.
     pub plan_hash: &'a str,
+    /// Expected deterministic target policy hash.
+    pub target_policy_hash: &'a str,
     /// Expected canonical source hash.
     pub source_ciphertext_hash: &'a str,
     /// Hash freshly calculated from transported artifact bytes.
@@ -154,7 +158,7 @@ pub struct ExpectedBinding<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedManifest {
     /// Authenticated payload.
-    pub manifest: TargetManifestV1,
+    pub manifest: TargetManifestV2,
     /// Trusted key IDs that supplied valid signatures.
     pub signers: BTreeSet<String>,
 }
@@ -265,7 +269,7 @@ fn key_id(key: &VerifyingKey) -> String {
 
 /// Creates an envelope with one signature.
 pub fn sign_manifest(
-    manifest: &TargetManifestV1,
+    manifest: &TargetManifestV2,
     key: &ApprovalSigningKey,
 ) -> Result<SignedEnvelopeV1, ManifestError> {
     validate_manifest_structure(manifest)?;
@@ -345,7 +349,7 @@ pub fn verify(
 
 fn decode_envelope(
     envelope: &SignedEnvelopeV1,
-) -> Result<(TargetManifestV1, Vec<u8>, Vec<u8>), ManifestError> {
+) -> Result<(TargetManifestV2, Vec<u8>, Vec<u8>), ManifestError> {
     if envelope.payload_type != PAYLOAD_TYPE {
         return Err(ManifestError::Version);
     }
@@ -358,7 +362,7 @@ fn decode_envelope(
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(ManifestError::Limit);
     }
-    let manifest: TargetManifestV1 =
+    let manifest: TargetManifestV2 =
         serde_json::from_slice(&payload).map_err(|_| ManifestError::Json)?;
     validate_manifest_structure(&manifest)?;
     let canonical = serde_jcs::to_vec(&manifest).map_err(|_| ManifestError::Json)?;
@@ -369,11 +373,12 @@ fn decode_envelope(
     Ok((manifest, payload, message))
 }
 
-fn validate_manifest_structure(manifest: &TargetManifestV1) -> Result<(), ManifestError> {
+fn validate_manifest_structure(manifest: &TargetManifestV2) -> Result<(), ManifestError> {
     if manifest.schema != ARTIFACT_SCHEMA || manifest.tool_version.is_empty() {
         return Err(ManifestError::Version);
     }
     if !is_digest(&manifest.plan_hash)
+        || !is_digest(&manifest.target_policy_hash)
         || !is_digest(&manifest.source_ciphertext_hash)
         || !is_digest(&manifest.artifact_ciphertext_hash)
         || !is_digest(&manifest.recipient_fingerprint)
@@ -391,7 +396,7 @@ fn validate_manifest_structure(manifest: &TargetManifestV1) -> Result<(), Manife
 }
 
 fn validate_expected(
-    manifest: &TargetManifestV1,
+    manifest: &TargetManifestV2,
     expected: &ExpectedBinding<'_>,
 ) -> Result<(), ManifestError> {
     let latest_issued = expected
@@ -407,6 +412,7 @@ fn validate_expected(
     }
     if manifest.tool_version != expected.tool_version
         || manifest.plan_hash != expected.plan_hash
+        || manifest.target_policy_hash != expected.target_policy_hash
         || manifest.source_ciphertext_hash != expected.source_ciphertext_hash
         || manifest.artifact_ciphertext_hash != expected.artifact_ciphertext_hash
         || &manifest.target_id != expected.target_id
@@ -451,12 +457,13 @@ fn pae(payload_type: &[u8], payload: &[u8]) -> Result<Vec<u8>, ManifestError> {
 mod tests {
     use super::*;
 
-    fn manifest() -> TargetManifestV1 {
+    fn manifest() -> TargetManifestV2 {
         let digest = "0".repeat(64);
-        TargetManifestV1 {
+        TargetManifestV2 {
             schema: ARTIFACT_SCHEMA.to_owned(),
             tool_version: "0.1.0-alpha.1".to_owned(),
             plan_hash: digest.clone(),
+            target_policy_hash: digest.clone(),
             source_ciphertext_hash: digest.clone(),
             artifact_ciphertext_hash: digest.clone(),
             target_id: Id::parse("host.web").unwrap_or_else(|error| unreachable!("{error}")),
@@ -468,10 +475,11 @@ mod tests {
         }
     }
 
-    fn expected(manifest: &TargetManifestV1) -> ExpectedBinding<'_> {
+    fn expected(manifest: &TargetManifestV2) -> ExpectedBinding<'_> {
         ExpectedBinding {
             tool_version: &manifest.tool_version,
             plan_hash: &manifest.plan_hash,
+            target_policy_hash: &manifest.target_policy_hash,
             source_ciphertext_hash: &manifest.source_ciphertext_hash,
             artifact_ciphertext_hash: &manifest.artifact_ciphertext_hash,
             target_id: &manifest.target_id,
@@ -530,6 +538,14 @@ mod tests {
             Err(ManifestError::Binding)
         );
 
+        let different_policy_hash = "f".repeat(64);
+        let mut policy_substituted = expected(&manifest);
+        policy_substituted.target_policy_hash = &different_policy_hash;
+        assert_eq!(
+            verify(&envelope, &trusted, 1, &policy_substituted),
+            Err(ManifestError::Binding)
+        );
+
         let mut expired = expected(&manifest);
         expired.now = 200;
         assert_eq!(
@@ -544,7 +560,7 @@ mod tests {
             Err(ManifestError::Version)
         );
 
-        let old = TargetManifestV1 {
+        let old = TargetManifestV2 {
             tool_version: "0.0.1".to_owned(),
             ..manifest.clone()
         };

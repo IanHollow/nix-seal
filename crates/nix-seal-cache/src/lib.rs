@@ -12,7 +12,7 @@ use thiserror::Error;
 
 const MAX_CIPHERTEXT_BYTES: u64 = 70 * 1024 * 1024;
 const MAX_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
-const ARTIFACT_FORMAT: &str = "nix-seal.cache-artifact.v1";
+const ARTIFACT_FORMAT: &str = "nix-seal.cache-artifact.v2";
 
 /// Cache error that never includes cache contents.
 #[derive(Debug, Error)]
@@ -42,23 +42,39 @@ pub enum CacheError {
 pub struct ArtifactAddress {
     /// Canonical plan hash.
     pub plan_hash: String,
+    /// Deterministic target-policy projection hash.
+    pub target_policy_hash: String,
     /// Canonical source ciphertext hash.
     pub source_ciphertext_hash: String,
     /// Normalized recipient fingerprint.
     pub recipient_fingerprint: String,
+    /// Target ID bound by the stored envelope.
+    pub target_id: String,
+    /// Secret ID bound by the stored envelope.
+    pub secret_id: String,
+    /// Monotonic artifact generation bound by the stored envelope.
+    pub artifact_generation: u64,
 }
 
 impl ArtifactAddress {
     /// Constructs a validated v1 address.
     pub fn new(
         plan_hash: impl Into<String>,
+        target_policy_hash: impl Into<String>,
         source_ciphertext_hash: impl Into<String>,
         recipient_fingerprint: impl Into<String>,
+        target_id: impl Into<String>,
+        secret_id: impl Into<String>,
+        artifact_generation: u64,
     ) -> Result<Self, CacheError> {
         let address = Self {
             plan_hash: plan_hash.into(),
+            target_policy_hash: target_policy_hash.into(),
             source_ciphertext_hash: source_ciphertext_hash.into(),
             recipient_fingerprint: recipient_fingerprint.into(),
+            target_id: target_id.into(),
+            secret_id: secret_id.into(),
+            artifact_generation,
         };
         address.validate()?;
         Ok(address)
@@ -68,34 +84,56 @@ impl ArtifactAddress {
     pub fn key(&self) -> Result<String, CacheError> {
         self.validate()?;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"nix-seal.cache-address.v1\0");
+        hasher.update(b"nix-seal.cache-address.v2\0");
         for field in [
             ARTIFACT_FORMAT,
             &self.plan_hash,
+            &self.target_policy_hash,
             &self.source_ciphertext_hash,
             &self.recipient_fingerprint,
+            &self.target_id,
+            &self.secret_id,
         ] {
             let length = u64::try_from(field.len()).map_err(|_| CacheError::InvalidAddress)?;
             hasher.update(&length.to_be_bytes());
             hasher.update(field.as_bytes());
         }
+        hasher.update(&self.artifact_generation.to_be_bytes());
         Ok(hasher.finalize().to_hex().to_string())
     }
 
     fn validate(&self) -> Result<(), CacheError> {
         if [
             &self.plan_hash,
+            &self.target_policy_hash,
             &self.source_ciphertext_hash,
             &self.recipient_fingerprint,
         ]
         .into_iter()
         .all(|value| is_digest(value))
+            && is_id(&self.target_id)
+            && is_id(&self.secret_id)
+            && self.artifact_generation > 0
         {
             Ok(())
         } else {
             Err(CacheError::InvalidAddress)
         }
     }
+}
+
+fn is_id(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && value.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != ".."
+                && segment.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'_' | b'-')
+                })
+        })
 }
 
 /// Verified public metadata for one cached target artifact bundle.
@@ -368,7 +406,21 @@ mod tests {
         let digest = cache.put(b"ciphertext only")?;
         assert_eq!(cache.get(&digest)?, b"ciphertext only");
 
-        let address = ArtifactAddress::new("0".repeat(64), "1".repeat(64), "2".repeat(64))?;
+        let address = ArtifactAddress::new(
+            "0".repeat(64),
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64),
+            "host.test",
+            "db/password",
+            1,
+        )?;
+        let mut other_target = address.clone();
+        other_target.target_id = "host.other".to_owned();
+        assert_ne!(address.key()?, other_target.key()?);
+        let mut other_generation = address.clone();
+        other_generation.artifact_generation = 2;
+        assert_ne!(address.key()?, other_generation.key()?);
         let artifact = cache.put_artifact(&address, b"age ciphertext".as_slice(), b"envelope")?;
         assert_eq!(
             artifact.artifact_ciphertext_hash,
@@ -383,7 +435,15 @@ mod tests {
             Err(CacheError::ArtifactExists)
         ));
 
-        let concurrent = ArtifactAddress::new("3".repeat(64), "4".repeat(64), "5".repeat(64))?;
+        let concurrent = ArtifactAddress::new(
+            "4".repeat(64),
+            "5".repeat(64),
+            "6".repeat(64),
+            "7".repeat(64),
+            "host.other",
+            "api/token",
+            2,
+        )?;
         let cache = Arc::new(cache);
         let barrier = Arc::new(Barrier::new(4));
         let mut handles = Vec::new();

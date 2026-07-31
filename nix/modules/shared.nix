@@ -52,14 +52,11 @@ let
     explicitRestartUnits ++ map (binding: binding.unit) serviceCredentialBindings
   );
   activationDocument = {
-    schema = "nix-seal.activation.v1";
+    schema = "nix-seal.activation.v2";
     runtimeRoot = cfg.runtimeDirectory;
-    inherit (cfg) planHash;
+    plan = toString cfg.planFile;
     inherit (cfg) targetId;
-    inherit (cfg) recipientFingerprint;
     inherit (cfg) allowedClockSkew;
-    inherit (cfg) approvalThreshold;
-    inherit (cfg) trustedKeys;
     artifacts = lib.mapAttrsToList (name: secret: {
       ciphertext = toString secret.ciphertext;
       envelope = toString secret.envelope;
@@ -109,25 +106,10 @@ in
       default = null;
       description = "Runtime path to the target age identity. This path is not copied to the Nix store.";
     };
-    planHash = mkOption {
-      type = types.nullOr digestType;
+    planFile = mkOption {
+      type = types.nullOr types.path;
       default = null;
-      description = "Canonical plan hash bound into every accepted artifact.";
-    };
-    recipientFingerprint = mkOption {
-      type = types.nullOr digestType;
-      default = null;
-      description = "Fingerprint of the configured target recipient.";
-    };
-    trustedKeys = mkOption {
-      type = types.listOf types.str;
-      default = [ ];
-      description = "Encoded public artifact-approval keys.";
-    };
-    approvalThreshold = mkOption {
-      type = types.ints.positive;
-      default = 1;
-      description = "Required number of distinct trusted artifact approvals.";
+      description = "Canonical compiled plan.v1 JSON used to derive and verify target policy.";
     };
     allowedClockSkew = mkOption {
       type = types.ints.between 0 86400;
@@ -306,7 +288,7 @@ in
     activationSpec = mkOption {
       type = types.path;
       readOnly = true;
-      default = pkgs.writeText "nix-seal-activation-v1.json" (builtins.toJSON activationDocument);
+      default = pkgs.writeText "nix-seal-activation-v2.json" (builtins.toJSON activationDocument);
       description = "Strict public activation document consumed by the Rust runtime.";
     };
   };
@@ -328,12 +310,8 @@ in
             message = "nixSeal.identityFile must name an out-of-store target identity when nix-seal is enabled";
           }
           {
-            assertion = cfg.planHash != null && cfg.recipientFingerprint != null;
-            message = "nixSeal.planHash and recipientFingerprint must be explicitly configured";
-          }
-          {
-            assertion = cfg.trustedKeys != [ ] && cfg.approvalThreshold <= builtins.length cfg.trustedKeys;
-            message = "nixSeal approvalThreshold must be satisfied by configured trustedKeys";
+            assertion = cfg.planFile != null;
+            message = "nixSeal.planFile must provide canonical compiled plan.v1 JSON";
           }
           {
             assertion = configuredSecrets != { };

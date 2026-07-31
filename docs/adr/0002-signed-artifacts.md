@@ -8,10 +8,12 @@ keys are separate from decryption keys. Default policy requires one trusted
 signature and supports N-of-M distinct signers. This authenticates the artifact,
 not repository or deployment authorization.
 
-The artifact v1 payload uses RFC 8785 canonical JSON inside the DSSE pre-
+The artifact v2 payload uses RFC 8785 canonical JSON inside the DSSE pre-
 authentication encoding. Verification is fail-closed: the caller supplies the
-expected plan, source and artifact hashes, target, secret, recipient,
-generation, tool version, and time. Unknown and duplicate signers, non-canonical
-payloads, expired/future envelopes, threshold failures, and any binding mismatch
-are rejected before decryption. Ed25519 is isolated in `nix-seal-manifest`; SSH
-signing remains pending.
+expected plan and target-policy hashes, source and artifact hashes, target,
+secret, recipient, generation, tool version, and time. The target-policy hash
+binds the artifact to the exact plan-derived recipient, authorized secret set,
+per-secret approval policy, runtime permissions, templates, and service actions.
+Unknown and duplicate signers, non-canonical payloads, expired/future envelopes,
+threshold failures, and any binding mismatch are rejected before decryption.
+Ed25519 is isolated in `nix-seal-manifest`; SSH signing remains pending.

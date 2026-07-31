@@ -8,6 +8,10 @@ public = "age1replace-with-a-public-recipient"
 kind = "target"
 public = "age1replace-with-a-public-recipient"
 
+[identities.release]
+kind = "signer"
+public = "nix-seal-ed25519-v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
 [targets.server]
 kind = "nixOs"
 system = "x86_64-linux"

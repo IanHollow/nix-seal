@@ -5,7 +5,7 @@ use nix_seal_cache::{ArtifactAddress, ArtifactRecord, Cache, CacheError};
 use nix_seal_core::Id;
 use nix_seal_manifest::{
     ARTIFACT_SCHEMA, ApprovalSigningKey, ExpectedBinding, ManifestError, SignedEnvelopeV1,
-    TargetManifestV1, TrustedKeys,
+    TargetManifestV2, TrustedKeys,
 };
 use secrecy::SecretString;
 use std::{
@@ -28,6 +28,8 @@ pub struct RekeyRequest<'a> {
     pub target_recipient: &'a str,
     /// Canonical plan hash.
     pub plan_hash: &'a str,
+    /// Hash of the deterministic target policy derived from the plan.
+    pub target_policy_hash: &'a str,
     /// Bound target ID.
     pub target_id: &'a Id,
     /// Bound secret ID.
@@ -109,8 +111,12 @@ pub fn rekey(cache: &Cache, request: &RekeyRequest<'_>) -> Result<RekeyResult, R
     let recipient_fingerprint = nix_seal_crypto::recipient_fingerprint(request.target_recipient)?;
     let address = ArtifactAddress::new(
         request.plan_hash,
+        request.target_policy_hash,
         &source_ciphertext_hash,
         &recipient_fingerprint,
+        request.target_id.as_str(),
+        request.secret_id.as_str(),
+        request.artifact_generation,
     )?;
 
     if let Some(record) = cache.load_artifact(&address)? {
@@ -139,10 +145,11 @@ pub fn rekey(cache: &Cache, request: &RekeyRequest<'_>) -> Result<RekeyResult, R
     let artifact_ciphertext_hash =
         copy_and_hash_bounded(target.as_file_mut(), std::io::sink(), MAX_CIPHERTEXT_BYTES)?;
 
-    let manifest = TargetManifestV1 {
+    let manifest = TargetManifestV2 {
         schema: ARTIFACT_SCHEMA.to_owned(),
         tool_version: request.tool_version.to_owned(),
         plan_hash: request.plan_hash.to_owned(),
+        target_policy_hash: request.target_policy_hash.to_owned(),
         source_ciphertext_hash: source_ciphertext_hash.clone(),
         artifact_ciphertext_hash: artifact_ciphertext_hash.clone(),
         target_id: request.target_id.clone(),
@@ -199,6 +206,7 @@ fn authenticate_record(
     let expected = ExpectedBinding {
         tool_version: request.tool_version,
         plan_hash: request.plan_hash,
+        target_policy_hash: request.target_policy_hash,
         source_ciphertext_hash: &source_ciphertext_hash,
         artifact_ciphertext_hash: &record.artifact_ciphertext_hash,
         target_id: request.target_id,
@@ -302,6 +310,8 @@ mod tests {
     use std::fs::OpenOptions;
 
     const PLAN_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const TARGET_POLICY_HASH: &str =
+        "3333333333333333333333333333333333333333333333333333333333333333";
 
     fn request<'a>(
         source: &'a Path,
@@ -316,6 +326,7 @@ mod tests {
             administrator_identity,
             target_recipient,
             plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
             target_id,
             secret_id,
             artifact_generation: 1,

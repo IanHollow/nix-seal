@@ -17,11 +17,15 @@ fsynced and published under an immutable name before an atomic `current` symlink
 switch. Authentication or decryption failure drops the transaction and leaves
 the previous generation active.
 
-Nix modules emit a strict `nix-seal.activation.v1` public document containing
-only ciphertext paths, signed-envelope paths, hashes, target bindings, public
-approval keys, and runtime policy. The target identity is configured as a string
-runtime path and is never coerced to a Nix path or copied into the store. The
-internal Rust `activate` command loads that identity with no-follow,
+Nix modules emit a strict `nix-seal.activation.v2` public document containing a
+canonical plan path, target ID, ciphertext/envelope paths, source hashes, and
+runtime materialization metadata. Plan hash, target-policy hash, recipient, and
+per-secret approval keys and thresholds are not separately configurable: the
+Rust bridge deterministically derives them from the validated plan and rejects
+any artifact set, permissions, template declaration, or service action that
+differs from that target projection. The target identity is configured as a
+string runtime path and is never coerced to a Nix path or copied into the store.
+The internal Rust `activate` command loads that identity with no-follow,
 single-link, owner, and restrictive-mode checks. Runtime generation numbers are
 allocated while the activation lock is held, avoiding collisions between
 concurrent or repeated activations.

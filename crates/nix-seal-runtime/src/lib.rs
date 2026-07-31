@@ -4,6 +4,7 @@
 use fs2::FileExt;
 use nix_seal_core::Id;
 use nix_seal_manifest::{ExpectedBinding, SignedEnvelopeV1, TrustedKeys};
+use schemars::JsonSchema;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,12 +25,12 @@ const MAX_ENVELOPE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_TEMPLATE_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_TEMPLATE_OUTPUT_BYTES: u64 = 128 * 1024 * 1024;
 /// Exact schema accepted for public activation metadata.
-pub const ACTIVATION_SCHEMA: &str = "nix-seal.activation.v1";
+pub const ACTIVATION_SCHEMA: &str = "nix-seal.activation.v2";
 
 /// Strict public activation document. It may enter the Nix store.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ActivationSpecV1 {
+pub struct ActivationSpecV2 {
     /// Must equal [`ACTIVATION_SCHEMA`].
     pub schema: String,
     /// Restrictive runtime root.
@@ -37,21 +38,15 @@ pub struct ActivationSpecV1 {
     /// Optional explicit runtime generation; omission safely allocates the next.
     #[serde(default)]
     pub runtime_generation: Option<u64>,
-    /// Exact compiled plan hash.
-    pub plan_hash: String,
+    /// Absolute path to canonical compiled `plan.v1` public JSON.
+    pub plan: PathBuf,
     /// Exact target binding.
     pub target_id: Id,
-    /// Fingerprint of the target recipient corresponding to the private identity.
-    pub recipient_fingerprint: String,
     /// Maximum accepted issue-time lead.
     #[serde(default = "default_clock_skew")]
     pub allowed_clock_skew: u64,
-    /// Required number of distinct trusted approvals.
-    pub approval_threshold: usize,
-    /// Encoded public approval keys.
-    pub trusted_keys: Vec<String>,
     /// Complete all-or-nothing artifact batch.
-    pub artifacts: Vec<ActivationArtifactSpecV1>,
+    pub artifacts: Vec<ActivationArtifactSpecV2>,
     /// Public templates rendered only after every secret decrypts successfully.
     #[serde(default)]
     pub templates: Vec<ActivationTemplateSpecV1>,
@@ -62,7 +57,7 @@ pub struct ActivationSpecV1 {
 }
 
 /// Supported platform service managers for post-switch actions.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ServiceManagerV1 {
     /// System systemd manager.
@@ -76,7 +71,7 @@ pub enum ServiceManagerV1 {
 }
 
 /// Strict public service-action declaration.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PostSwitchSpecV1 {
     /// Absolute service-manager executable path.
@@ -94,10 +89,10 @@ pub struct PostSwitchSpecV1 {
     pub timeout_seconds: u64,
 }
 
-/// One public artifact entry in [`ActivationSpecV1`].
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// One public artifact entry in [`ActivationSpecV2`].
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ActivationArtifactSpecV1 {
+pub struct ActivationArtifactSpecV2 {
     /// Target-encrypted standard age file.
     pub ciphertext: PathBuf,
     /// Signed envelope file.
@@ -117,7 +112,7 @@ pub struct ActivationArtifactSpecV1 {
 }
 
 /// One public runtime template declaration.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ActivationTemplateSpecV1 {
     /// Public UTF-8 template source. It may enter the Nix store.
@@ -142,7 +137,7 @@ impl ActivationTemplateSpecV1 {
 }
 
 /// One declared template placeholder.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TemplatePlaceholderSpecV1 {
     /// Activated secret used for this placeholder.
@@ -152,7 +147,7 @@ pub struct TemplatePlaceholderSpecV1 {
 }
 
 /// Supported secret-to-text template transformations.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TemplateEncodingV1 {
     /// Require valid UTF-8 and copy it without modification.
@@ -163,7 +158,7 @@ pub enum TemplateEncodingV1 {
     Hex,
 }
 
-impl ActivationArtifactSpecV1 {
+impl ActivationArtifactSpecV2 {
     /// Returns the validated numeric runtime mode.
     pub fn parsed_mode(&self) -> Result<u32, RuntimeError> {
         parse_mode(&self.mode)
@@ -178,22 +173,14 @@ const fn default_action_timeout() -> u64 {
     30
 }
 
-impl ActivationSpecV1 {
+impl ActivationSpecV2 {
     /// Enforces structural and resource constraints before filesystem access.
     pub fn validate(&self) -> Result<(), RuntimeError> {
         if self.schema != ACTIVATION_SCHEMA
             || !self.runtime_root.is_absolute()
+            || !self.plan.is_absolute()
             || self.runtime_generation == Some(0)
-            || !is_digest(&self.plan_hash)
-            || !is_digest(&self.recipient_fingerprint)
             || self.allowed_clock_skew > 86_400
-            || self.approval_threshold == 0
-            || self.approval_threshold > self.trusted_keys.len()
-            || self.trusted_keys.len() > 64
-            || self
-                .trusted_keys
-                .iter()
-                .any(|key| key.is_empty() || key.len() > 16 * 1024)
             || self.artifacts.is_empty()
             || self.artifacts.len() > 10_000
             || self.templates.len() > 1_024
@@ -239,6 +226,11 @@ impl ActivationSpecV1 {
     }
 }
 
+/// Returns the `JSON` Schema for the strict public activation document.
+pub fn activation_json_schema() -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&schemars::schema_for!(ActivationSpecV2))
+}
+
 impl PostSwitchSpecV1 {
     /// Enforces executable, unit-name, cardinality, and timeout bounds.
     pub fn validate(&self) -> Result<(), RuntimeError> {
@@ -276,6 +268,10 @@ pub struct ActivationArtifact<'a> {
     pub source_ciphertext_hash: &'a str,
     /// Exact policy-selected artifact generation.
     pub artifact_generation: u64,
+    /// Signer identities and encoded public keys derived from the plan.
+    pub approval_signers: &'a BTreeMap<Id, String>,
+    /// Required distinct signer threshold derived from the plan.
+    pub approval_threshold: usize,
     /// Restrictive runtime mode. Group/other access is rejected in v1.
     pub mode: u32,
     /// Existing operating-system account that owns the runtime file.
@@ -308,6 +304,8 @@ pub struct ActivationRequest<'a> {
     pub runtime_generation: Option<u64>,
     /// Exact local plan hash.
     pub plan_hash: &'a str,
+    /// Exact deterministic target policy hash.
+    pub target_policy_hash: &'a str,
     /// Exact local target ID.
     pub target_id: &'a Id,
     /// Target recipient fingerprint derived from the local target recipient.
@@ -318,10 +316,6 @@ pub struct ActivationRequest<'a> {
     pub now: u64,
     /// Maximum accepted clock lead for artifact issue times.
     pub allowed_clock_skew: u64,
-    /// Explicit trusted artifact-approval keys.
-    pub trusted_keys: &'a TrustedKeys,
-    /// Required number of distinct trusted approvals.
-    pub approval_threshold: usize,
     /// Target age identity. It is never persisted by activation.
     pub target_identity: &'a SecretString,
     /// Every artifact in the all-or-nothing generation.
@@ -438,6 +432,7 @@ fn prepare_artifacts<'a>(
         let expected = ExpectedBinding {
             tool_version: request.tool_version,
             plan_hash: request.plan_hash,
+            target_policy_hash: request.target_policy_hash,
             source_ciphertext_hash: artifact.source_ciphertext_hash,
             artifact_ciphertext_hash: &artifact_hash,
             target_id: request.target_id,
@@ -447,12 +442,11 @@ fn prepare_artifacts<'a>(
             now: request.now,
             allowed_clock_skew: request.allowed_clock_skew,
         };
-        nix_seal_manifest::verify(
-            &envelope,
-            request.trusted_keys,
-            request.approval_threshold,
-            &expected,
-        )?;
+        let mut trusted = TrustedKeys::new();
+        for encoded in artifact.approval_signers.values() {
+            trusted.insert_encoded(encoded)?;
+        }
+        nix_seal_manifest::verify(&envelope, &trusted, artifact.approval_threshold, &expected)?;
         prepared.push(PreparedArtifact {
             ciphertext,
             secret_id: artifact.secret_id,
@@ -1560,9 +1554,11 @@ fn set_file_mode(_file: &File, _mode: u32) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix_seal_manifest::{ARTIFACT_SCHEMA, ApprovalSigningKey, TargetManifestV1};
+    use nix_seal_manifest::{ARTIFACT_SCHEMA, ApprovalSigningKey, TargetManifestV2};
 
     const PLAN_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const TARGET_POLICY_HASH: &str =
+        "3333333333333333333333333333333333333333333333333333333333333333";
     const SOURCE_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
     struct Fixture {
@@ -1575,7 +1571,7 @@ mod tests {
         target_id: Id,
         secret_id: Id,
         fingerprint: String,
-        trusted: TrustedKeys,
+        approval_signers: BTreeMap<Id, String>,
         signing_key: ApprovalSigningKey,
         owner: String,
         group: String,
@@ -1599,10 +1595,11 @@ mod tests {
         let target_id = Id::parse("host.web")?;
         let secret_id = Id::parse("db/password")?;
         let signing_key = ApprovalSigningKey::generate()?;
-        let manifest = TargetManifestV1 {
+        let manifest = TargetManifestV2 {
             schema: ARTIFACT_SCHEMA.to_owned(),
             tool_version: "0.1.0-alpha.1".to_owned(),
             plan_hash: PLAN_HASH.to_owned(),
+            target_policy_hash: TARGET_POLICY_HASH.to_owned(),
             source_ciphertext_hash: SOURCE_HASH.to_owned(),
             artifact_ciphertext_hash: artifact_hash,
             target_id: target_id.clone(),
@@ -1614,8 +1611,8 @@ mod tests {
         };
         let signed = nix_seal_manifest::sign_manifest(&manifest, &signing_key)?;
         std::fs::write(&envelope, serde_json::to_vec(&signed)?)?;
-        let mut trusted = TrustedKeys::new();
-        trusted.insert_encoded(&signing_key.encode_public())?;
+        let approval_signers =
+            BTreeMap::from([(Id::parse("release-signer")?, signing_key.encode_public())]);
         let owner = uzers::get_user_by_uid(uzers::get_current_uid())
             .ok_or("current user is not resolvable")?
             .name()
@@ -1638,7 +1635,7 @@ mod tests {
             target_id,
             secret_id,
             fingerprint,
-            trusted,
+            approval_signers,
             signing_key,
             owner,
             group,
@@ -1656,6 +1653,8 @@ mod tests {
             secret_id,
             source_ciphertext_hash: SOURCE_HASH,
             artifact_generation: 1,
+            approval_signers: &fixture.approval_signers,
+            approval_threshold: 1,
             mode: 0o400,
             owner: &fixture.owner,
             group: &fixture.group,
@@ -1678,10 +1677,11 @@ mod tests {
         )?;
         output.sync_all()?;
         let artifact_hash = hash_bounded(&mut File::open(&ciphertext)?, MAX_CIPHERTEXT_BYTES)?;
-        let manifest = TargetManifestV1 {
+        let manifest = TargetManifestV2 {
             schema: ARTIFACT_SCHEMA.to_owned(),
             tool_version: "0.1.0-alpha.1".to_owned(),
             plan_hash: PLAN_HASH.to_owned(),
+            target_policy_hash: TARGET_POLICY_HASH.to_owned(),
             source_ciphertext_hash: SOURCE_HASH.to_owned(),
             artifact_ciphertext_hash: artifact_hash,
             target_id: fixture.target_id.clone(),
@@ -1721,13 +1721,12 @@ mod tests {
             runtime_root: &fixture.runtime,
             runtime_generation: None,
             plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
             tool_version: "0.1.0-alpha.1",
             now: 101,
             allowed_clock_skew: 0,
-            trusted_keys: &fixture.trusted,
-            approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
             templates: &[],
@@ -1800,13 +1799,12 @@ mod tests {
             runtime_root: &fixture.runtime,
             runtime_generation: None,
             plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
             tool_version: "0.1.0-alpha.1",
             now: 101,
             allowed_clock_skew: 0,
-            trusted_keys: &fixture.trusted,
-            approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
             templates: std::slice::from_ref(&template),
@@ -1848,6 +1846,8 @@ mod tests {
             secret_id: &binary_id,
             source_ciphertext_hash: SOURCE_HASH,
             artifact_generation: 1,
+            approval_signers: &fixture.approval_signers,
+            approval_threshold: 1,
             mode: 0o400,
             owner: &fixture.owner,
             group: &fixture.group,
@@ -1874,13 +1874,12 @@ mod tests {
             runtime_root: &fixture.runtime,
             runtime_generation: None,
             plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
             tool_version: "0.1.0-alpha.1",
             now: 101,
             allowed_clock_skew: 0,
-            trusted_keys: &fixture.trusted,
-            approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
             templates: std::slice::from_ref(&valid_template),
@@ -1950,13 +1949,12 @@ mod tests {
             runtime_root: &fixture.runtime,
             runtime_generation: None,
             plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
             tool_version: "0.1.0-alpha.1",
             now: 101,
             allowed_clock_skew: 0,
-            trusted_keys: &fixture.trusted,
-            approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
             templates: &[],
@@ -1976,7 +1974,7 @@ mod tests {
     fn activation_spec_is_strict_and_rejects_duplicate_destinations()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture()?;
-        let artifact = ActivationArtifactSpecV1 {
+        let artifact = ActivationArtifactSpecV2 {
             ciphertext: fixture.ciphertext.clone(),
             envelope: fixture.envelope.clone(),
             secret_id: fixture.secret_id.clone(),
@@ -2000,16 +1998,13 @@ mod tests {
             owner: fixture.owner.clone(),
             group: fixture.group.clone(),
         };
-        let spec = ActivationSpecV1 {
+        let spec = ActivationSpecV2 {
             schema: ACTIVATION_SCHEMA.to_owned(),
             runtime_root: fixture.runtime.clone(),
             runtime_generation: None,
-            plan_hash: PLAN_HASH.to_owned(),
+            plan: fixture.temporary.path().join("plan.v1.json"),
             target_id: fixture.target_id,
-            recipient_fingerprint: fixture.fingerprint,
             allowed_clock_skew: 300,
-            approval_threshold: 1,
-            trusted_keys: vec!["public-key-placeholder".to_owned()],
             artifacts: vec![artifact.clone()],
             templates: vec![template],
             post_switch: None,
@@ -2056,7 +2051,7 @@ mod tests {
             .as_object_mut()
             .ok_or("spec was not an object")?
             .insert("unknown".to_owned(), serde_json::Value::Bool(true));
-        assert!(serde_json::from_value::<ActivationSpecV1>(encoded).is_err());
+        assert!(serde_json::from_value::<ActivationSpecV2>(encoded).is_err());
         let mut excessive_skew = spec;
         excessive_skew.allowed_clock_skew = 86_401;
         assert!(matches!(
@@ -2100,13 +2095,12 @@ mod tests {
             runtime_root: &fixture.runtime,
             runtime_generation: None,
             plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
             tool_version: "0.1.0-alpha.1",
             now: 101,
             allowed_clock_skew: 0,
-            trusted_keys: &fixture.trusted,
-            approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
             templates: &[],
@@ -2147,13 +2141,12 @@ mod tests {
             runtime_root: &fixture.runtime,
             runtime_generation: Some(2),
             plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
             tool_version: "0.1.0-alpha.1",
             now: 101,
             allowed_clock_skew: 0,
-            trusted_keys: &fixture.trusted,
-            approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
             templates: &[],
@@ -2188,13 +2181,12 @@ mod tests {
             runtime_root: &fixture.runtime,
             runtime_generation: Some(1),
             plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
             tool_version: "0.1.0-alpha.1",
             now: 101,
             allowed_clock_skew: 0,
-            trusted_keys: &fixture.trusted,
-            approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: &artifacts,
             templates: &[],
@@ -2223,13 +2215,12 @@ mod tests {
             runtime_root: &fixture.runtime,
             runtime_generation: Some(2),
             plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
             tool_version: "0.1.0-alpha.1",
             now: 101,
             allowed_clock_skew: 0,
-            trusted_keys: &fixture.trusted,
-            approval_threshold: 1,
             target_identity: &wrong_identity,
             artifacts: std::slice::from_ref(&artifact),
             templates: &[],
@@ -2260,13 +2251,12 @@ mod tests {
             runtime_root: &fixture.runtime,
             runtime_generation: Some(1),
             plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
             target_id: &fixture.target_id,
             recipient_fingerprint: &fixture.fingerprint,
             tool_version: "0.1.0-alpha.1",
             now: 101,
             allowed_clock_skew: 0,
-            trusted_keys: &fixture.trusted,
-            approval_threshold: 1,
             target_identity: &fixture.target_identity,
             artifacts: std::slice::from_ref(&artifact),
             templates: &[],

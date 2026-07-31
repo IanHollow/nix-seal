@@ -13,7 +13,10 @@ The v1 implementation streams administrator plaintext directly from the age
 decryptor into target age encryption. It copies canonical ciphertext into a
 private transaction file so its signed source hash and decrypted bytes cannot
 diverge during a concurrent source change. Target ciphertext and its signed
-manifest are committed as one directory under a domain-separated address of the
-plan hash, source ciphertext hash, recipient fingerprint, and cache format.
+manifest are committed as one directory. Cache address v2 is domain-separated
+over the cache format, plan and target-policy hashes, source ciphertext hash,
+recipient fingerprint, target and secret IDs, and artifact generation. Including
+all target-bound envelope identity fields prevents otherwise-valid targets that
+share a recipient or source from colliding on one incompatible signed envelope.
 Existing entries are reused only after recalculating the ciphertext hash and
 verifying every signed binding. No plaintext transaction file is created.
