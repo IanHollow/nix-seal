@@ -74,9 +74,7 @@
     }
   },
   "additionalProperties": false,
-  "required": [
-    "schema"
-  ],
+  "required": ["schema"],
   "$defs": {
     "ActivationPhase": {
       "description": "Activation lifecycle phase.",
@@ -123,10 +121,7 @@
         }
       },
       "additionalProperties": false,
-      "required": [
-        "threshold",
-        "signers"
-      ]
+      "required": ["threshold", "signers"]
     },
     "Backend": {
       "description": "Backend declaration.",
@@ -146,9 +141,7 @@
         }
       },
       "additionalProperties": false,
-      "required": [
-        "kind"
-      ]
+      "required": ["kind"]
     },
     "BackendKind": {
       "description": "Supported backend kinds.",
@@ -200,17 +193,11 @@
         },
         "validation": {
           "description": "Public validation fingerprint.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       },
       "additionalProperties": false,
-      "required": [
-        "executable",
-        "outputs"
-      ]
+      "required": ["executable", "outputs"]
     },
     "Group": {
       "description": "Named group of IDs.",
@@ -245,10 +232,7 @@
         }
       },
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "public"
-      ]
+      "required": ["kind", "public"]
     },
     "IdentityKind": {
       "description": "Identity role.",
@@ -286,45 +270,27 @@
       "properties": {
         "classification": {
           "description": "Public classification.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "contact": {
           "description": "Responsible contact.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "createdAt": {
           "description": "ISO-8601 creation time.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "expiresAt": {
           "description": "ISO-8601 expiry time.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "purpose": {
           "description": "Non-secret purpose.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "rotateAfterDays": {
           "description": "Rotation interval in days.",
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "format": "uint32",
           "minimum": 0
         }
@@ -365,11 +331,7 @@
         }
       },
       "additionalProperties": false,
-      "required": [
-        "owner",
-        "group",
-        "mode"
-      ]
+      "required": ["owner", "group", "mode"]
     },
     "Secret": {
       "description": "Secret policy. It contains paths and metadata, never plaintext.",
@@ -441,9 +403,7 @@
         }
       },
       "additionalProperties": false,
-      "required": [
-        "source"
-      ]
+      "required": ["source"]
     },
     "Target": {
       "description": "Target platform consumer.",
@@ -471,18 +431,11 @@
         },
         "username": {
           "description": "Optional Home Manager user.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         }
       },
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "system",
-        "identity"
-      ]
+      "required": ["kind", "system", "identity"]
     },
     "TargetKind": {
       "description": "Supported integration type.",
@@ -532,10 +485,7 @@
         }
       },
       "additionalProperties": false,
-      "required": [
-        "source",
-        "secrets"
-      ]
+      "required": ["source", "secrets"]
     }
   }
 }
