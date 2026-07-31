@@ -95,7 +95,7 @@
         }
         // import ./nix/tests/module-evaluation.nix {
           inherit inputs system pkgs;
-          self = inputs.self;
+          inherit (inputs) self;
         }
       );
       nixosModules.default = import ./nix/modules/nixos.nix inputs.self;
