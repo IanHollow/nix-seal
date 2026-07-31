@@ -11,6 +11,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     io::Read,
     path::Path,
+    time::{Duration, SystemTime},
 };
 use thiserror::Error;
 
@@ -18,6 +19,52 @@ const MAX_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Exact schema for one deterministic target-specific policy projection.
 pub const TARGET_POLICY_SCHEMA: &str = "nix-seal.target-policy.v1";
+/// Exact schema for one secret's canonical authoring recipient set.
+pub const SECRET_RECIPIENTS_SCHEMA: &str = "nix-seal.secret-recipients.v1";
+
+/// Deterministic public recipients used for one canonical ciphertext source.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SecretRecipientsV1 {
+    /// Must equal [`SECRET_RECIPIENTS_SCHEMA`].
+    pub schema: String,
+    /// Exact compiled plan hash.
+    pub plan_hash: String,
+    /// Selected secret ID.
+    pub secret_id: Id,
+    /// Configured ciphertext delivery model.
+    pub delivery: DeliveryMode,
+    /// Identity IDs mapped to public age/plugin recipients.
+    pub recipients: BTreeMap<Id, String>,
+}
+
+/// Public lifecycle state of a secret at one explicit observation time.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LifecycleStateV1 {
+    /// No expiry or rotation schedule is configured.
+    Unmanaged,
+    /// Neither expiry nor scheduled rotation is due.
+    Current,
+    /// The application credential is due for rotation.
+    RotationDue,
+    /// The configured expiry instant has passed.
+    Expired,
+}
+
+/// Versioned public lifecycle report for one secret.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SecretLifecycleReportV1 {
+    /// Secret ID.
+    pub secret_id: Id,
+    /// Calculated lifecycle state.
+    pub state: LifecycleStateV1,
+    /// Parsed expiry instant, normalized to UTC RFC 3339.
+    pub expires_at: Option<String>,
+    /// Calculated next rotation instant, normalized to UTC RFC 3339.
+    pub rotation_due_at: Option<String>,
+}
 
 /// Canonical public policy that one target is allowed to activate.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -238,6 +285,7 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
 }
 
 fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
+    let mut sources = BTreeSet::new();
     for (id, secret) in &plan.secrets {
         if secret.source.starts_with('/')
             || secret
@@ -249,12 +297,65 @@ fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
                 "secret {id} source must be a normalized repository-relative path"
             )));
         }
+        if !sources.insert(&secret.source) {
+            return Err(PolicyError::Violation(format!(
+                "secret {id} reuses a canonical ciphertext source path"
+            )));
+        }
         for consumer in &secret.consumers {
             if !plan.targets.contains_key(consumer) && !plan.groups.contains_key(consumer) {
                 return Err(PolicyError::Violation(format!(
                     "secret {id} references missing consumer {consumer}"
                 )));
             }
+        }
+        for administrator in &secret.administrators {
+            if !plan.identities.contains_key(administrator)
+                && !plan.groups.contains_key(administrator)
+            {
+                return Err(PolicyError::Violation(format!(
+                    "secret {id} references missing administrator {administrator}"
+                )));
+            }
+        }
+        let administrator_leaves = expand_group_leaves(plan, &secret.administrators)?;
+        if administrator_leaves.iter().any(|identity_id| {
+            !plan.identities.get(identity_id).is_some_and(|identity| {
+                matches!(
+                    identity.kind,
+                    IdentityKind::Administrator | IdentityKind::Recovery | IdentityKind::Plugin
+                )
+            })
+        }) {
+            return Err(PolicyError::Violation(format!(
+                "secret {id} administrator groups contain incompatible members"
+            )));
+        }
+        let consumer_leaves = expand_group_leaves(plan, &secret.consumers)?;
+        if consumer_leaves
+            .iter()
+            .any(|target_id| !plan.targets.contains_key(target_id))
+        {
+            return Err(PolicyError::Violation(format!(
+                "secret {id} consumer groups contain non-target members"
+            )));
+        }
+        let default_administrator_exists = plan.identities.values().any(|identity| {
+            matches!(
+                identity.kind,
+                IdentityKind::Administrator | IdentityKind::Recovery
+            )
+        });
+        let has_administrator = !administrator_leaves.is_empty()
+            || secret.administrators.is_empty() && default_administrator_exists;
+        if matches!(secret.delivery, DeliveryMode::Rekeyed) && !has_administrator
+            || matches!(secret.delivery, DeliveryMode::Direct)
+                && !has_administrator
+                && consumer_leaves.is_empty()
+        {
+            return Err(PolicyError::Violation(format!(
+                "secret {id} has no canonical encryption recipients"
+            )));
         }
         if let Some(policy) = &secret.approval_policy
             && !plan.approval_policies.contains_key(policy)
@@ -278,8 +379,106 @@ fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
                 "secret {id} runtime mode must be a nonzero owner-only four-digit octal mode"
             )));
         }
+        validate_lifecycle(id, &secret.lifecycle)?;
     }
     Ok(())
+}
+
+fn parse_timestamp(label: &str, value: &str) -> Result<jiff::Timestamp, PolicyError> {
+    value.parse().map_err(|_| {
+        PolicyError::Violation(format!(
+            "{label} must be a valid RFC 3339 timestamp with an explicit offset"
+        ))
+    })
+}
+
+fn validate_lifecycle(id: &Id, lifecycle: &nix_seal_core::Lifecycle) -> Result<(), PolicyError> {
+    let created = lifecycle
+        .created_at
+        .as_deref()
+        .map(|value| parse_timestamp(&format!("secret {id} createdAt"), value))
+        .transpose()?;
+    let rotated = lifecycle
+        .rotated_at
+        .as_deref()
+        .map(|value| parse_timestamp(&format!("secret {id} rotatedAt"), value))
+        .transpose()?;
+    let expires = lifecycle
+        .expires_at
+        .as_deref()
+        .map(|value| parse_timestamp(&format!("secret {id} expiresAt"), value))
+        .transpose()?;
+    if rotated
+        .zip(created)
+        .is_some_and(|(rotated, created)| rotated < created)
+        || expires
+            .zip(created)
+            .is_some_and(|(expires, created)| expires <= created)
+        || lifecycle.rotate_after_days == Some(0)
+        || lifecycle.rotate_after_days.is_some() && rotated.or(created).is_none()
+    {
+        return Err(PolicyError::Violation(format!(
+            "secret {id} has inconsistent lifecycle chronology or rotation interval"
+        )));
+    }
+    Ok(())
+}
+
+/// Calculates deterministic lifecycle states at an explicit system time.
+pub fn lifecycle_report(
+    plan: &PlanV1,
+    now: SystemTime,
+) -> Result<Vec<SecretLifecycleReportV1>, PolicyError> {
+    validate(plan)?;
+    let now = jiff::Timestamp::try_from(now).map_err(|_| {
+        PolicyError::Violation("system time is outside supported lifecycle range".to_owned())
+    })?;
+    plan.secrets
+        .iter()
+        .map(|(secret_id, secret)| {
+            let lifecycle = &secret.lifecycle;
+            let expires = lifecycle
+                .expires_at
+                .as_deref()
+                .map(|value| parse_timestamp("expiresAt", value))
+                .transpose()?;
+            let rotation_base = lifecycle
+                .rotated_at
+                .as_deref()
+                .or(lifecycle.created_at.as_deref());
+            let rotation_due = rotation_base
+                .zip(lifecycle.rotate_after_days)
+                .map(|(base, days)| {
+                    let base = parse_timestamp("rotation base", base)?;
+                    let seconds = u64::from(days).checked_mul(86_400).ok_or_else(|| {
+                        PolicyError::Violation(
+                            "rotation interval exceeds supported range".to_owned(),
+                        )
+                    })?;
+                    base.checked_add(Duration::from_secs(seconds)).map_err(|_| {
+                        PolicyError::Violation(
+                            "rotation due time exceeds supported range".to_owned(),
+                        )
+                    })
+                })
+                .transpose()?;
+            let state = if expires.is_some_and(|expiry| expiry <= now) {
+                LifecycleStateV1::Expired
+            } else if rotation_due.is_some_and(|due| due <= now) {
+                LifecycleStateV1::RotationDue
+            } else if expires.is_none() && rotation_due.is_none() {
+                LifecycleStateV1::Unmanaged
+            } else {
+                LifecycleStateV1::Current
+            };
+            Ok(SecretLifecycleReportV1 {
+                secret_id: secret_id.clone(),
+                state,
+                expires_at: expires.map(|value| value.to_string()),
+                rotation_due_at: rotation_due.map(|value| value.to_string()),
+            })
+        })
+        .collect()
 }
 
 fn validate_templates(plan: &PlanV1) -> Result<(), PolicyError> {
@@ -437,6 +636,111 @@ fn target_is_consumer(plan: &PlanV1, consumers: &[Id], target_id: &Id) -> bool {
         }
     }
     false
+}
+
+fn expand_group_leaves(plan: &PlanV1, references: &[Id]) -> Result<BTreeSet<Id>, PolicyError> {
+    let mut leaves = BTreeSet::new();
+    let mut pending = Vec::new();
+    let mut visited = BTreeSet::new();
+    for reference in references {
+        if plan.groups.contains_key(reference) {
+            if visited.insert(reference.clone()) {
+                pending.push(reference.clone());
+            }
+        } else {
+            leaves.insert(reference.clone());
+        }
+    }
+    while let Some(group_id) = pending.pop() {
+        let group = plan
+            .groups
+            .get(&group_id)
+            .ok_or_else(|| PolicyError::Violation(format!("missing group {group_id}")))?;
+        for member in &group.members {
+            if plan.groups.contains_key(member) {
+                if visited.insert(member.clone()) {
+                    pending.push(member.clone());
+                }
+            } else {
+                leaves.insert(member.clone());
+            }
+        }
+    }
+    Ok(leaves)
+}
+
+/// Derives the canonical encryption recipients for one secret source.
+pub fn secret_recipients(plan: &PlanV1, secret_id: &Id) -> Result<SecretRecipientsV1, PolicyError> {
+    validate(plan)?;
+    let secret = plan.secrets.get(secret_id).ok_or_else(|| {
+        PolicyError::Violation(format!(
+            "recipient policy references missing secret {secret_id}"
+        ))
+    })?;
+    let mut recipients = BTreeMap::new();
+    let administrator_ids = if secret.administrators.is_empty() {
+        plan.identities
+            .iter()
+            .filter_map(|(id, identity)| {
+                matches!(
+                    identity.kind,
+                    IdentityKind::Administrator | IdentityKind::Recovery
+                )
+                .then_some(id.clone())
+            })
+            .collect()
+    } else {
+        expand_group_leaves(plan, &secret.administrators)?
+    };
+    for identity_id in administrator_ids {
+        let identity = plan.identities.get(&identity_id).ok_or_else(|| {
+            PolicyError::Violation(format!(
+                "administrator reference {identity_id} does not resolve to an identity"
+            ))
+        })?;
+        if !matches!(
+            identity.kind,
+            IdentityKind::Administrator | IdentityKind::Recovery | IdentityKind::Plugin
+        ) {
+            return Err(PolicyError::Violation(format!(
+                "administrator reference {identity_id} has an incompatible identity kind"
+            )));
+        }
+        recipients.insert(identity_id, identity.public.clone());
+    }
+    for (identity_id, identity) in &plan.identities {
+        if matches!(identity.kind, IdentityKind::Recovery) {
+            recipients.insert(identity_id.clone(), identity.public.clone());
+        }
+    }
+    if matches!(secret.delivery, DeliveryMode::Direct) {
+        for target_id in expand_group_leaves(plan, &secret.consumers)? {
+            let target = plan.targets.get(&target_id).ok_or_else(|| {
+                PolicyError::Violation(format!(
+                    "direct consumer reference {target_id} does not resolve to a target"
+                ))
+            })?;
+            let identity = plan.identities.get(&target.identity).ok_or_else(|| {
+                PolicyError::Violation(format!(
+                    "target {target_id} references missing identity {}",
+                    target.identity
+                ))
+            })?;
+            recipients.insert(target.identity.clone(), identity.public.clone());
+        }
+    }
+    if recipients.is_empty() {
+        return Err(PolicyError::Violation(format!(
+            "secret {secret_id} has no canonical encryption recipients"
+        )));
+    }
+    Ok(SecretRecipientsV1 {
+        schema: SECRET_RECIPIENTS_SCHEMA.to_owned(),
+        plan_hash: plan_hash(plan)?,
+        secret_id: secret_id.clone(),
+        delivery: secret.delivery.clone(),
+        recipients,
+    })
 }
 
 fn target_approval_policy(
@@ -661,6 +965,13 @@ pub fn target_policy_json_schema() -> Result<String, PolicyError> {
     ))?)
 }
 
+/// Returns the `JSON` Schema for canonical secret-recipient projections.
+pub fn secret_recipients_json_schema() -> Result<String, PolicyError> {
+    Ok(serde_json::to_string_pretty(&schemars::schema_for!(
+        SecretRecipientsV1
+    ))?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +1007,14 @@ mod tests {
             Identity {
                 kind: IdentityKind::Signer,
                 public: "public-signer-fixture".to_owned(),
+            },
+        );
+        plan.identities.insert(
+            Id::parse("administrator")
+                .map_err(|error| PolicyError::Violation(error.to_string()))?,
+            Identity {
+                kind: IdentityKind::Administrator,
+                public: "age1administrator".to_owned(),
             },
         );
         let secret_id =
@@ -775,6 +1094,14 @@ mod tests {
             Identity {
                 kind: IdentityKind::Signer,
                 public: "signer-public".to_owned(),
+            },
+        );
+        plan.identities.insert(
+            Id::parse("administrator")
+                .map_err(|error| PolicyError::Violation(error.to_string()))?,
+            Identity {
+                kind: IdentityKind::Administrator,
+                public: "age1administrator".to_owned(),
             },
         );
         plan.identities.insert(
@@ -904,6 +1231,132 @@ mod tests {
             },
         );
         assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_recipients_are_plan_derived_and_direct_mode_is_explicit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut plan = PlanV1::default();
+        let admin = Id::parse("admin")?;
+        let recovery = Id::parse("recovery")?;
+        let signer = Id::parse("signer")?;
+        let target_identity = Id::parse("target-recipient")?;
+        let target = Id::parse("host.test")?;
+        let group = Id::parse("hosts")?;
+        let secret = Id::parse("db/password")?;
+        for (id, kind, public) in [
+            (&admin, IdentityKind::Administrator, "age1admin"),
+            (&recovery, IdentityKind::Recovery, "age1recovery"),
+            (&signer, IdentityKind::Signer, "signer-public"),
+            (&target_identity, IdentityKind::Target, "age1target"),
+        ] {
+            plan.identities.insert(
+                id.clone(),
+                Identity {
+                    kind,
+                    public: public.to_owned(),
+                },
+            );
+        }
+        plan.targets.insert(
+            target.clone(),
+            Target {
+                kind: TargetKind::NixOs,
+                system: "x86_64-linux".to_owned(),
+                identity: target_identity.clone(),
+                username: None,
+                tags: Vec::new(),
+            },
+        );
+        plan.groups.insert(
+            group.clone(),
+            Group {
+                members: vec![target.clone()],
+            },
+        );
+        plan.secrets.insert(
+            secret.clone(),
+            Secret {
+                source: "secrets/db.age".to_owned(),
+                delivery: DeliveryMode::Direct,
+                administrators: vec![admin.clone()],
+                consumers: vec![group],
+                phase: ActivationPhase::Activation,
+                runtime: RuntimeSettings::default(),
+                lifecycle: Lifecycle::default(),
+                approval_policy: None,
+            },
+        );
+        let recipients = secret_recipients(&plan, &secret)?;
+        assert_eq!(recipients.recipients.len(), 3);
+        assert!(recipients.recipients.contains_key(&admin));
+        assert!(recipients.recipients.contains_key(&recovery));
+        assert!(recipients.recipients.contains_key(&target_identity));
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_reporting_distinguishes_rotation_and_expiry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut plan = PlanV1::default();
+        let signer = Id::parse("signer")?;
+        let admin = Id::parse("admin")?;
+        plan.identities.insert(
+            signer,
+            Identity {
+                kind: IdentityKind::Signer,
+                public: "signer-public".to_owned(),
+            },
+        );
+        plan.identities.insert(
+            admin,
+            Identity {
+                kind: IdentityKind::Administrator,
+                public: "age1admin".to_owned(),
+            },
+        );
+        let rotating = Id::parse("rotating")?;
+        let expired = Id::parse("expired")?;
+        let base = |source: &str, lifecycle| Secret {
+            source: source.to_owned(),
+            delivery: DeliveryMode::Rekeyed,
+            administrators: Vec::new(),
+            consumers: Vec::new(),
+            phase: ActivationPhase::Activation,
+            runtime: RuntimeSettings::default(),
+            lifecycle,
+            approval_policy: None,
+        };
+        plan.secrets.insert(
+            rotating.clone(),
+            base(
+                "secrets/rotating.age",
+                Lifecycle {
+                    created_at: Some("2026-01-01T00:00:00Z".to_owned()),
+                    rotate_after_days: Some(10),
+                    ..Lifecycle::default()
+                },
+            ),
+        );
+        plan.secrets.insert(
+            expired.clone(),
+            base(
+                "secrets/expired.age",
+                Lifecycle {
+                    created_at: Some("2026-01-01T00:00:00Z".to_owned()),
+                    expires_at: Some("2026-01-02T00:00:00Z".to_owned()),
+                    ..Lifecycle::default()
+                },
+            ),
+        );
+        let now: jiff::Timestamp = "2026-02-01T00:00:00Z".parse()?;
+        let now: SystemTime = now.into();
+        let report = lifecycle_report(&plan, now)?;
+        assert_eq!(report[0].secret_id, expired);
+        assert_eq!(report[0].state, LifecycleStateV1::Expired);
+        assert_eq!(report[1].secret_id, rotating);
+        assert_eq!(report[1].state, LifecycleStateV1::RotationDue);
         Ok(())
     }
 }

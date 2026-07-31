@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/nix-seal-authoring",
   "crates/nix-seal-cache",
   "crates/nix-seal-cli",
   "crates/nix-seal-core",
@@ -30,6 +31,8 @@ clap_complete_nushell = "4.6.1"
 fs2 = "0.4.3"
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["fast", "zeroize"] }
 getrandom = "=0.4.3"
+jiff = { version = "=0.2.35", default-features = false, features = ["std"] }
+nix-seal-authoring = { path = "crates/nix-seal-authoring", version = "=0.1.0-alpha.1" }
 nix-seal-cache = { path = "crates/nix-seal-cache", version = "=0.1.0-alpha.1" }
 nix-seal-core = { path = "crates/nix-seal-core", version = "=0.1.0-alpha.1" }
 nix-seal-crypto = { path = "crates/nix-seal-crypto", version = "=0.1.0-alpha.1" }

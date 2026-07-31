@@ -13,6 +13,27 @@ that projection rather than trusting duplicate command-line or Nix options.
 Signed artifact v2 manifests bind its hash, so policy substitution fails before
 decryption.
 
+Canonical authoring is plan-directed and reads values only from stdin or an
+explicit editor transaction:
+
+```console
+nix-seal secret create --plan plan.v1.json --secret db/password \
+  --identity ~/.config/age/keys.txt < password.txt
+nix-seal secret edit --plan plan.v1.json --secret db/password \
+  --identity ~/.config/age/keys.txt --editor /absolute/path/to/editor
+nix-seal rotate --plan plan.v1.json --secret db/password \
+  --identity ~/.config/age/keys.txt < replacement.txt
+nix-seal secret list --plan plan.v1.json --due
+```
+
+The plan determines canonical administrator/recovery recipients. Direct mode
+additionally includes authorized target recipients and emits a history-exposure
+warning. Every create, import, edit, and rotation is encrypted into a private
+same-directory transaction, round-trip decrypted and hashed, then atomically
+committed. Editor execution uses no shell, inherits no environment, and runs in
+a private ephemeral workspace. `rekey` changes encryption recipients; `rotate`
+changes the application credential.
+
 The project is in an early, pre-release foundation phase. The current vertical
 slice provides strict plan parsing and validation, canonical plan hashing,
 native age X25519 encryption/decryption, signed target artifacts, transactional

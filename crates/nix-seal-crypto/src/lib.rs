@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use thiserror::Error;
 
 const MAX_SECRET_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CIPHERTEXT_BYTES: u64 = 70 * 1024 * 1024;
 
 /// A redacted cryptographic error.
 #[derive(Debug, Error)]
@@ -118,6 +119,12 @@ pub fn decrypt<R: Read, W: Write>(
     if reader.read(&mut overflow).map_err(|_| CryptoError::Io)? != 0 {
         return Err(CryptoError::InputTooLarge);
     }
+    Ok(())
+}
+
+/// Parses and bounds a standard age ciphertext header without decrypting plaintext.
+pub fn validate_ciphertext_header<R: Read>(input: R) -> Result<(), CryptoError> {
+    Decryptor::new(input.take(MAX_CIPHERTEXT_BYTES + 1)).map_err(|_| CryptoError::Decrypt)?;
     Ok(())
 }
 

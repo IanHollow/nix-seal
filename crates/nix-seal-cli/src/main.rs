@@ -48,6 +48,9 @@ enum Command {
         nix_plan: Option<PathBuf>,
         #[arg(long)]
         deep: bool,
+        /// Repository root used for deep canonical ciphertext checks.
+        #[arg(long, default_value = ".")]
+        repository_root: PathBuf,
     },
     /// Identity operations.
     #[command(subcommand)]
@@ -63,6 +66,10 @@ enum Command {
     /// Secret authoring operations.
     #[command(subcommand)]
     Secret(SecretCommand),
+    /// Replace an application credential from stdin; this is distinct from rekeying recipients.
+    Rotate(SecretWriteArgs),
+    /// Print the plan-derived canonical recipients for one secret.
+    Recipients(SecretPlanArgs),
     /// Print a versioned public `JSON` Schema.
     Schema {
         #[arg(long, value_enum, default_value_t = SchemaKind::Plan)]
@@ -194,20 +201,61 @@ struct ActivateArgs {
 
 #[derive(Subcommand)]
 enum SecretCommand {
-    /// Encrypt stdin to a new standard age file.
-    Import {
-        #[arg(long = "recipient", required = true)]
-        recipients: Vec<String>,
-        #[arg(long)]
-        output: PathBuf,
-    },
+    /// Create a new plan-declared canonical ciphertext from stdin.
+    Create(SecretWriteArgs),
+    /// Import an existing value from stdin into a new plan-declared canonical ciphertext.
+    Import(SecretWriteArgs),
+    /// Edit through an explicit executable in a private ephemeral workspace.
+    Edit(SecretEditArgs),
     /// Decrypt to stdout. This is the only command that emits plaintext.
-    Reveal {
+    Reveal(SecretWriteArgs),
+    /// List plan-declared secret IDs without reading ciphertext.
+    List {
+        #[arg(long, default_value = "plan.v1.json")]
+        plan: PathBuf,
+        /// Show only expired or rotation-due secrets with calculated lifecycle metadata.
         #[arg(long)]
-        identity: PathBuf,
-        #[arg(long)]
-        input: PathBuf,
+        due: bool,
     },
+    /// Show public policy metadata for one secret.
+    Show(SecretPlanArgs),
+}
+
+#[derive(Clone, Args)]
+struct SecretPlanArgs {
+    /// Canonical compiled plan.v1 JSON.
+    #[arg(long, default_value = "plan.v1.json")]
+    plan: PathBuf,
+    /// Secret ID selected from the plan.
+    #[arg(long)]
+    secret: nix_seal_core::Id,
+}
+
+#[derive(Clone, Args)]
+struct SecretWriteArgs {
+    #[command(flatten)]
+    policy: SecretPlanArgs,
+    /// Repository root used to resolve the plan's canonical ciphertext source.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Administrator/recovery identity used to verify encryption or reveal plaintext.
+    #[arg(long)]
+    identity: PathBuf,
+}
+
+#[derive(Args)]
+struct SecretEditArgs {
+    #[command(flatten)]
+    secret: SecretWriteArgs,
+    /// Absolute editor executable; no shell is invoked.
+    #[arg(long)]
+    editor: PathBuf,
+    /// Explicit editor argument placed before the private temporary filename.
+    #[arg(long = "editor-arg")]
+    editor_arguments: Vec<String>,
+    /// Existing private/runtime directory used as the temporary workspace parent.
+    #[arg(long)]
+    workspace_root: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -231,6 +279,7 @@ enum CompletionShell {
 enum SchemaKind {
     Plan,
     TargetPolicy,
+    SecretRecipients,
     Activation,
 }
 
@@ -302,10 +351,14 @@ fn run() -> Result<()> {
             toml,
             nix_plan,
             deep,
+            repository_root,
         } => {
             let plan = load_plan(&toml, nix_plan.as_deref())?;
             nix_seal_policy::validate(&plan)?;
             let hash = nix_seal_policy::plan_hash(&plan)?;
+            if deep {
+                deep_check_plan(&plan, &repository_root)?;
+            }
             if cli.json {
                 println!(
                     "{}",
@@ -326,18 +379,31 @@ fn run() -> Result<()> {
         Command::Artifact(command) => run_artifact(command, cli.json)?,
         Command::Rekey(arguments) => run_rekey(arguments, cli.json)?,
         Command::Activate(arguments) => run_activate(&arguments, cli.json)?,
-        Command::Secret(command) => run_secret(command)?,
-        Command::Schema { kind } => println!(
-            "{}",
-            match kind {
-                SchemaKind::Plan => nix_seal_policy::json_schema()?,
-                SchemaKind::TargetPolicy => nix_seal_policy::target_policy_json_schema()?,
-                SchemaKind::Activation => nix_seal_runtime::activation_json_schema()?,
-            }
-        ),
+        Command::Secret(command) => run_secret(command, cli.json)?,
+        Command::Rotate(arguments) => run_secret_write(
+            &arguments,
+            nix_seal_authoring::WriteMode::Replace,
+            cli.json,
+            "rotated",
+        )?,
+        Command::Recipients(arguments) => run_recipients(&arguments, cli.json)?,
+        Command::Schema { kind } => run_schema(kind)?,
         Command::Completions { shell } => completions(shell),
         Command::Cache(CacheCommand::Status { root }) => cache_status(root, cli.json)?,
     }
+    Ok(())
+}
+
+fn run_schema(kind: SchemaKind) -> Result<()> {
+    println!(
+        "{}",
+        match kind {
+            SchemaKind::Plan => nix_seal_policy::json_schema()?,
+            SchemaKind::TargetPolicy => nix_seal_policy::target_policy_json_schema()?,
+            SchemaKind::SecretRecipients => nix_seal_policy::secret_recipients_json_schema()?,
+            SchemaKind::Activation => nix_seal_runtime::activation_json_schema()?,
+        }
+    );
     Ok(())
 }
 
@@ -899,6 +965,48 @@ fn read_plan_bounded(path: &Path) -> Result<nix_seal_core::PlanV1> {
     Ok(plan)
 }
 
+fn deep_check_plan(plan: &nix_seal_core::PlanV1, repository_root: &Path) -> Result<()> {
+    let mut trusted = nix_seal_manifest::TrustedKeys::new();
+    for (id, identity) in &plan.identities {
+        match identity.kind {
+            nix_seal_core::IdentityKind::Signer => {
+                trusted
+                    .insert_encoded(&identity.public)
+                    .with_context(|| format!("signer identity {id} is malformed or duplicated"))?;
+            }
+            nix_seal_core::IdentityKind::Plugin => {
+                bail!("identity {id} uses a plugin that this release cannot deeply validate");
+            }
+            nix_seal_core::IdentityKind::Administrator
+            | nix_seal_core::IdentityKind::Target
+            | nix_seal_core::IdentityKind::Recovery => {
+                nix_seal_crypto::recipient_fingerprint(&identity.public)
+                    .with_context(|| format!("recipient identity {id} is malformed"))?;
+            }
+        }
+    }
+    for (secret_id, secret) in &plan.secrets {
+        let recipients = nix_seal_policy::secret_recipients(plan, secret_id)?;
+        for recipient in recipients.recipients.values() {
+            nix_seal_crypto::recipient_fingerprint(recipient)?;
+        }
+        let path = existing_secret_path(repository_root, &secret.source)?;
+        let file = open_public_ciphertext(&path)?;
+        let length = file.metadata()?.len();
+        if length == 0 || length > 70 * 1024 * 1024 {
+            bail!("canonical ciphertext for {secret_id} has an invalid size");
+        }
+        nix_seal_crypto::validate_ciphertext_header(file)
+            .with_context(|| format!("canonical ciphertext for {secret_id} is malformed"))?;
+    }
+    for target_id in plan.targets.keys() {
+        let policy = nix_seal_policy::target_policy(plan, target_id)?;
+        nix_seal_crypto::recipient_fingerprint(&policy.recipient)
+            .with_context(|| format!("target {target_id} recipient is malformed"))?;
+    }
+    Ok(())
+}
+
 fn write_new_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
     let parent = path.parent().context("artifact path has no parent")?;
@@ -935,31 +1043,304 @@ fn emit_canonical_public_json(output: Option<&Path>, bytes: &[u8]) -> Result<()>
     Ok(())
 }
 
-fn run_secret(command: SecretCommand) -> Result<()> {
+fn run_secret(command: SecretCommand, json: bool) -> Result<()> {
     match command {
-        SecretCommand::Import { recipients, output } => {
-            let parent = output.parent().context("output has no parent directory")?;
-            std::fs::create_dir_all(parent)?;
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&output)
-                .with_context(|| format!("refusing to overwrite {}", output.display()))?;
-            set_private_file(&output)?;
-            if let Err(error) = nix_seal_crypto::encrypt(std::io::stdin().lock(), file, &recipients)
-            {
-                let _ = std::fs::remove_file(&output);
-                return Err(error.into());
+        SecretCommand::Create(arguments) => run_secret_write(
+            &arguments,
+            nix_seal_authoring::WriteMode::Create,
+            json,
+            "created",
+        )?,
+        SecretCommand::Import(arguments) => run_secret_write(
+            &arguments,
+            nix_seal_authoring::WriteMode::Create,
+            json,
+            "imported",
+        )?,
+        SecretCommand::Edit(arguments) => run_secret_edit(arguments, json)?,
+        SecretCommand::Reveal(arguments) => {
+            if json {
+                bail!("secret reveal refuses --json because plaintext JSON output is forbidden");
             }
-            eprintln!("encrypted stdin to {}", output.display());
-        }
-        SecretCommand::Reveal { identity, input } => {
-            let identity = read_identity(&identity)?;
-            let ciphertext = std::fs::File::open(&input)?;
+            let plan = read_plan_bounded(&arguments.policy.plan)?;
+            let recipients = nix_seal_policy::secret_recipients(&plan, &arguments.policy.secret)?;
+            let identity = read_identity(&arguments.identity)?;
+            let public = nix_seal_crypto::recipient_from_identity(&identity)?;
+            if !recipients.recipients.values().any(|value| value == &public) {
+                bail!("reveal identity is not authorized by canonical recipient policy");
+            }
+            let secret = plan
+                .secrets
+                .get(&arguments.policy.secret)
+                .context("secret is absent from plan")?;
+            let input = existing_secret_path(&arguments.repository_root, &secret.source)?;
+            let ciphertext = open_public_ciphertext(&input)?;
             nix_seal_crypto::decrypt(ciphertext, std::io::stdout().lock(), &identity)?;
+        }
+        SecretCommand::List { plan, due } => {
+            let plan = read_plan_bounded(&plan)?;
+            let lifecycle = nix_seal_policy::lifecycle_report(&plan, SystemTime::now())?;
+            let lifecycle: Vec<_> = lifecycle
+                .into_iter()
+                .filter(|report| {
+                    !due || matches!(
+                        report.state,
+                        nix_seal_policy::LifecycleStateV1::Expired
+                            | nix_seal_policy::LifecycleStateV1::RotationDue
+                    )
+                })
+                .collect();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema":"nix-seal.output.v1",
+                        "secrets":lifecycle
+                    })
+                );
+            } else {
+                for report in lifecycle {
+                    println!("{}\t{:?}", report.secret_id, report.state);
+                }
+            }
+        }
+        SecretCommand::Show(arguments) => {
+            let plan = read_plan_bounded(&arguments.plan)?;
+            let secret = plan
+                .secrets
+                .get(&arguments.secret)
+                .context("secret is absent from plan")?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema":"nix-seal.output.v1",
+                        "secretId":arguments.secret,
+                        "secret":secret
+                    })
+                );
+            } else {
+                println!("{}", arguments.secret);
+                println!("source: {}", secret.source);
+                println!("delivery: {:?}", secret.delivery);
+                println!("phase: {:?}", secret.phase);
+            }
         }
     }
     Ok(())
+}
+
+fn run_secret_write(
+    arguments: &SecretWriteArgs,
+    mode: nix_seal_authoring::WriteMode,
+    json: bool,
+    operation: &str,
+) -> Result<()> {
+    let plan = read_plan_bounded(&arguments.policy.plan)?;
+    let secret = plan
+        .secrets
+        .get(&arguments.policy.secret)
+        .context("secret is absent from plan")?;
+    let recipient_policy = nix_seal_policy::secret_recipients(&plan, &arguments.policy.secret)?;
+    let recipients: Vec<_> = recipient_policy
+        .recipients
+        .values()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if matches!(secret.delivery, nix_seal_core::DeliveryMode::Direct) {
+        eprintln!(
+            "warning: direct mode allows matching target keys to decrypt current and historical Git ciphertext"
+        );
+    }
+    let root = arguments
+        .repository_root
+        .canonicalize()
+        .context("repository root must exist")?;
+    let identity = read_identity(&arguments.identity)?;
+    let result = nix_seal_authoring::write_secret(
+        &root,
+        Path::new(&secret.source),
+        std::io::stdin().lock(),
+        &recipients,
+        &identity,
+        mode,
+    )?;
+    let rotated_at = (operation == "rotated")
+        .then(|| {
+            jiff::Timestamp::try_from(SystemTime::now())
+                .map(|timestamp| timestamp.to_string())
+                .context("system time is outside supported lifecycle range")
+        })
+        .transpose()?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.output.v1",
+                "operation":operation,
+                "secretId":arguments.policy.secret,
+                "ciphertextPath":result.path,
+                "ciphertextHash":result.ciphertext_hash,
+                "recipientCount":recipients.len(),
+                "rotatedAt":rotated_at
+            })
+        );
+    } else {
+        println!("{}", result.path.display());
+        eprintln!(
+            "{operation} canonical ciphertext for {}",
+            arguments.policy.secret
+        );
+        if let Some(rotated_at) = rotated_at {
+            eprintln!("record lifecycle.rotatedAt = {rotated_at} in the authoritative plan source");
+        }
+    }
+    Ok(())
+}
+
+fn run_secret_edit(arguments: SecretEditArgs, json: bool) -> Result<()> {
+    let plan = read_plan_bounded(&arguments.secret.policy.plan)?;
+    let secret = plan
+        .secrets
+        .get(&arguments.secret.policy.secret)
+        .context("secret is absent from plan")?;
+    let recipient_policy =
+        nix_seal_policy::secret_recipients(&plan, &arguments.secret.policy.secret)?;
+    let recipients: Vec<_> = recipient_policy
+        .recipients
+        .values()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let root = arguments
+        .secret
+        .repository_root
+        .canonicalize()
+        .context("repository root must exist")?;
+    let identity = read_identity(&arguments.secret.identity)?;
+    let workspace_root = match arguments.workspace_root {
+        Some(path) => path,
+        None => match std::env::var_os("XDG_RUNTIME_DIR") {
+            Some(path) if Path::new(&path).is_absolute() => PathBuf::from(path),
+            _ => {
+                eprintln!(
+                    "warning: editor workspace uses the OS temporary directory, which may not be memory-backed"
+                );
+                std::env::temp_dir()
+            }
+        },
+    }
+    .canonicalize()
+    .context("editor workspace root must exist")?;
+    if matches!(secret.delivery, nix_seal_core::DeliveryMode::Direct) {
+        eprintln!(
+            "warning: direct mode allows matching target keys to decrypt current and historical Git ciphertext"
+        );
+    }
+    let result = nix_seal_authoring::edit_secret(&nix_seal_authoring::EditRequest {
+        repository_root: &root,
+        relative_destination: Path::new(&secret.source),
+        identity: &identity,
+        recipients: &recipients,
+        editor: &arguments.editor,
+        editor_arguments: &arguments.editor_arguments,
+        workspace_root: &workspace_root,
+    })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.output.v1",
+                "operation":"edited",
+                "secretId":arguments.secret.policy.secret,
+                "ciphertextPath":result.path,
+                "ciphertextHash":result.ciphertext_hash,
+                "recipientCount":recipients.len()
+            })
+        );
+    } else {
+        println!("{}", result.path.display());
+        eprintln!(
+            "edited canonical ciphertext for {}",
+            arguments.secret.policy.secret
+        );
+    }
+    Ok(())
+}
+
+fn run_recipients(arguments: &SecretPlanArgs, json: bool) -> Result<()> {
+    let plan = read_plan_bounded(&arguments.plan)?;
+    let recipients = nix_seal_policy::secret_recipients(&plan, &arguments.secret)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.output.v1",
+                "recipientPolicy":recipients
+            })
+        );
+    } else {
+        for (id, recipient) in &recipients.recipients {
+            println!("{id}\t{recipient}");
+        }
+    }
+    Ok(())
+}
+
+fn existing_secret_path(repository_root: &Path, relative: &str) -> Result<PathBuf> {
+    let root = repository_root
+        .canonicalize()
+        .context("repository root must exist")?;
+    let relative = Path::new(relative);
+    if relative.is_absolute() {
+        bail!("canonical ciphertext path must be repository-relative");
+    }
+    let mut path = root.clone();
+    let components: Vec<_> = relative.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(segment) = component else {
+            bail!("canonical ciphertext path is not normalized");
+        };
+        path.push(segment);
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if index + 1 == components.len() {
+            if !metadata.file_type().is_file() {
+                bail!("canonical ciphertext is not a regular file");
+            }
+        } else if !metadata.file_type().is_dir() {
+            bail!("canonical ciphertext ancestry is not a directory");
+        }
+    }
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn open_public_ciphertext(path: &Path) -> Result<std::fs::File> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile || metadata.st_nlink != 1
+    {
+        bail!("canonical ciphertext is not a no-follow single-link regular file");
+    }
+    Ok(std::fs::File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn open_public_ciphertext(path: &Path) -> Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        bail!("canonical ciphertext is not a regular file");
+    }
+    Ok(std::fs::File::open(path)?)
 }
 
 fn read_identity(path: &Path) -> Result<SecretString> {
@@ -1165,6 +1546,13 @@ mod tests {
             nix_seal_core::Identity {
                 kind: nix_seal_core::IdentityKind::Signer,
                 public: signer.encode_public(),
+            },
+        );
+        plan.identities.insert(
+            nix_seal_core::Id::parse("administrator")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: recipient.clone(),
             },
         );
         plan.targets.insert(

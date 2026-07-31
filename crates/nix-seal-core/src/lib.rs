@@ -268,6 +268,8 @@ impl Default for RuntimeSettings {
 pub struct Lifecycle {
     /// ISO-8601 creation time.
     pub created_at: Option<String>,
+    /// ISO-8601 time of the most recent application-credential rotation.
+    pub rotated_at: Option<String>,
     /// ISO-8601 expiry time.
     pub expires_at: Option<String>,
     /// Rotation interval in days.
@@ -278,6 +280,8 @@ pub struct Lifecycle {
     pub purpose: Option<String>,
     /// Public classification.
     pub classification: Option<String>,
+    /// Public incident or ticket reference associated with this credential.
+    pub incident_reference: Option<String>,
 }
 
 /// Generator declaration.

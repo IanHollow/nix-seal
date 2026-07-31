@@ -1,8 +1,8 @@
 # nix-seal product specification
 
 Status: accepted design, implementation in progress. Version: plan v1 / artifact
-v1. The normative requirements below use “must”; incomplete items are tracked in
-the roadmap and must not be represented as implemented.
+v2 / activation v2. The normative requirements below use “must”; incomplete
+items are tracked in the roadmap and must not be represented as implemented.
 
 ## Mission and boundaries
 
@@ -77,12 +77,13 @@ may identify a secret but never contain values or decrypted fragments.
 ## Cache, Nix bridge, and activation
 
 The cache is `$XDG_CACHE_HOME/nix-seal/v1`, contains only ciphertext, signed
-manifests, and public metadata, and addresses objects by plan/source/recipient/
-format hashes. Transactions use private same-filesystem directories, locks,
-fsync, and atomic rename. Rekeying never occurs in Nix builds. Missing
-fixed-output objects fail with the exact safe rekey command. Export/import and
-encrypted closure copy support remote builds. GC is dry-run-first and retains
-objects referenced by active plans.
+manifests, and public metadata, and addresses objects by plan, target policy,
+source, recipient, target, secret, generation, and format bindings. Transactions
+use private same-filesystem directories, locks, fsync, and atomic rename.
+Rekeying never occurs in Nix builds. Missing fixed-output objects fail with the
+exact safe rekey command. Export/import and encrypted closure copy support
+remote builds. GC is dry-run-first and retains objects referenced by active
+plans.
 
 Activation verifies schema, signatures, hashes, target, and recipient metadata;
 decrypts a complete restrictive generation; and switches only after every value
