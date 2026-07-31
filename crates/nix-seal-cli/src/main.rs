@@ -52,6 +52,17 @@ enum Command {
         #[arg(long, default_value = ".")]
         repository_root: PathBuf,
     },
+    /// Diagnose public policy, ciphertext references, and runtime capabilities.
+    Doctor {
+        #[arg(long, default_value = "plan.v1.json")]
+        plan: PathBuf,
+        /// Repository root used to verify canonical ciphertext references.
+        #[arg(long, default_value = ".")]
+        repository_root: PathBuf,
+        /// Override the standard XDG cache root.
+        #[arg(long)]
+        cache_root: Option<PathBuf>,
+    },
     /// Identity operations.
     #[command(subcommand)]
     Key(KeyCommand),
@@ -361,6 +372,11 @@ fn run() -> Result<()> {
             deep,
             repository_root,
         } => run_check(&toml, nix_plan.as_deref(), deep, &repository_root, cli.json)?,
+        Command::Doctor {
+            plan,
+            repository_root,
+            cache_root,
+        } => run_doctor(&plan, &repository_root, cache_root, cli.json)?,
         Command::Key(command) => run_key(command, cli.json)?,
         Command::Artifact(command) => run_artifact(command, cli.json)?,
         Command::Rekey(arguments) => run_rekey(arguments, cli.json)?,
@@ -476,6 +492,78 @@ fn run_check(
                 ""
             }
         );
+    }
+    Ok(())
+}
+
+fn run_doctor(
+    plan_path: &Path,
+    repository_root: &Path,
+    cache_root: Option<PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let plan = read_plan_bounded(plan_path)?;
+    deep_check_plan(&plan, repository_root)?;
+    let plan_hash = nix_seal_policy::plan_hash(&plan)?;
+    let cache = nix_seal_cache::Cache::open(cache_root.unwrap_or_else(default_cache_root))?;
+    let inventory = cache.inventory()?;
+    let mut warnings = Vec::new();
+    if cfg!(target_os = "macos") {
+        warnings.push(
+            "macOS runtime directories are not guaranteed to be memory-backed; review the selected Home Manager runtime directory"
+                .to_owned(),
+        );
+    }
+    if !cfg!(target_os = "linux") {
+        warnings.push(
+            "systemd credentials are unavailable on this platform; use ordinary restrictive runtime files"
+                .to_owned(),
+        );
+    }
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        warnings.push(
+            "XDG_RUNTIME_DIR is unset; standalone Home Manager activation needs an explicit secure runtime directory"
+                .to_owned(),
+        );
+    }
+    if plan
+        .secrets
+        .values()
+        .any(|secret| matches!(secret.delivery, nix_seal_core::DeliveryMode::Direct))
+    {
+        warnings.push(
+            "the plan contains advanced direct-delivery secrets; matching target keys can decrypt current and historical canonical ciphertext"
+                .to_owned(),
+        );
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.doctor.v1",
+                "ok":true,
+                "planHash":plan_hash,
+                "secrets":plan.secrets.len(),
+                "targets":plan.targets.len(),
+                "cache":{
+                    "root":cache.root(),
+                    "objects":inventory.object_count,
+                    "artifacts":inventory.artifact_count
+                },
+                "warnings":warnings
+            })
+        );
+    } else {
+        println!(
+            "doctor: plan {plan_hash} is deeply valid; {} secrets, {} targets; cache has {} objects and {} artifacts",
+            plan.secrets.len(),
+            plan.targets.len(),
+            inventory.object_count,
+            inventory.artifact_count,
+        );
+        for warning in warnings {
+            eprintln!("warning: {warning}");
+        }
     }
     Ok(())
 }

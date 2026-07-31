@@ -138,6 +138,13 @@ This code has **not** received the independent audit required for 1.0. Do not
 use it for production secrets yet. Report vulnerabilities according to
 [SECURITY.md](SECURITY.md).
 
+## Diagnostics
+
+`nix-seal doctor --plan plan.v1.json --repository-root .` performs the same deep
+public-policy and canonical-ciphertext checks used before deployment, then
+reports verified cache inventory and platform/runtime caveats. It emits only
+public metadata and does not decrypt secrets.
+
 ## Development
 
 ```console
