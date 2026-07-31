@@ -1056,7 +1056,6 @@ dependencies = [
 name = "nix-seal"
 version = "0.1.0-alpha.1"
 dependencies = [
- "age",
  "anyhow",
  "clap",
  "clap_complete",

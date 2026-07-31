@@ -197,12 +197,7 @@ fn run_key(command: KeyCommand, json: bool) -> Result<()> {
         }
         KeyCommand::Inspect { identity } => {
             let secret = read_identity(&identity)?;
-            let parsed = secret
-                .expose_secret()
-                .trim()
-                .parse::<age::x25519::Identity>()
-                .map_err(|_| anyhow::anyhow!("invalid age X25519 identity"))?;
-            let recipient = parsed.to_public().to_string();
+            let recipient = nix_seal_crypto::recipient_from_identity(&secret)?;
             if json {
                 println!(
                     "{}",

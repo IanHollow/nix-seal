@@ -38,6 +38,16 @@ pub fn generate_x25519() -> (secrecy::SecretString, String) {
     (private, identity.to_public().to_string())
 }
 
+/// Derives the public recipient from a standard `X25519` identity.
+pub fn recipient_from_identity(identity: &secrecy::SecretString) -> Result<String, CryptoError> {
+    let parsed = identity
+        .expose_secret()
+        .trim()
+        .parse::<age::x25519::Identity>()
+        .map_err(|_| CryptoError::Identity)?;
+    Ok(parsed.to_public().to_string())
+}
+
 /// Encrypts a stream to standard age `X25519` recipients, bounded to 64 MiB.
 pub fn encrypt<R: Read, W: Write>(
     mut input: R,
@@ -105,6 +115,7 @@ mod tests {
     #[test]
     fn x25519_round_trip() -> Result<(), CryptoError> {
         let (identity, recipient) = generate_x25519();
+        assert_eq!(recipient_from_identity(&identity)?, recipient);
         let mut ciphertext = Vec::new();
         encrypt(b"canary".as_slice(), &mut ciphertext, &[recipient])?;
         assert!(!ciphertext.windows(6).any(|window| window == b"canary"));
