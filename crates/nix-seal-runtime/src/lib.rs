@@ -64,6 +64,10 @@ pub struct ActivationArtifactSpecV1 {
     pub artifact_generation: u64,
     /// Restrictive octal mode such as `0400`.
     pub mode: String,
+    /// Existing operating-system account that owns the runtime file.
+    pub owner: String,
+    /// Existing operating-system group that owns the runtime file.
+    pub group: String,
 }
 
 impl ActivationArtifactSpecV1 {
@@ -106,6 +110,8 @@ impl ActivationSpecV1 {
                 || artifact.artifact_generation == 0
                 || !ids.insert(&artifact.secret_id)
                 || parse_mode(&artifact.mode).is_err()
+                || !is_account_name(&artifact.owner)
+                || !is_account_name(&artifact.group)
             {
                 return Err(RuntimeError::InvalidSpec);
             }
@@ -128,6 +134,10 @@ pub struct ActivationArtifact<'a> {
     pub artifact_generation: u64,
     /// Restrictive runtime mode. Group/other access is rejected in v1.
     pub mode: u32,
+    /// Existing operating-system account that owns the runtime file.
+    pub owner: &'a str,
+    /// Existing operating-system group that owns the runtime file.
+    pub group: &'a str,
 }
 
 /// Complete policy and trust context for one atomic activation.
@@ -188,6 +198,9 @@ pub enum RuntimeError {
     /// Public activation metadata violated its strict schema or resource limits.
     #[error("invalid activation specification")]
     InvalidSpec,
+    /// A declared runtime owner or group does not exist.
+    #[error("declared runtime owner or group does not exist")]
+    UnknownAccount,
     /// Artifact authentication failed before decryption.
     #[error(transparent)]
     Manifest(#[from] nix_seal_manifest::ManifestError),
@@ -206,6 +219,8 @@ struct PreparedArtifact<'a> {
     ciphertext: File,
     secret_id: &'a Id,
     mode: u32,
+    uid: u32,
+    gid: u32,
 }
 
 /// Authenticates every artifact before decrypting any, then atomically switches
@@ -217,6 +232,8 @@ pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, Run
     let mut prepared = Vec::with_capacity(request.artifacts.len());
     for artifact in request.artifacts {
         validate_mode(artifact.mode)?;
+        let uid = resolve_user(artifact.owner)?;
+        let gid = resolve_group(artifact.group)?;
         let mut ciphertext = open_regular_nofollow(artifact.ciphertext)?;
         let artifact_hash = hash_bounded(&mut ciphertext, MAX_CIPHERTEXT_BYTES)?;
         ciphertext.seek(SeekFrom::Start(0))?;
@@ -247,12 +264,19 @@ pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, Run
             ciphertext,
             secret_id: artifact.secret_id,
             mode: artifact.mode,
+            uid,
+            gid,
         });
     }
 
     let generation = Generation::begin(request.runtime_root)?;
     for mut artifact in prepared {
-        let mut destination = generation.create_file(artifact.secret_id, artifact.mode)?;
+        let mut destination = generation.create_file_owned(
+            artifact.secret_id,
+            artifact.mode,
+            artifact.uid,
+            artifact.gid,
+        )?;
         nix_seal_crypto::decrypt(
             &mut artifact.ciphertext,
             &mut destination,
@@ -305,6 +329,23 @@ impl Generation {
 
     /// Creates one exclusive regular destination inside the private generation.
     pub fn create_file(&self, id: &Id, mode: u32) -> Result<File, RuntimeError> {
+        self.create_file_owned(
+            id,
+            mode,
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        )
+    }
+
+    /// Creates one exclusive destination and applies ownership through its
+    /// already-open descriptor before returning it.
+    pub fn create_file_owned(
+        &self,
+        id: &Id,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<File, RuntimeError> {
         validate_mode(mode)?;
         let path = self.transaction.path().join(id.as_str());
         if let Some(parent) = path.parent() {
@@ -312,6 +353,7 @@ impl Generation {
             validate_private_ancestors(self.transaction.path(), parent)?;
         }
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        set_file_owner(&file, uid, gid)?;
         set_file_mode(&file, mode)?;
         Ok(file)
     }
@@ -401,6 +443,38 @@ fn is_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_account_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.bytes().any(|byte| {
+            byte.is_ascii_control() || byte == b'/' || byte == b':' || byte.is_ascii_whitespace()
+        })
+}
+
+#[cfg(unix)]
+fn resolve_user(name: &str) -> Result<u32, RuntimeError> {
+    uzers::get_user_by_name(name)
+        .map(|user| user.uid())
+        .ok_or(RuntimeError::UnknownAccount)
+}
+
+#[cfg(not(unix))]
+fn resolve_user(_name: &str) -> Result<u32, RuntimeError> {
+    Err(RuntimeError::UnknownAccount)
+}
+
+#[cfg(unix)]
+fn resolve_group(name: &str) -> Result<u32, RuntimeError> {
+    uzers::get_group_by_name(name)
+        .map(|group| group.gid())
+        .ok_or(RuntimeError::UnknownAccount)
+}
+
+#[cfg(not(unix))]
+fn resolve_group(_name: &str) -> Result<u32, RuntimeError> {
+    Err(RuntimeError::UnknownAccount)
 }
 
 fn validate_mode(mode: u32) -> Result<(), RuntimeError> {
@@ -636,6 +710,20 @@ fn set_file_mode(file: &File, mode: u32) -> Result<(), std::io::Error> {
     fchmod(file, permissions).map_err(Into::into)
 }
 
+#[cfg(unix)]
+fn set_file_owner(file: &File, uid: u32, gid: u32) -> Result<(), std::io::Error> {
+    use rustix::{
+        fs::fchown,
+        process::{Gid, Uid},
+    };
+    fchown(file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).map_err(Into::into)
+}
+
+#[cfg(not(unix))]
+fn set_file_owner(_file: &File, _uid: u32, _gid: u32) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn set_file_mode(_file: &File, _mode: u32) -> Result<(), std::io::Error> {
     Ok(())
@@ -659,6 +747,8 @@ mod tests {
         secret_id: Id,
         fingerprint: String,
         trusted: TrustedKeys,
+        owner: String,
+        group: String,
     }
 
     fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
@@ -696,6 +786,18 @@ mod tests {
         std::fs::write(&envelope, serde_json::to_vec(&signed)?)?;
         let mut trusted = TrustedKeys::new();
         trusted.insert_encoded(&signing_key.encode_public())?;
+        let owner = uzers::get_user_by_uid(uzers::get_current_uid())
+            .ok_or("current user is not resolvable")?
+            .name()
+            .to_str()
+            .ok_or("current user name is not UTF-8")?
+            .to_owned();
+        let group = uzers::get_group_by_gid(uzers::get_current_gid())
+            .ok_or("current group is not resolvable")?
+            .name()
+            .to_str()
+            .ok_or("current group name is not UTF-8")?
+            .to_owned();
         Ok(Fixture {
             temporary,
             runtime,
@@ -706,20 +808,32 @@ mod tests {
             secret_id,
             fingerprint,
             trusted,
+            owner,
+            group,
         })
+    }
+
+    fn owned_artifact<'a>(
+        fixture: &'a Fixture,
+        ciphertext: &'a Path,
+        secret_id: &'a Id,
+    ) -> ActivationArtifact<'a> {
+        ActivationArtifact {
+            ciphertext,
+            envelope: &fixture.envelope,
+            secret_id,
+            source_ciphertext_hash: SOURCE_HASH,
+            artifact_generation: 1,
+            mode: 0o400,
+            owner: &fixture.owner,
+            group: &fixture.group,
+        }
     }
 
     #[test]
     fn verifies_then_atomically_switches_generation() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture()?;
-        let artifact = ActivationArtifact {
-            ciphertext: &fixture.ciphertext,
-            envelope: &fixture.envelope,
-            secret_id: &fixture.secret_id,
-            source_ciphertext_hash: SOURCE_HASH,
-            artifact_generation: 1,
-            mode: 0o400,
-        };
+        let artifact = owned_artifact(&fixture, &fixture.ciphertext, &fixture.secret_id);
         let request = ActivationRequest {
             runtime_root: &fixture.runtime,
             runtime_generation: None,
@@ -740,6 +854,14 @@ mod tests {
             std::fs::read(result.generation_path.join("db/password"))?,
             b"plaintext-canary"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(result.generation_path.join("db/password"))?;
+            assert_eq!(metadata.uid(), uzers::get_current_uid());
+            assert_eq!(metadata.gid(), uzers::get_current_gid());
+            assert_eq!(metadata.mode() & 0o777, 0o400);
+        }
         assert_eq!(
             std::fs::read_link(fixture.runtime.join("current"))?,
             Path::new("generation-1")
@@ -754,6 +876,35 @@ mod tests {
     }
 
     #[test]
+    fn unknown_account_fails_before_runtime_creation() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture()?;
+        let artifact = ActivationArtifact {
+            owner: "nix-seal-account-that-must-not-exist",
+            ..owned_artifact(&fixture, &fixture.ciphertext, &fixture.secret_id)
+        };
+        let request = ActivationRequest {
+            runtime_root: &fixture.runtime,
+            runtime_generation: None,
+            plan_hash: PLAN_HASH,
+            target_id: &fixture.target_id,
+            recipient_fingerprint: &fixture.fingerprint,
+            tool_version: "0.1.0-alpha.1",
+            now: 101,
+            allowed_clock_skew: 0,
+            trusted_keys: &fixture.trusted,
+            approval_threshold: 1,
+            target_identity: &fixture.target_identity,
+            artifacts: std::slice::from_ref(&artifact),
+        };
+        assert!(matches!(
+            activate(&request),
+            Err(RuntimeError::UnknownAccount)
+        ));
+        assert!(!fixture.runtime.exists());
+        Ok(())
+    }
+
+    #[test]
     fn activation_spec_is_strict_and_rejects_duplicate_destinations()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture()?;
@@ -764,6 +915,8 @@ mod tests {
             source_ciphertext_hash: SOURCE_HASH.to_owned(),
             artifact_generation: 1,
             mode: "0400".to_owned(),
+            owner: fixture.owner.clone(),
+            group: fixture.group.clone(),
         };
         let spec = ActivationSpecV1 {
             schema: ACTIVATION_SCHEMA.to_owned(),
@@ -808,14 +961,7 @@ mod tests {
         initial.commit_and_switch(1)?;
         std::fs::write(&fixture.ciphertext, b"substituted")?;
 
-        let artifact = ActivationArtifact {
-            ciphertext: &fixture.ciphertext,
-            envelope: &fixture.envelope,
-            secret_id: &fixture.secret_id,
-            source_ciphertext_hash: SOURCE_HASH,
-            artifact_generation: 1,
-            mode: 0o400,
-        };
+        let artifact = owned_artifact(&fixture, &fixture.ciphertext, &fixture.secret_id);
         let request = ActivationRequest {
             runtime_root: &fixture.runtime,
             runtime_generation: Some(2),
@@ -852,22 +998,8 @@ mod tests {
     fn verifies_entire_batch_before_creating_plaintext() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture()?;
         let other_id = Id::parse("db/other")?;
-        let first = ActivationArtifact {
-            ciphertext: &fixture.ciphertext,
-            envelope: &fixture.envelope,
-            secret_id: &fixture.secret_id,
-            source_ciphertext_hash: SOURCE_HASH,
-            artifact_generation: 1,
-            mode: 0o400,
-        };
-        let mismatched = ActivationArtifact {
-            ciphertext: &fixture.ciphertext,
-            envelope: &fixture.envelope,
-            secret_id: &other_id,
-            source_ciphertext_hash: SOURCE_HASH,
-            artifact_generation: 1,
-            mode: 0o400,
-        };
+        let first = owned_artifact(&fixture, &fixture.ciphertext, &fixture.secret_id);
+        let mismatched = owned_artifact(&fixture, &fixture.ciphertext, &other_id);
         let artifacts = [first, mismatched];
         let request = ActivationRequest {
             runtime_root: &fixture.runtime,
@@ -901,14 +1033,7 @@ mod tests {
         initial.write_from(&fixture.secret_id, b"old-value".as_slice(), 0o400)?;
         initial.commit_and_switch(1)?;
         let (wrong_identity, _recipient) = nix_seal_crypto::generate_x25519();
-        let artifact = ActivationArtifact {
-            ciphertext: &fixture.ciphertext,
-            envelope: &fixture.envelope,
-            secret_id: &fixture.secret_id,
-            source_ciphertext_hash: SOURCE_HASH,
-            artifact_generation: 1,
-            mode: 0o400,
-        };
+        let artifact = owned_artifact(&fixture, &fixture.ciphertext, &fixture.secret_id);
         let request = ActivationRequest {
             runtime_root: &fixture.runtime,
             runtime_generation: Some(2),
@@ -943,14 +1068,7 @@ mod tests {
         let fixture = fixture()?;
         let link = fixture.temporary.path().join("linked.age");
         symlink(&fixture.ciphertext, &link)?;
-        let artifact = ActivationArtifact {
-            ciphertext: &link,
-            envelope: &fixture.envelope,
-            secret_id: &fixture.secret_id,
-            source_ciphertext_hash: SOURCE_HASH,
-            artifact_generation: 1,
-            mode: 0o400,
-        };
+        let artifact = owned_artifact(&fixture, &link, &fixture.secret_id);
         let request = ActivationRequest {
             runtime_root: &fixture.runtime,
             runtime_generation: Some(1),

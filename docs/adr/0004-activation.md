@@ -25,3 +25,9 @@ internal Rust `activate` command loads that identity with no-follow,
 single-link, owner, and restrictive-mode checks. Runtime generation numbers are
 allocated while the activation lock is held, avoiding collisions between
 concurrent or repeated activations.
+
+Runtime owner and group names are resolved before a plaintext transaction is
+created. The runtime applies the resulting numeric IDs with descriptor-based
+`fchown`, then reapplies the restrictive mode with descriptor-based `fchmod` so
+ownership changes cannot clear the intended final permission bits or introduce a
+path-resolution race.

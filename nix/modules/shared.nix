@@ -26,6 +26,8 @@ let
       inherit (secret) sourceCiphertextHash;
       inherit (secret) artifactGeneration;
       inherit (secret) mode;
+      inherit (secret) owner;
+      inherit (secret) group;
     }) configuredSecrets;
   };
 in

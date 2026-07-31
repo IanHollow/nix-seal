@@ -516,6 +516,8 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
                 source_ciphertext_hash: &artifact.source_ciphertext_hash,
                 artifact_generation: artifact.artifact_generation,
                 mode: artifact.parsed_mode()?,
+                owner: &artifact.owner,
+                group: &artifact.group,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -846,6 +848,12 @@ mod tests {
                 source_ciphertext_hash: source_hash,
                 artifact_generation: 1,
                 mode: "0400".to_owned(),
+                owner: uzers::get_user_by_uid(uzers::get_current_uid())
+                    .and_then(|user| user.name().to_str().map(str::to_owned))
+                    .ok_or("current user is not resolvable")?,
+                group: uzers::get_group_by_gid(uzers::get_current_gid())
+                    .and_then(|group| group.name().to_str().map(str::to_owned))
+                    .ok_or("current group is not resolvable")?,
             }],
         };
         write_new_json(&spec_path, &spec)?;

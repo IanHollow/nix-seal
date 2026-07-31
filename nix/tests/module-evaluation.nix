@@ -53,7 +53,9 @@ let
         .targetId == "host.test" and
         .approvalThreshold == 1 and
         (.artifacts | length) == 1 and
-        .artifacts[0].secretId == "db/password"
+        .artifacts[0].secretId == "db/password" and
+        .artifacts[0].owner == "root" and
+        .artifacts[0].group == "root"
       ' ${spec} >/dev/null
       grep -F -- "--identity /run/keys/nix-seal-target" ${activationText} >/dev/null
       touch "$out"
