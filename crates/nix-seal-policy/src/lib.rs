@@ -915,7 +915,12 @@ fn validate_generator_execution(
     }
     let is_builtin = matches!(
         generator.executable.as_str(),
-        "builtin:random" | "builtin:hex" | "builtin:uuid"
+        "builtin:random"
+            | "builtin:hex"
+            | "builtin:base64"
+            | "builtin:token"
+            | "builtin:wireguard-private-key"
+            | "builtin:uuid"
     );
     if !is_builtin && !valid_store_executable(&generator.executable) {
         return Err(PolicyError::Violation(format!(

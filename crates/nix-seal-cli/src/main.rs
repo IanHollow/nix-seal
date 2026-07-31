@@ -2,6 +2,10 @@
 //! Command-line interface. Plaintext output is limited to `secret reveal`.
 
 use anyhow::{Context, Result, bail};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 use std::{
@@ -1742,6 +1746,33 @@ fn generate_builtin_value(generator: &nix_seal_core::Generator) -> Result<Secret
             hex_encode(input.expose_secret(), &mut output)?;
             Ok(SecretBox::new(Box::new(output)))
         }
+        "builtin:base64" => {
+            let input = nix_seal_crypto::random_bytes(generator_byte_length(generator)?)?;
+            Ok(SecretBox::new(Box::new(
+                BASE64_STANDARD.encode(input.expose_secret()).into_bytes(),
+            )))
+        }
+        "builtin:token" => {
+            let input = nix_seal_crypto::random_bytes(generator_byte_length(generator)?)?;
+            Ok(SecretBox::new(Box::new(
+                URL_SAFE_NO_PAD.encode(input.expose_secret()).into_bytes(),
+            )))
+        }
+        "builtin:wireguard-private-key" => {
+            if !generator.parameters.is_empty() {
+                bail!("builtin:wireguard-private-key does not accept parameters");
+            }
+            let mut input = nix_seal_crypto::random_bytes(32)?;
+            let bytes = input.expose_secret_mut();
+            // WireGuard uses Curve25519 private scalars. Clamp according to RFC 7748
+            // before standard base64 serialization, the format consumed by wg(8).
+            bytes[0] &= 0b1111_1000;
+            bytes[31] &= 0b0111_1111;
+            bytes[31] |= 0b0100_0000;
+            Ok(SecretBox::new(Box::new(
+                BASE64_STANDARD.encode(bytes).into_bytes(),
+            )))
+        }
         "builtin:uuid" => {
             if !generator.parameters.is_empty() {
                 bail!("builtin:uuid does not accept parameters");
@@ -1761,7 +1792,7 @@ fn generate_builtin_value(generator: &nix_seal_core::Generator) -> Result<Secret
             Ok(SecretBox::new(Box::new(output)))
         }
         _ => bail!(
-            "generator executable is unsupported; v1 accepts builtin:random, builtin:hex, or builtin:uuid"
+            "generator executable is unsupported; v1 accepts builtin:random, builtin:hex, builtin:base64, builtin:token, builtin:wireguard-private-key, or builtin:uuid"
         ),
     }
 }
@@ -2893,6 +2924,57 @@ mod tests {
         let hex_value = generate_builtin_value(&hex)?;
         assert_eq!(hex_value.expose_secret().len(), 48);
         assert!(hex_value.expose_secret().iter().all(u8::is_ascii_hexdigit));
+        let base64 = nix_seal_core::Generator {
+            executable: "builtin:base64".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            outputs: vec![output.clone()],
+            prompts: Vec::new(),
+            parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
+            validation: None,
+        };
+        assert_eq!(generate_builtin_value(&base64)?.expose_secret().len(), 32);
+        let token = nix_seal_core::Generator {
+            executable: "builtin:token".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            outputs: vec![output.clone()],
+            prompts: Vec::new(),
+            parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
+            validation: None,
+        };
+        let token = generate_builtin_value(&token)?;
+        assert_eq!(token.expose_secret().len(), 32);
+        assert!(
+            token
+                .expose_secret()
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        );
+        let wireguard = nix_seal_core::Generator {
+            executable: "builtin:wireguard-private-key".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            outputs: vec![output.clone()],
+            prompts: Vec::new(),
+            parameters: BTreeMap::new(),
+            validation: None,
+        };
+        let wireguard = generate_builtin_value(&wireguard)?;
+        let wireguard_bytes = BASE64_STANDARD.decode(wireguard.expose_secret())?;
+        assert_eq!(wireguard_bytes.len(), 32);
+        assert_eq!(wireguard_bytes[0] & 7, 0);
+        assert_eq!(wireguard_bytes[31] & 128, 0);
+        assert_eq!(wireguard_bytes[31] & 64, 64);
         let uuid = nix_seal_core::Generator {
             executable: "builtin:uuid".to_owned(),
             arguments: Vec::new(),

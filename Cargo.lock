@@ -1250,6 +1250,7 @@ name = "nix-seal"
 version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
+ "base64",
  "blake3",
  "clap",
  "clap_complete",
