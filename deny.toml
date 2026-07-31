@@ -1,6 +1,12 @@
 [advisories]
 version = 2
 yanked = "deny"
+# age's optional OpenSSH compatibility feature requires `rsa` for parsing
+# existing OpenSSH RSA identities. RUSTSEC-2023-0071 has no upstream fix. Its
+# use is constrained by ADR 0009: no network service, no daemon, no RSA for
+# new configuration, and no encrypted-key prompting. Reassess on every age or
+# rsa update and remove this exception before any network-facing use exists.
+ignore = ["RUSTSEC-2023-0071"]
 
 [licenses]
 version = 2

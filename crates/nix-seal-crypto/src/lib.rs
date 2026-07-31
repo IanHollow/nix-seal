@@ -3,7 +3,7 @@
 
 use age::{Decryptor, Encryptor, Identity, Recipient, secrecy::ExposeSecret};
 use secrecy::{ExposeSecretMut, SecretBox};
-use std::io::{Read, Write};
+use std::io::{BufReader, Cursor, Read, Write};
 use thiserror::Error;
 
 const MAX_SECRET_BYTES: u64 = 64 * 1024 * 1024;
@@ -53,29 +53,47 @@ pub fn generate_x25519() -> (secrecy::SecretString, String) {
     (private, identity.to_public().to_string())
 }
 
-/// Derives the public recipient from a standard `X25519` identity.
+/// Derives the normalized public recipient from a native X25519 or unencrypted
+/// OpenSSH compatibility identity.
 pub fn recipient_from_identity(identity: &secrecy::SecretString) -> Result<String, CryptoError> {
-    let parsed = identity
+    if let Ok(parsed) = identity
         .expose_secret()
         .trim()
         .parse::<age::x25519::Identity>()
-        .map_err(|_| CryptoError::Identity)?;
-    Ok(parsed.to_public().to_string())
+    {
+        return Ok(parsed.to_public().to_string());
+    }
+    let parsed = parse_ssh_identity(identity)?;
+    age::ssh::Recipient::try_from(parsed)
+        .map(|recipient| recipient.to_string())
+        .map_err(|_| CryptoError::Identity)
 }
 
-/// Returns a domain-separated fingerprint of a normalized X25519 recipient.
+/// Parses an accepted recipient and returns its canonical serialized form.
+///
+/// This deliberately removes an OpenSSH public-key comment before policy
+/// comparison and fingerprinting, because comments are not key material.
+pub fn normalize_recipient(recipient: &str) -> Result<String, CryptoError> {
+    if let Ok(parsed) = recipient.parse::<age::x25519::Recipient>() {
+        return Ok(parsed.to_string());
+    }
+    recipient
+        .parse::<age::ssh::Recipient>()
+        .map(|parsed| parsed.to_string())
+        .map_err(|_| CryptoError::Recipient)
+}
+
+/// Returns a domain-separated fingerprint of a normalized age recipient.
 pub fn recipient_fingerprint(recipient: &str) -> Result<String, CryptoError> {
-    let normalized = recipient
-        .parse::<age::x25519::Recipient>()
-        .map_err(|_| CryptoError::Recipient)?
-        .to_string();
+    let normalized = normalize_recipient(recipient)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"nix-seal.age-recipient-fingerprint.v1\0");
     hasher.update(normalized.as_bytes());
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Encrypts a stream to standard age `X25519` recipients, bounded to 64 MiB.
+/// Encrypts a stream to native age or OpenSSH-compatibility recipients, bounded
+/// to 64 MiB.
 pub fn encrypt<R: Read, W: Write>(
     mut input: R,
     output: W,
@@ -83,12 +101,7 @@ pub fn encrypt<R: Read, W: Write>(
 ) -> Result<(), CryptoError> {
     let parsed = recipients
         .iter()
-        .map(|value| {
-            value
-                .parse::<age::x25519::Recipient>()
-                .map(|recipient| Box::new(recipient) as Box<dyn Recipient + Send>)
-                .map_err(|_| CryptoError::Recipient)
-        })
+        .map(|value| parse_recipient(value))
         .collect::<Result<Vec<_>, _>>()?;
     if parsed.is_empty() {
         return Err(CryptoError::Recipient);
@@ -111,21 +124,60 @@ pub fn encrypt<R: Read, W: Write>(
     Ok(())
 }
 
-/// Decrypts a stream using a standard `X25519` identity, bounded to 64 MiB.
+/// Decrypts a stream using a native X25519 or unencrypted OpenSSH
+/// compatibility identity, bounded to 64 MiB.
 pub fn decrypt<R: Read, W: Write>(
     input: R,
-    mut output: W,
+    output: W,
     identity: &secrecy::SecretString,
 ) -> Result<(), CryptoError> {
-    let parsed = identity
+    let parsed = parse_identity(identity)?;
+    decrypt_with_identity(input, output, parsed.as_ref())
+}
+
+fn parse_recipient(value: &str) -> Result<Box<dyn Recipient + Send>, CryptoError> {
+    if let Ok(recipient) = value.parse::<age::x25519::Recipient>() {
+        return Ok(Box::new(recipient));
+    }
+    value
+        .parse::<age::ssh::Recipient>()
+        .map(|recipient| Box::new(recipient) as Box<dyn Recipient + Send>)
+        .map_err(|_| CryptoError::Recipient)
+}
+
+fn parse_identity(
+    identity: &secrecy::SecretString,
+) -> Result<Box<dyn Identity + Send>, CryptoError> {
+    if let Ok(parsed) = identity
         .expose_secret()
         .trim()
         .parse::<age::x25519::Identity>()
-        .map_err(|_| CryptoError::Identity)?;
+    {
+        return Ok(Box::new(parsed));
+    }
+    let parsed = parse_ssh_identity(identity)?;
+    if matches!(&parsed, age::ssh::Identity::Encrypted(_)) {
+        return Err(CryptoError::Identity);
+    }
+    Ok(Box::new(parsed))
+}
+
+fn parse_ssh_identity(identity: &secrecy::SecretString) -> Result<age::ssh::Identity, CryptoError> {
+    age::ssh::Identity::from_buffer(
+        BufReader::new(Cursor::new(identity.expose_secret().as_bytes())),
+        None,
+    )
+    .map_err(|_| CryptoError::Identity)
+}
+
+fn decrypt_with_identity<R: Read, W: Write>(
+    input: R,
+    mut output: W,
+    identity: &dyn Identity,
+) -> Result<(), CryptoError> {
     let decryptor = Decryptor::new(input).map_err(|_| CryptoError::Decrypt)?;
-    let identities: Vec<&dyn Identity> = vec![&parsed];
     let mut reader = decryptor
-        .decrypt(identities.into_iter())
+        .decrypt(std::iter::once(identity))
         .map_err(|_| CryptoError::Decrypt)?;
     std::io::copy(&mut reader.by_ref().take(MAX_SECRET_BYTES), &mut output)
         .map_err(|_| CryptoError::Io)?;
@@ -151,28 +203,18 @@ pub fn rekey<R: Read, W: Write>(
     identity: &secrecy::SecretString,
     recipients: &[String],
 ) -> Result<(), CryptoError> {
-    let identity = identity
-        .expose_secret()
-        .trim()
-        .parse::<age::x25519::Identity>()
-        .map_err(|_| CryptoError::Identity)?;
+    let identity = parse_identity(identity)?;
     let recipients = recipients
         .iter()
-        .map(|value| {
-            value
-                .parse::<age::x25519::Recipient>()
-                .map(|recipient| Box::new(recipient) as Box<dyn Recipient + Send>)
-                .map_err(|_| CryptoError::Recipient)
-        })
+        .map(|value| parse_recipient(value))
         .collect::<Result<Vec<_>, _>>()?;
     if recipients.is_empty() {
         return Err(CryptoError::Recipient);
     }
 
     let decryptor = Decryptor::new(input).map_err(|_| CryptoError::Decrypt)?;
-    let identities: Vec<&dyn Identity> = vec![&identity];
     let mut plaintext = decryptor
-        .decrypt(identities.into_iter())
+        .decrypt(std::iter::once(identity.as_ref() as &dyn Identity))
         .map_err(|_| CryptoError::Decrypt)?;
     let encryptor = Encryptor::with_recipients(
         recipients
@@ -199,6 +241,16 @@ pub fn rekey<R: Read, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SSH_ED25519_RECIPIENT: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHsKLqeplhpW+uObz5dvMgjz1OxfM/XXUB+VHtZ6isGN alice@rust";
+    const SSH_ED25519_IDENTITY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+QyNTUxOQAAACB7Ci6nqZYaVvrjm8+XbzII89TsXzP111AflR7WeorBjQAAAJCfEwtqnxML\n\
+agAAAAtzc2gtZWQyNTUxOQAAACB7Ci6nqZYaVvrjm8+XbzII89TsXzP111AflR7WeorBjQ\n\
+AAAEADBJvjZT8X6JRJI8xVq/1aU8nMVgOtVnmdwqWwrSlXG3sKLqeplhpW+uObz5dvMgjz\n\
+1OxfM/XXUB+VHtZ6isGNAAAADHN0cjRkQGNhcmJvbgE=\n\
+-----END OPENSSH PRIVATE KEY-----\n";
+
     #[test]
     fn x25519_round_trip() -> Result<(), CryptoError> {
         let (identity, recipient) = generate_x25519();
@@ -226,6 +278,26 @@ mod tests {
         )?;
         assert_eq!(target_plaintext, b"canary");
         assert_eq!(recipient_fingerprint(&target_recipient)?.len(), 64);
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_ed25519_compatibility_round_trip() -> Result<(), CryptoError> {
+        let identity = secrecy::SecretString::from(SSH_ED25519_IDENTITY.to_owned());
+        let mut ciphertext = Vec::new();
+        encrypt(
+            b"ssh-canary".as_slice(),
+            &mut ciphertext,
+            &[SSH_ED25519_RECIPIENT.to_owned()],
+        )?;
+        assert!(!ciphertext.windows(10).any(|window| window == b"ssh-canary"));
+        let mut plaintext = Vec::new();
+        decrypt(ciphertext.as_slice(), &mut plaintext, &identity)?;
+        assert_eq!(plaintext, b"ssh-canary");
+        assert_eq!(
+            recipient_fingerprint(SSH_ED25519_RECIPIENT)?,
+            recipient_fingerprint(&recipient_from_identity(&identity)?)?
+        );
         Ok(())
     }
 }

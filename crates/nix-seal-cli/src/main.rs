@@ -714,7 +714,7 @@ fn migrate_secretctl(index_path: &Path, json: bool) -> Result<()> {
     }
     let warnings = vec![
         "dry run only: no ciphertext, configuration, or source manager was changed".to_owned(),
-        "secretctl uses SSH recipients; migrate targets to native age or an approved age SSH compatibility identity before importing ciphertext".to_owned(),
+        "secretctl uses SSH recipients; native age is preferred, while unencrypted OpenSSH identities are available only for reviewed migration compatibility".to_owned(),
         "review normalized IDs and scope selectors before generating a nix-seal plan".to_owned(),
     ];
     if json {
@@ -732,7 +732,7 @@ fn migrate_secretctl(index_path: &Path, json: bool) -> Result<()> {
         );
     } else {
         println!(
-            "secretctl dry-run: {} secrets and {} targets mapped; {} SSH recipients need identity migration",
+            "secretctl dry-run: {} secrets and {} targets mapped; {} SSH recipients require a reviewed migration path",
             mappings.len(),
             targets.len(),
             ssh_recipients.len()
@@ -1359,9 +1359,7 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
     let policy = nix_seal_policy::target_policy(&plan, &spec.target_id)?;
     verify_activation_projection(&spec, &policy)?;
     let identity = read_identity(&arguments.identity)?;
-    if nix_seal_crypto::recipient_from_identity(&identity)? != policy.recipient {
-        bail!("target identity does not match the recipient selected by plan policy");
-    }
+    ensure_identity_matches_recipient(&identity, &policy.recipient)?;
     let target_policy_hash = nix_seal_policy::target_policy_hash(&policy)?;
     let recipient_fingerprint = nix_seal_crypto::recipient_fingerprint(&policy.recipient)?;
     let artifacts = spec
@@ -1448,6 +1446,18 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
                 "unchanged"
             }
         );
+    }
+    Ok(())
+}
+
+fn ensure_identity_matches_recipient(
+    identity: &secrecy::SecretString,
+    recipient: &str,
+) -> Result<()> {
+    if nix_seal_crypto::recipient_from_identity(identity)?
+        != nix_seal_crypto::normalize_recipient(recipient)?
+    {
+        bail!("target identity does not match the recipient selected by plan policy");
     }
     Ok(())
 }

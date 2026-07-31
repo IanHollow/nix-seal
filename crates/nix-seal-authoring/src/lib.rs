@@ -127,7 +127,11 @@ pub fn write_secret<R: Read>(
     mode: WriteMode,
 ) -> Result<AuthoringResult, AuthoringError> {
     let verification_recipient = nix_seal_crypto::recipient_from_identity(verification_identity)?;
-    if !recipients.contains(&verification_recipient) {
+    let normalized_recipients = recipients
+        .iter()
+        .map(|recipient| nix_seal_crypto::normalize_recipient(recipient))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !normalized_recipients.contains(&verification_recipient) {
         return Err(AuthoringError::VerificationIdentity);
     }
     let destination = resolve_destination(repository_root, relative_destination)?;

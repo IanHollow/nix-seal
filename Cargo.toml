@@ -21,7 +21,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/IanHollow/nix-seal"
 
 [workspace.dependencies]
-age = { version = "=0.12.1", default-features = false, features = ["armor"] }
+age = { version = "=0.12.1", default-features = false, features = ["armor", "ssh"] }
 anyhow = "1.0.98"
 base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 blake3 = "1.8.2"
