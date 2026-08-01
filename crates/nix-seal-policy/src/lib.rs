@@ -290,7 +290,14 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
     let mut signer_keys = BTreeMap::new();
     for (id, identity) in &plan.identities {
         if matches!(identity.kind, IdentityKind::Signer)
-            && let Some(previous) = signer_keys.insert(&identity.public, id)
+            && let Some(previous) = signer_keys.insert(
+                nix_seal_manifest::public_key_id(&identity.public).map_err(|_| {
+                    PolicyError::Violation(format!(
+                        "identity {id} has an invalid approval verification key"
+                    ))
+                })?,
+                id,
+            )
         {
             return Err(PolicyError::Violation(format!(
                 "signer identities {previous} and {id} reuse one public verification key"
@@ -1328,6 +1335,31 @@ mod tests {
                 },
             );
         }
+        assert!(validate(&plan).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_openssh_signer_keys_ignore_public_comments() -> Result<(), PolicyError> {
+        let mut plan = PlanV1::default();
+        let first =
+            Id::parse("signer-a").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let second =
+            Id::parse("signer-b").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.identities.insert(
+            first,
+            nix_seal_core::Identity {
+                kind: IdentityKind::Signer,
+                public: SSH_SIGNER.to_owned(),
+            },
+        );
+        plan.identities.insert(
+            second,
+            nix_seal_core::Identity {
+                kind: IdentityKind::Signer,
+                public: SSH_SIGNER.replace("release@example.com", "incident@example.com"),
+            },
+        );
         assert!(validate(&plan).is_err());
         Ok(())
     }

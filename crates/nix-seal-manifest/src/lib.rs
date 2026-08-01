@@ -375,6 +375,14 @@ pub fn validate_public_key(encoded: &str) -> Result<(), ManifestError> {
     Ok(())
 }
 
+/// Returns the stable, comment-independent identifier of one approval key.
+///
+/// Policy code uses this identifier to reject the same OpenSSH public key
+/// declared under multiple identity IDs with different comments.
+pub fn public_key_id(encoded: &str) -> Result<String, ManifestError> {
+    parse_public_key(encoded)?.key_id()
+}
+
 fn encode_public_key(key: &VerifyingKey) -> String {
     format!("{PUBLIC_KEY_PREFIX}{}", STANDARD.encode(key.as_bytes()))
 }

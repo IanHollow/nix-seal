@@ -22,7 +22,9 @@ keys. Those approvals are encoded as standard OpenSSH `sshsig` PEM under the
 fixed `nix-seal-artifact-v2` namespace over the same DSSE pre-authenticated
 bytes. The envelope records its signature format, so a native Ed25519 signature
 can never be interpreted as an SSH signature (or vice versa). SSH public-key
-comments do not affect the approval key ID or authorization comparison.
+comments do not affect the approval key ID or authorization comparison. Plan
+validation rejects comment-only duplicates before approval thresholds are
+calculated, so one OpenSSH key cannot inflate an N-of-M policy.
 
 This is deliberately software-key compatibility only. The client does not invoke
 `ssh-keygen`, `ssh-agent`, FIDO/U2F, PKCS#11, or an arbitrary helper; it accepts
