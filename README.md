@@ -392,6 +392,8 @@ the complete prior set. Direct executable generators use an explicit protocol:
 `executable` and every `runtimeInputs` entry must be under `/nix/store`;
 `arguments` are literal public values; and the process runs with a cleared
 environment, null standard streams, a private workspace, and a bounded timeout.
+On Unix it also runs in a dedicated process group, so timeout cleanup terminates
+descendants that might otherwise retain staged plaintext.
 It must write exactly one regular file named `0`, `1`, and so on for each
 declared secret output beneath `$NIX_SEAL_OUTPUT_DIR`, plus the same numbered
 protocol beneath `$NIX_SEAL_PUBLIC_OUTPUT_DIR` for declared public outputs.

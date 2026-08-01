@@ -1657,6 +1657,7 @@ fn migrate_sops_document(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .env_clear();
+    isolate_child_process_group(&mut command);
     if let Some(path) = &sops_age_key_file {
         command.env("SOPS_AGE_KEY_FILE", path);
     }
@@ -1677,7 +1678,7 @@ fn migrate_sops_document(
             && let Ok(mut child) = watchdog_child.lock()
             && child.try_wait().ok().flatten().is_none()
         {
-            let _ = child.kill();
+            terminate_child_process_tree(&mut child);
         }
     });
     let result = nix_seal_authoring::write_secret_checked(
@@ -1771,6 +1772,7 @@ fn migrate_pgp_document(
     };
 
     let mut command = pgp_decrypt_command(&gpg, &gnupg_home, &source);
+    isolate_child_process_group(&mut command);
     let mut child = command
         .spawn()
         .context("could not start the explicit GnuPG migration executable")?;
@@ -1788,7 +1790,7 @@ fn migrate_pgp_document(
             && let Ok(mut child) = watchdog_child.lock()
             && child.try_wait().ok().flatten().is_none()
         {
-            let _ = child.kill();
+            terminate_child_process_tree(&mut child);
         }
     });
     let result = nix_seal_authoring::write_secret_checked(
@@ -1899,9 +1901,40 @@ fn wait_for_external_migration(
 
 fn terminate_external_migration(child: &Arc<Mutex<Child>>) {
     if let Ok(mut child) = child.lock() {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_child_process_tree(&mut child);
     }
+}
+
+/// Starts an explicitly declared external executable in its own process group.
+///
+/// A generator or migration helper is an untrusted process boundary. Keeping
+/// descendants in a private group lets the timeout path terminate the complete
+/// tree instead of leaving a helper behind with access to staged plaintext.
+#[cfg(unix)]
+fn isolate_child_process_group(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+
+    // `process_group(0)` asks the child to become the leader of a new group
+    // whose ID is its own PID. This is a safe std API and does not require a
+    // pre-exec hook (which would require an unsafe block).
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_child_process_group(_command: &mut ProcessCommand) {}
+
+fn terminate_child_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // Avoid signalling a reused process-group ID after the child already
+        // exited. `try_wait` also makes the subsequent wait deterministic.
+        let running = child.try_wait().ok().flatten().is_none();
+        if running && let Some(pid) = rustix::process::Pid::from_raw(child.id().cast_signed()) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn resolve_migration_regular_file(repository_root: &Path, relative: &Path) -> Result<PathBuf> {
@@ -4763,7 +4796,8 @@ fn generate_external_values(
             .map(|input| Path::new(input).join("bin")),
     )
     .context("generator runtime inputs cannot form a safe PATH")?;
-    let mut child = ProcessCommand::new(&generator.executable)
+    let mut command = ProcessCommand::new(&generator.executable);
+    command
         .args(&generator.arguments)
         .env_clear()
         .env("PATH", runtime_path)
@@ -4786,7 +4820,9 @@ fn generate_external_values(
         .current_dir(workspace.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    isolate_child_process_group(&mut command);
+    let mut child = command
         .spawn()
         .context("could not start constrained generator")?;
     let deadline = Instant::now() + Duration::from_secs(u64::from(generator.timeout_seconds));
@@ -4798,8 +4834,7 @@ fn generate_external_values(
             Some(status) if status.success() => break,
             Some(_) => bail!("constrained generator failed"),
             None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child_process_tree(&mut child);
                 bail!("constrained generator timed out");
             }
             None => thread::sleep(Duration::from_millis(10)),
