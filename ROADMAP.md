@@ -27,8 +27,12 @@
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
   starting with a synthetic low-risk secret. Public migration compatibility
   goldens now cover agenix/ragenix, agenix-rekey, SOPS metadata, Clan
-  Vars/Facts, and the current secretctl index; mutation fixtures and actual
-  nix-conf dogfooding remain required.
+  Vars/Facts, and the current secretctl index. The parent nix-conf flake now
+  runs a disposable end-to-end dogfood check covering generated identities,
+  canonical authoring, deep validation, signed provisioning, cache
+  export/import, activation, and template rendering without copying plaintext
+  into its output; mutation fixtures and migration of actual nix-conf secrets
+  remain required.
 - Phase 5: attack-path review, sustained fuzz/mutation/platform/performance work
   (the reproducible scale benchmark protocol and scheduled Miri, sanitizer, and
   mutation jobs are now published), release build/SBOM/attestation scaffolding,
