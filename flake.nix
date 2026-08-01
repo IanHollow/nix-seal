@@ -83,6 +83,7 @@
                 clippy
                 cargo-deny
                 cargo-audit
+                cargo-vet
                 nixfmt-rfc-style
               ]
               ++ lib.optionals stdenv.hostPlatform.isDarwin [ libiconv ];

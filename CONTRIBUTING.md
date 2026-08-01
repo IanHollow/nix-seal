@@ -13,8 +13,14 @@ git commit -s
 
 Run `cargo fmt --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace`, and `nix flake check`. Never put real secrets, private
-identities, prompt answers, or plaintext test fixtures in commits or CI.
+`cargo test --workspace`, `cargo vet --locked`, and `nix flake check`. Never put
+real secrets, private identities, prompt answers, or plaintext test fixtures in
+commits or CI.
 
 Security-critical code requires CODEOWNER review. Dependencies are reviewed one
 at a time; lockfile updates must explain security and compatibility impact.
+`supply-chain/config.toml` is the committed cargo-vet policy. Its exemptions are
+a recorded bootstrap baseline, not an audit claim: reduce them only with a
+documented review or a trusted imported audit. Refresh imports deliberately and
+commit the resulting `supply-chain/imports.lock` change with the dependency
+update.
