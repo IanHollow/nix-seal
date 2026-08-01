@@ -1293,6 +1293,17 @@ fn run_doctor(
                 .to_owned(),
         );
     }
+    let recovery_identity_count = plan
+        .identities
+        .values()
+        .filter(|identity| matches!(identity.kind, nix_seal_core::IdentityKind::Recovery))
+        .count();
+    if !plan.secrets.is_empty() && recovery_identity_count < 2 {
+        warnings.push(
+            "fewer than two recovery identities are declared; add independent recovery paths before relying on this plan"
+                .to_owned(),
+        );
+    }
     if stale_artifacts > 0 {
         warnings.push(format!(
             "{stale_artifacts} cache artifact(s) do not match the current authenticated plan and are garbage-collection candidates"
@@ -1313,6 +1324,7 @@ fn run_doctor(
                 "planHash":plan_hash,
                 "secrets":plan.secrets.len(),
                 "targets":plan.targets.len(),
+                "recoveryIdentities":recovery_identity_count,
                 "cache":{
                     "root":cache.root(),
                     "objects":inventory.object_count,
