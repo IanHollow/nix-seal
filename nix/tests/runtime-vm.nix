@@ -21,16 +21,18 @@ pkgs.testers.nixosTest {
       pkgs.gnugrep
       pkgs.jq
     ];
-    environment.etc."systemd/system/nix-seal-test.service".text = ''
-      [Unit]
-      Description=nix-seal VM credential consumer
-
-      [Service]
-      Type=oneshot
-      RemainAfterExit=yes
-      LoadCredential=database-password:/run/nix-seal/current/app/token
-      ExecStart=/bin/sh -c 'umask 077; cat "$CREDENTIALS_DIRECTORY/database-password" > /run/nix-seal-service-observed'
-    '';
+    systemd.services.nix-seal-test = {
+      description = "nix-seal VM credential consumer";
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        LoadCredential = "database-password:/run/nix-seal/current/app/token";
+      };
+      script = ''
+        umask 077
+        ${pkgs.coreutils}/bin/cat "$CREDENTIALS_DIRECTORY/database-password" > /run/nix-seal-service-observed
+      '';
+    };
     virtualisation.memorySize = 1024;
     system.stateVersion = "26.05";
   };
