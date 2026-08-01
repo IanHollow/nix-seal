@@ -747,6 +747,52 @@ struct AgenixRekeyMigrationArgs {
     execute: bool,
 }
 
+#[derive(Args)]
+struct ClanVarsMigrationArgs {
+    /// Clan's existing `vars/per-machine` directory.
+    #[arg(long, default_value = "vars/per-machine")]
+    directory: PathBuf,
+    /// Repository root containing the legacy Vars tree and destination tree.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Repository-relative destination tree for a side-by-side import.
+    #[arg(long)]
+    destination: Option<PathBuf>,
+    /// Private identity authorized to verify every replacement ciphertext.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Explicit replacement recipient; repeat for each recipient.
+    #[arg(long = "recipient")]
+    recipients: Vec<String>,
+    /// Replace existing destination ciphertexts; omission is create-only.
+    #[arg(long)]
+    replace: bool,
+    /// Commit the complete preflighted migration. Without this flag the
+    /// command reports the mapping and never reads legacy values.
+    #[arg(long)]
+    execute: bool,
+}
+
+#[derive(Args)]
+struct ClanFactsMigrationArgs {
+    /// Clan's existing `machines/<machine>/facts` tree.
+    #[arg(long, default_value = "machines")]
+    directory: PathBuf,
+    /// Repository root containing the legacy Facts tree and destination tree.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Repository-relative destination tree for a side-by-side public import.
+    #[arg(long)]
+    destination: Option<PathBuf>,
+    /// Replace existing destination files; omission is create-only.
+    #[arg(long)]
+    replace: bool,
+    /// Commit the complete preflighted migration. Without this flag the
+    /// command reports the mapping and never reads legacy values.
+    #[arg(long)]
+    execute: bool,
+}
+
 #[derive(Subcommand)]
 enum MigrateCommand {
     /// Inspect a public secretctl `secretIndex` JSON export and optionally write a new candidate plan.
@@ -838,18 +884,10 @@ enum MigrateCommand {
         #[arg(long)]
         execute: bool,
     },
-    /// Inspect Clan Vars per-machine output leaves without reading their values.
-    ClanVars {
-        /// Clan's `vars/per-machine` directory.
-        #[arg(long, default_value = "vars/per-machine")]
-        directory: PathBuf,
-    },
-    /// Inspect Clan Facts public leaves without reading their values.
-    ClanFacts {
-        /// Clan `machines` directory containing per-machine `facts` directories.
-        #[arg(long, default_value = "machines")]
-        directory: PathBuf,
-    },
+    /// Inspect or bulk-import Clan Vars per-machine output leaves.
+    ClanVars(ClanVarsMigrationArgs),
+    /// Inspect or bulk-import Clan Facts public leaves.
+    ClanFacts(ClanFactsMigrationArgs),
     /// Stream one legacy age ciphertext into explicit new recipients.
     Ciphertext {
         /// Existing repository root; source and destination must remain below it.
@@ -1593,8 +1631,8 @@ fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
             execute,
             json,
         ),
-        MigrateCommand::ClanVars { directory } => migrate_clan_vars_tree(&directory, json),
-        MigrateCommand::ClanFacts { directory } => migrate_clan_facts_tree(&directory, json),
+        MigrateCommand::ClanVars(arguments) => migrate_clan_vars_tree(&arguments, json),
+        MigrateCommand::ClanFacts(arguments) => migrate_clan_facts_tree(&arguments, json),
         MigrateCommand::Ciphertext {
             repository_root,
             source,
@@ -2807,24 +2845,76 @@ struct ClanVarInventory {
 }
 
 /// Inventories Clan Vars' documented `machine/generator/file/value` leaves
-/// without opening a value for reading. A Clan store may use SOPS, a password
-/// store, or a custom backend, so byte content is intentionally opaque here.
-fn migrate_clan_vars_tree(directory: &Path, json: bool) -> Result<()> {
-    let supplied_metadata = fs::symlink_metadata(directory)
-        .context("could not inspect Clan Vars per-machine directory")?;
-    if supplied_metadata.file_type().is_symlink() || !supplied_metadata.file_type().is_dir() {
-        bail!("Clan Vars root must be a non-symlink directory");
+/// without opening a value for reading. An explicit import streams each value
+/// directly into a side-by-side native age ciphertext tree; the source manager
+/// remains untouched for rollback and comparison.
+#[allow(clippy::too_many_lines)]
+fn migrate_clan_vars_tree(arguments: &ClanVarsMigrationArgs, json: bool) -> Result<()> {
+    let import_requested = arguments.destination.is_some()
+        || arguments.identity.is_some()
+        || !arguments.recipients.is_empty()
+        || arguments.replace
+        || arguments.execute;
+    let repository_root = if import_requested {
+        Some(resolve_migration_repository_root(
+            &arguments.repository_root,
+        )?)
+    } else {
+        None
+    };
+    if import_requested && arguments.directory.is_absolute() {
+        bail!("bulk Clan Vars migration requires --directory to be repository-relative");
     }
-    let root = directory
-        .canonicalize()
-        .context("could not resolve Clan Vars per-machine directory")?;
+    let root = if let Some(repository_root) = &repository_root {
+        resolve_migration_directory(repository_root, &arguments.directory)?
+    } else {
+        let supplied_metadata = fs::symlink_metadata(&arguments.directory)
+            .context("could not inspect Clan Vars per-machine directory")?;
+        if supplied_metadata.file_type().is_symlink() || !supplied_metadata.file_type().is_dir() {
+            bail!("Clan Vars root must be a non-symlink directory");
+        }
+        arguments
+            .directory
+            .canonicalize()
+            .context("could not resolve Clan Vars per-machine directory")?
+    };
     let mut values = Vec::new();
     let mut auxiliary_files = 0_u64;
     scan_clan_vars_files(&root, &root, &mut values, &mut auxiliary_files)?;
     if values.is_empty() {
         bail!("Clan Vars per-machine directory contains no output value files");
     }
+    let (destination, replacement_recipients, identity_path) = if import_requested {
+        let repository_root = repository_root
+            .as_ref()
+            .context("bulk Clan Vars migration repository root was not initialized")?;
+        let destination = arguments
+            .destination
+            .as_deref()
+            .context("bulk Clan Vars migration requires --destination")?;
+        validate_migration_relative_path(destination, "destination")?;
+        let destination_root = repository_root.join(destination);
+        if destination_root.starts_with(&root) || root.starts_with(&destination_root) {
+            bail!("bulk Clan Vars destination must be side-by-side with the legacy tree");
+        }
+        let recipients = normalize_migration_recipients(&arguments.recipients)?;
+        let identity = arguments
+            .identity
+            .as_deref()
+            .context("bulk Clan Vars migration requires --identity")?;
+        if !identity.is_absolute() {
+            bail!("bulk Clan Vars migration identity must be an absolute private path");
+        }
+        (
+            Some(destination.to_owned()),
+            recipients,
+            Some(identity.to_owned()),
+        )
+    } else {
+        (None, Vec::new(), None)
+    };
     let mut seen_ids = BTreeSet::new();
+    let mut entries = Vec::with_capacity(values.len());
     let mappings = values
         .iter()
         .map(|entry| {
@@ -2839,36 +2929,118 @@ fn migrate_clan_vars_tree(directory: &Path, json: bool) -> Result<()> {
                 .path
                 .strip_prefix(&root)
                 .context("Clan Vars value escaped its canonical root")?;
+            let relative_destination = destination.as_ref().and_then(|destination| {
+                relative
+                    .parent()
+                    .map(|parent| destination.join(parent).with_extension("age"))
+            });
+            if let Some(repository_root) = &repository_root {
+                let relative_source = entry
+                    .path
+                    .strip_prefix(repository_root)
+                    .context("Clan Vars value escaped the migration repository root")?
+                    .to_owned();
+                entries.push((
+                    relative_source,
+                    relative_destination
+                        .clone()
+                        .context("Clan Vars destination was not initialized")?,
+                ));
+            }
             Ok(serde_json::json!({
                 "legacyId":format!("{}/{}/{}", entry.machine, entry.generator, entry.output),
                 "nixSealId":id,
                 "source":relative,
                 "valueBytes":entry.bytes,
+                "destination":relative_destination,
             }))
         })
         .collect::<Result<Vec<_>>>()?;
-    let warnings = vec![
-        "dry run only: no value, configuration, or source manager was changed",
-        "Clan Vars storage backend and secret/public classification are not recoverable from an output leaf; provide explicit target, recipient, runtime, and public-output mappings before import",
-        "output values were never read, decrypted, emitted, or passed to an external process",
-        "auxiliary regular files were ignored after link/type validation; only machine/generator/output/value leaves are migration candidates",
-    ];
+    let mut mappings = mappings;
+    if import_requested && arguments.execute {
+        let repository_root = repository_root
+            .as_ref()
+            .context("bulk Clan Vars migration repository root was not initialized")?;
+        let identity = read_identity(
+            identity_path
+                .as_deref()
+                .context("bulk Clan Vars migration identity was not initialized")?,
+        )?;
+        let writes = entries
+            .iter()
+            .map(|(relative_source, relative_destination)| {
+                nix_seal_authoring::BatchPlaintextFileWrite {
+                    relative_source,
+                    relative_destination,
+                    recipients: &replacement_recipients,
+                }
+            })
+            .collect::<Vec<_>>();
+        let results = nix_seal_authoring::write_secret_file_batch(
+            repository_root,
+            &writes,
+            &identity,
+            if arguments.replace {
+                nix_seal_authoring::WriteMode::Replace
+            } else {
+                nix_seal_authoring::WriteMode::Create
+            },
+        )?;
+        for (mapping, result) in mappings.iter_mut().zip(results) {
+            mapping["ciphertextHash"] = serde_json::json!(result.ciphertext_hash);
+            mapping["plaintextBytes"] = serde_json::json!(result.plaintext_bytes);
+        }
+    }
+    let warnings = if import_requested {
+        vec![
+            if arguments.execute {
+                "side-by-side migration committed only after every value was streamed and round-trip verified"
+            } else {
+                "dry run only: no value, configuration, or source manager was changed"
+            },
+            "Clan Vars storage backend and secret/public classification are not recoverable from an output leaf; review target, runtime, lifecycle, and public-output mappings before activation",
+            "legacy values remain untouched for side-by-side rollback and comparison",
+            "auxiliary regular files were ignored after link/type validation; only machine/generator/output/value leaves are migration candidates",
+        ]
+    } else {
+        vec![
+            "dry run only: no value, configuration, or source manager was changed",
+            "Clan Vars storage backend and secret/public classification are not recoverable from an output leaf; provide explicit target, recipient, runtime, and public-output mappings before import",
+            "output values were never read, decrypted, emitted, or passed to an external process",
+            "auxiliary regular files were ignored after link/type validation; only machine/generator/output/value leaves are migration candidates",
+        ]
+    };
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "schema":"nix-seal.migration-report.v1",
                 "source":"clan-vars",
-                "dryRun":true,
+                "dryRun":!import_requested || !arguments.execute,
+                "recipientPolicy":if import_requested { serde_json::json!({"recipients":&replacement_recipients}) } else { serde_json::Value::Null },
                 "values":mappings,
                 "auxiliaryFileCount":auxiliary_files,
                 "warnings":warnings
             })
         );
     } else {
-        println!("clan-vars dry-run: {} value leaves mapped", mappings.len());
+        println!(
+            "clan-vars {}: {} value leaves mapped",
+            if import_requested && arguments.execute {
+                "migration"
+            } else {
+                "dry-run"
+            },
+            mappings.len()
+        );
         for warning in warnings {
             eprintln!("warning: {warning}");
+        }
+        if import_requested {
+            eprintln!(
+                "replacement recipient policy: {} recipient(s)",
+                replacement_recipients.len()
+            );
         }
         for mapping in mappings {
             println!(
@@ -2960,14 +3132,35 @@ fn inspect_clan_var_value(path: &Path, relative: &Path) -> Result<ClanVarInvento
 /// Inventories Clan Facts' documented `machines/<machine>/facts/<fact>` public
 /// leaves without opening their contents. Secret facts deliberately have a
 /// configurable store/path function and cannot be inferred safely from disk.
-fn migrate_clan_facts_tree(directory: &Path, json: bool) -> Result<()> {
-    let metadata = fs::symlink_metadata(directory).context("could not inspect Clan Facts root")?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-        bail!("Clan Facts root must be a non-symlink directory");
-    }
-    let root = directory
-        .canonicalize()
-        .context("could not resolve Clan Facts root")?;
+/// An explicit destination enables a side-by-side public import; the legacy
+/// tree remains untouched for rollback and comparison.
+#[allow(clippy::too_many_lines)]
+fn migrate_clan_facts_tree(arguments: &ClanFactsMigrationArgs, json: bool) -> Result<()> {
+    let import_requested =
+        arguments.destination.is_some() || arguments.replace || arguments.execute;
+    let repository_root = if import_requested {
+        if arguments.directory.is_absolute() {
+            bail!("bulk Clan Facts migration requires --directory to be repository-relative");
+        }
+        Some(resolve_migration_repository_root(
+            &arguments.repository_root,
+        )?)
+    } else {
+        None
+    };
+    let root = if let Some(repository_root) = &repository_root {
+        resolve_migration_directory(repository_root, &arguments.directory)?
+    } else {
+        let metadata = fs::symlink_metadata(&arguments.directory)
+            .context("could not inspect Clan Facts root")?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            bail!("Clan Facts root must be a non-symlink directory");
+        }
+        arguments
+            .directory
+            .canonicalize()
+            .context("could not resolve Clan Facts root")?
+    };
     let mut entries = fs::read_dir(&root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(fs::DirEntry::file_name);
     let mut facts = Vec::new();
@@ -3016,23 +3209,113 @@ fn migrate_clan_facts_tree(directory: &Path, json: bool) -> Result<()> {
     if facts.is_empty() {
         bail!("Clan Facts root contains no documented public fact leaves");
     }
+    let (destination, entries) = if import_requested {
+        let repository_root = repository_root
+            .as_ref()
+            .context("bulk Clan Facts migration repository root was not initialized")?;
+        let destination = arguments
+            .destination
+            .as_deref()
+            .context("bulk Clan Facts migration requires --destination")?;
+        validate_migration_relative_path(destination, "destination")?;
+        let destination_root = repository_root.join(destination);
+        if destination_root.starts_with(&root) || root.starts_with(&destination_root) {
+            bail!("bulk Clan Facts destination must be side-by-side with the legacy tree");
+        }
+        let mut entries = Vec::with_capacity(facts.len());
+        for (_, _, _, path) in &facts {
+            let relative_source = path
+                .strip_prefix(repository_root)
+                .context("Clan Facts value escaped the migration repository root")?
+                .to_owned();
+            let relative = path
+                .strip_prefix(&root)
+                .context("Clan Facts value escaped its canonical root")?;
+            entries.push((relative_source, destination.join(relative)));
+        }
+        (Some(destination.to_owned()), entries)
+    } else {
+        (None, Vec::new())
+    };
     let mut seen = BTreeSet::new();
-    let mappings = facts.iter().map(|(machine, name, bytes, path)| {
-        let id = migrated_id(&format!("clan-facts/{machine}/{name}"))?;
-        if !seen.insert(id.clone()) { bail!("Clan Facts paths collide after nix-seal ID normalization"); }
-        Ok(serde_json::json!({"legacyId":format!("{machine}/{name}"),"nixSealId":id,"source":path.strip_prefix(&root)?,"valueBytes":bytes}))
-    }).collect::<Result<Vec<_>>>()?;
-    let warnings = vec![
-        "dry run only: no value, configuration, or source manager was changed",
-        "only documented public facts were inventoried without reading them; secret facts use configurable stores and require an explicit reviewed export",
-    ];
+    let mut mappings = facts
+        .iter()
+        .enumerate()
+        .map(|(index, (machine, name, bytes, path))| {
+            let id = migrated_id(&format!("clan-facts/{machine}/{name}"))?;
+            if !seen.insert(id.clone()) {
+                bail!("Clan Facts paths collide after nix-seal ID normalization");
+            }
+            let relative = path
+                .strip_prefix(&root)
+                .context("Clan Facts value escaped its canonical root")?;
+            Ok(serde_json::json!({
+                "legacyId":format!("{machine}/{name}"),
+                "nixSealId":id,
+                "source":relative,
+                "valueBytes":bytes,
+                "destination":destination.as_ref().map(|_| entries[index].1.clone()),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if import_requested && arguments.execute {
+        let repository_root = repository_root
+            .as_ref()
+            .context("bulk Clan Facts migration repository root was not initialized")?;
+        let writes = entries
+            .iter()
+            .map(|(relative_source, relative_destination)| {
+                nix_seal_authoring::BatchPublicFileWrite {
+                    relative_source,
+                    relative_destination,
+                }
+            })
+            .collect::<Vec<_>>();
+        let results = nix_seal_authoring::write_public_file_batch(
+            repository_root,
+            &writes,
+            if arguments.replace {
+                nix_seal_authoring::WriteMode::Replace
+            } else {
+                nix_seal_authoring::WriteMode::Create
+            },
+        )?;
+        for (mapping, result) in mappings.iter_mut().zip(results) {
+            mapping["contentHash"] = serde_json::json!(result.content_hash);
+            mapping["plaintextBytes"] = serde_json::json!(result.plaintext_bytes);
+        }
+    }
+    let warnings = if import_requested {
+        vec![
+            if arguments.execute {
+                "side-by-side public migration committed only after every fact was streamed and verified"
+            } else {
+                "dry run only: no value, configuration, or source manager was changed"
+            },
+            "Clan Facts leaves are public outputs; secret facts use configurable stores and require an explicit reviewed export",
+            "legacy facts remain untouched for side-by-side rollback and comparison",
+        ]
+    } else {
+        vec![
+            "dry run only: no value, configuration, or source manager was changed",
+            "only documented public facts were inventoried without reading them; secret facts use configurable stores and require an explicit reviewed export",
+        ]
+    };
     if json {
         println!(
             "{}",
-            serde_json::json!({"schema":"nix-seal.migration-report.v1","source":"clan-facts","dryRun":true,"facts":mappings,"warnings":warnings})
+            serde_json::json!({"schema":"nix-seal.migration-report.v1","source":"clan-facts","dryRun":!import_requested || !arguments.execute,"facts":mappings,"warnings":warnings})
         );
     } else {
-        println!("clan-facts dry-run: {} public facts mapped", mappings.len());
+        println!(
+            "clan-facts {}: {} public facts mapped",
+            if import_requested && arguments.execute {
+                "migration"
+            } else {
+                "dry-run"
+            },
+            mappings.len()
+        );
         for warning in warnings {
             eprintln!("warning: {warning}");
         }
@@ -8016,7 +8299,42 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         fs::create_dir(machines.join("desktop"))?;
         fs::create_dir(machines.join("desktop/facts"))?;
         fs::write(machines.join("desktop/facts/public-key"), b"public value")?;
-        migrate_clan_facts_tree(&machines, false)?;
+        migrate_clan_facts_tree(
+            &ClanFactsMigrationArgs {
+                directory: machines,
+                repository_root: PathBuf::from("."),
+                destination: None,
+                replace: false,
+                execute: false,
+            },
+            false,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn clan_facts_migration_bulk_copies_public_leaves_side_by_side()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        let fact = repository.join("machines/desktop/facts/public-key");
+        fs::create_dir_all(fact.parent().ok_or("fact parent")?)?;
+        fs::write(&fact, b"public value")?;
+        let common = || ClanFactsMigrationArgs {
+            directory: PathBuf::from("machines"),
+            repository_root: repository.clone(),
+            destination: Some(PathBuf::from("nix-seal-public")),
+            replace: false,
+            execute: false,
+        };
+        migrate_clan_facts_tree(&common(), true)?;
+        let destination = repository.join("nix-seal-public/desktop/facts/public-key");
+        assert!(!destination.exists());
+        let mut execute = common();
+        execute.execute = true;
+        migrate_clan_facts_tree(&execute, true)?;
+        assert_eq!(fs::read(destination)?, b"public value");
+        assert_eq!(fs::read(fact)?, b"public value");
         Ok(())
     }
 
@@ -8940,6 +9258,39 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             migrated_id("clan-vars/desktop/service-token/api-token")?.as_str(),
             "clan-vars/desktop/service-token/api-token"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn clan_vars_migration_bulk_encrypts_side_by_side_only_after_dry_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        let value = repository.join("vars/per-machine/desktop/service-token/api-token/value");
+        std::fs::create_dir_all(value.parent().ok_or("value parent")?)?;
+        std::fs::write(&value, b"clan-vars-secret-canary")?;
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        let identity_path = temporary.path().join("administrator.agekey");
+        write_new_private(&identity_path, identity.expose_secret().as_bytes())?;
+        let common = || ClanVarsMigrationArgs {
+            directory: PathBuf::from("vars/per-machine"),
+            repository_root: repository.clone(),
+            destination: Some(PathBuf::from("migrated")),
+            identity: Some(identity_path.clone()),
+            recipients: vec![recipient.clone()],
+            replace: false,
+            execute: false,
+        };
+        migrate_clan_vars_tree(&common(), true)?;
+        let destination = repository.join("migrated/desktop/service-token/api-token.age");
+        assert!(!destination.exists());
+        let mut execute = common();
+        execute.execute = true;
+        migrate_clan_vars_tree(&execute, true)?;
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(std::fs::File::open(destination)?, &mut plaintext, &identity)?;
+        assert_eq!(plaintext, b"clan-vars-secret-canary");
+        assert_eq!(std::fs::read(value)?, b"clan-vars-secret-canary");
         Ok(())
     }
 

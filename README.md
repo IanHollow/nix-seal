@@ -539,8 +539,16 @@ nix-seal migrate sops --repository-root . --source legacy/token.yaml \
   --identity /absolute/private/nix-seal-admin.age --recipient age1... --execute
 # inventory Clan's documented per-machine output leaves without reading values
 nix-seal migrate clan-vars --directory ./vars/per-machine --json
+# after reviewing the mapping, stream values into a side-by-side native age tree
+nix-seal migrate clan-vars --directory vars/per-machine \
+  --repository-root . --destination nix-seal-vars \
+  --identity /absolute/private/nix-seal-admin.age \
+  --recipient age1... --execute
 # inventory documented Clan Facts public leaves without reading values
 nix-seal migrate clan-facts --directory ./machines --json
+# after reviewing the mapping, copy public facts side-by-side
+nix-seal migrate clan-facts --directory machines --repository-root . \
+  --destination nix-seal-public --execute
 # First inspect the mutation; then add --execute to stream-reencrypt it.
 nix-seal migrate ciphertext --source legacy/token.age --destination secrets/token.age \
   --identity /absolute/path/to/administrator.age --recipient age1... --json
@@ -660,15 +668,23 @@ reviewed extension rather than implicitly inheriting credential environments.
 `migrate clan-vars` recognizes only the documented
 `vars/per-machine/<machine>/<generator>/<output>/value` leaves. It validates the
 complete filesystem walk without following links, reports paths and byte counts,
-and never reads, decrypts, prints, or passes a value to another process. Clan
-storage backend, secret/public classification, target authorization, and runtime
-policy are not encoded by those leaves, so they must be supplied in a reviewed
-mapping before import.
+and never reads, decrypts, prints, or passes a value to another process during
+inventory. Clan storage backend, secret/public classification, target
+authorization, and runtime policy are not encoded by those leaves, so they must
+be supplied in a reviewed mapping before import. Supplying `--repository-root`,
+`--destination`, `--identity`, and one or more `--recipient` values enables a
+side-by-side import; `--execute` is required before values are opened. Every
+value is streamed into a staged age ciphertext, round-trip verified, and
+committed as one recoverable batch while the legacy Vars tree remains unchanged.
 
 `migrate clan-facts` inventories only documented public
 `machines/<machine>/facts/<fact>` leaves, with link/type and 64 MiB bounds. It
-never reads their values. Clan secret facts have configurable stores and paths,
-so they need an explicit reviewed export instead of filesystem inference.
+never reads their values during inventory. Supplying a repository-relative
+destination enables an explicit side-by-side public import; `--execute` streams
+each leaf through a bounded no-follow file transaction, verifies the complete
+batch, and publishes mode-safe outputs while leaving the legacy tree untouched.
+Clan secret facts have configurable stores and paths, so they need an explicit
+reviewed export instead of filesystem inference.
 
 ## Development
 

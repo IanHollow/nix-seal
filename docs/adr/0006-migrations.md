@@ -42,7 +42,17 @@ their own reviewed capability design.
 Clan Vars inspection recognizes the documented per-machine output layout and
 never reads values. Because the filesystem leaves do not authoritatively encode
 the storage backend, secrecy classification, target selection, or runtime
-policy, importing a value requires an explicit reviewed mapping.
+policy, importing a value requires an explicit reviewed mapping. With an
+explicit repository-relative destination, private verification identity, and
+replacement recipients, `--execute` streams every value into a staged age
+ciphertext batch, verifies each result, and commits side-by-side while leaving
+the legacy tree untouched.
+
+Clan Facts inspection recognizes only public `machines/<machine>/facts/<fact>`
+leaves. A repository-relative destination plus `--execute` enables a bounded,
+no-follow, side-by-side public copy transaction; the source tree remains
+available for rollback. Secret facts are backend-defined and require an explicit
+reviewed export rather than path inference.
 
 The agenix-rekey adapter consumes an explicit public evaluated export instead of
 guessing policy from filenames. It checks the master-to-target boundary,

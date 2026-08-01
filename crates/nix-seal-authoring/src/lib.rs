@@ -55,6 +55,28 @@ pub struct BatchRekeyWrite<'a> {
     pub recipients: &'a [String],
 }
 
+/// One legacy plaintext file to stream into a new native age ciphertext as
+/// part of an all-or-recover migration transaction.
+pub struct BatchPlaintextFileWrite<'a> {
+    /// Repository-relative source file. It is opened with no-follow semantics
+    /// and is never modified or removed.
+    pub relative_source: &'a Path,
+    /// Repository-relative destination ciphertext.
+    pub relative_destination: &'a Path,
+    /// Explicit replacement recipients selected by the migration policy.
+    pub recipients: &'a [String],
+}
+
+/// One legacy public file to stream into a new public output as part of an
+/// all-or-recover migration transaction.
+pub struct BatchPublicFileWrite<'a> {
+    /// Repository-relative source file. It is opened with no-follow semantics
+    /// and is never modified or removed.
+    pub relative_source: &'a Path,
+    /// Repository-relative public destination.
+    pub relative_destination: &'a Path,
+}
+
 /// One unencrypted public output staged as part of a mixed generation
 /// transaction. Public outputs are still written atomically and are never
 /// allowed to collide with canonical ciphertext destinations.
@@ -192,6 +214,12 @@ pub enum AuthoringError {
     /// An external plaintext producer failed its final status check.
     #[error("external plaintext producer did not complete successfully")]
     ExternalInput,
+    /// A legacy source changed while it was being staged.
+    #[error("legacy migration source changed during the transaction")]
+    SourceChanged,
+    /// A migration plaintext source exceeded the bounded input limit.
+    #[error("plaintext migration source exceeds the 64 MiB safety limit")]
+    InputTooLarge,
     /// Filesystem transaction failed.
     #[error("canonical ciphertext transaction failed")]
     Io(#[source] std::io::Error),
@@ -384,6 +412,7 @@ pub fn rekey_secret(
 /// same-directory backups and restored if any later commit fails. This keeps a
 /// partially completed migration from looking successful while preserving the
 /// legacy source manager for side-by-side rollback.
+#[allow(clippy::too_many_lines)]
 pub fn rekey_secret_batch(
     repository_root: &Path,
     writes: &[BatchRekeyWrite<'_>],
@@ -408,6 +437,9 @@ pub fn rekey_secret_batch(
         }
         let source = resolve_existing(repository_root, write.relative_source)?;
         let source_metadata = std::fs::symlink_metadata(&source).map_err(AuthoringError::Io)?;
+        if source_metadata.len() > 64 * 1024 * 1024 {
+            return Err(AuthoringError::InputTooLarge);
+        }
         let destination = resolve_destination(repository_root, write.relative_destination)?;
         if !sources.insert(source.clone()) || !destinations.insert(destination.clone()) {
             return Err(AuthoringError::DestinationState);
@@ -419,6 +451,7 @@ pub fn rekey_secret_batch(
             .to_owned();
         let mut staged = NamedTempFile::new_in(&parent).map_err(AuthoringError::Io)?;
         set_private(staged.path()).map_err(AuthoringError::Io)?;
+        let (source_hash, _) = hash_bounded_file(&source, 64 * 1024 * 1024)?;
         nix_seal_crypto::rekey(
             open_nofollow_regular(&source)?,
             staged.as_file_mut(),
@@ -426,6 +459,10 @@ pub fn rekey_secret_batch(
             write.recipients,
         )?;
         staged.as_file().sync_all().map_err(AuthoringError::Io)?;
+        let (source_hash_after, _) = hash_bounded_file(&source, 64 * 1024 * 1024)?;
+        if source_hash_after != source_hash {
+            return Err(AuthoringError::SourceChanged);
+        }
         staged.as_file_mut().rewind().map_err(AuthoringError::Io)?;
         let mut verified = HashingWriter::default();
         nix_seal_crypto::decrypt(staged.as_file_mut(), &mut verified, verification_identity)?;
@@ -490,6 +527,273 @@ pub fn rekey_secret_batch(
         File::open(&item.parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|_| AuthoringError::DurabilityUnknown)?;
+    }
+    Ok(results)
+}
+
+/// Streams a bounded set of legacy plaintext files into fresh age ciphertexts
+/// and commits every destination as one recoverable transaction.
+///
+/// This is intentionally separate from [`rekey_secret_batch`]: migration
+/// sources such as Clan Vars are backend-defined plaintext leaves rather than
+/// native age ciphertext. Sources are opened with no-follow semantics, hashed
+/// while encrypted, round-trip verified, and kept untouched for side-by-side
+/// rollback. No source plaintext is retained in a caller-owned collection.
+#[allow(clippy::too_many_lines)]
+pub fn write_secret_file_batch(
+    repository_root: &Path,
+    writes: &[BatchPlaintextFileWrite<'_>],
+    verification_identity: &SecretString,
+    mode: WriteMode,
+) -> Result<Vec<AuthoringResult>, AuthoringError> {
+    if writes.is_empty() || writes.len() > 10_000 {
+        return Err(AuthoringError::UnsafePath);
+    }
+
+    let mut prepared = Vec::with_capacity(writes.len());
+    let mut sources = BTreeSet::new();
+    let mut destinations = BTreeSet::new();
+    let mut source_states = Vec::with_capacity(writes.len());
+    for write in writes {
+        if write.recipients.is_empty()
+            || !write.recipients.iter().any(|recipient| {
+                nix_seal_crypto::identity_matches_recipient(verification_identity, recipient)
+            })
+        {
+            return Err(AuthoringError::VerificationIdentity);
+        }
+        let source = resolve_existing(repository_root, write.relative_source)?;
+        let source_metadata = std::fs::symlink_metadata(&source).map_err(AuthoringError::Io)?;
+        let destination = resolve_destination(repository_root, write.relative_destination)?;
+        if !sources.insert(source.clone()) || !destinations.insert(destination.clone()) {
+            return Err(AuthoringError::DestinationState);
+        }
+        let previous = validate_destination(&destination, mode)?;
+        let parent = destination
+            .parent()
+            .ok_or(AuthoringError::UnsafePath)?
+            .to_owned();
+        let mut staged = NamedTempFile::new_in(&parent).map_err(AuthoringError::Io)?;
+        set_private(staged.path()).map_err(AuthoringError::Io)?;
+        let mut hashing_input =
+            HashingReader::new(open_nofollow_regular(&source)?.take(64 * 1024 * 1024 + 1));
+        nix_seal_crypto::encrypt(&mut hashing_input, staged.as_file_mut(), write.recipients)?;
+        staged.as_file().sync_all().map_err(AuthoringError::Io)?;
+        let (plaintext_hash, plaintext_bytes) = hashing_input.finish();
+        if plaintext_bytes > 64 * 1024 * 1024 {
+            return Err(AuthoringError::InputTooLarge);
+        }
+        let (source_hash, source_bytes) = hash_bounded_file(&source, 64 * 1024 * 1024)?;
+        if source_hash != plaintext_hash || source_bytes != plaintext_bytes {
+            return Err(AuthoringError::SourceChanged);
+        }
+        staged.as_file_mut().rewind().map_err(AuthoringError::Io)?;
+        let mut verified = HashingWriter::default();
+        nix_seal_crypto::decrypt(staged.as_file_mut(), &mut verified, verification_identity)?;
+        if verified.hash() != plaintext_hash || verified.bytes != plaintext_bytes {
+            return Err(AuthoringError::RoundTrip);
+        }
+        staged.as_file_mut().rewind().map_err(AuthoringError::Io)?;
+        let ciphertext_hash = hash_file(staged.as_file_mut())?;
+        prepared.push(PreparedBatchWrite {
+            destination: destination.clone(),
+            parent,
+            previous,
+            staged: Some(staged),
+            result: AuthoringResult {
+                path: destination,
+                ciphertext_hash,
+                plaintext_bytes,
+            },
+        });
+        source_states.push((source, source_metadata));
+    }
+
+    if sources.intersection(&destinations).next().is_some() {
+        return Err(AuthoringError::UnsafePath);
+    }
+    for (source, metadata) in &source_states {
+        ensure_unchanged(source, Some(metadata))?;
+    }
+    for item in &prepared {
+        match mode {
+            WriteMode::Create if item.destination.exists() => {
+                return Err(AuthoringError::DestinationState);
+            }
+            WriteMode::Replace => ensure_unchanged(&item.destination, item.previous.as_ref())?,
+            WriteMode::Create => {}
+        }
+    }
+
+    let mut backups = Vec::with_capacity(prepared.len());
+    for item in &prepared {
+        if mode == WriteMode::Create {
+            backups.push(None);
+            continue;
+        }
+        let backup = NamedTempFile::new_in(&item.parent).map_err(AuthoringError::Io)?;
+        set_private(backup.path()).map_err(AuthoringError::Io)?;
+        let backup = backup.into_temp_path();
+        if std::fs::rename(&item.destination, &backup).is_err() {
+            if restore_batch(&prepared, &mut backups, &[]) {
+                return Err(AuthoringError::BatchRolledBack);
+            }
+            return Err(AuthoringError::BatchRecoveryUnknown);
+        }
+        backups.push(Some(backup));
+    }
+    let results = commit_prepared_batch(&mut prepared, mode, &mut backups)?;
+    drop(backups);
+    for item in &prepared {
+        File::open(&item.parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| AuthoringError::DurabilityUnknown)?;
+    }
+    Ok(results)
+}
+
+/// Streams a bounded set of legacy public files into a side-by-side public
+/// output tree and commits every destination as one recoverable transaction.
+///
+/// Public files are intentionally kept separate from encrypted migration
+/// inputs. They are still copied through the same no-follow, atomic, durable
+/// transaction path, and are private until the commit point so an interrupted
+/// migration cannot leave a partially published output.
+#[allow(clippy::too_many_lines)]
+pub fn write_public_file_batch(
+    repository_root: &Path,
+    writes: &[BatchPublicFileWrite<'_>],
+    mode: WriteMode,
+) -> Result<Vec<PublicAuthoringResult>, AuthoringError> {
+    const MAX_PUBLIC_FILE_BYTES: u64 = 64 * 1024 * 1024;
+    if writes.is_empty() || writes.len() > 10_000 {
+        return Err(AuthoringError::UnsafePath);
+    }
+
+    let mut prepared = Vec::with_capacity(writes.len());
+    let mut sources = BTreeSet::new();
+    let mut destinations = BTreeSet::new();
+    let mut source_states = Vec::with_capacity(writes.len());
+    for write in writes {
+        let source = resolve_existing(repository_root, write.relative_source)?;
+        let source_metadata = std::fs::symlink_metadata(&source).map_err(AuthoringError::Io)?;
+        if source_metadata.len() > MAX_PUBLIC_FILE_BYTES {
+            return Err(AuthoringError::InputTooLarge);
+        }
+        let destination = resolve_destination(repository_root, write.relative_destination)?;
+        if !sources.insert(source.clone()) || !destinations.insert(destination.clone()) {
+            return Err(AuthoringError::DestinationState);
+        }
+        let previous = validate_destination(&destination, mode)?;
+        let parent = destination
+            .parent()
+            .ok_or(AuthoringError::UnsafePath)?
+            .to_owned();
+        let mut staged = NamedTempFile::new_in(&parent).map_err(AuthoringError::Io)?;
+        set_private(staged.path()).map_err(AuthoringError::Io)?;
+        let mut source_file = open_nofollow_regular(&source)?;
+        let mut hashing_source =
+            HashingReader::new((&mut source_file).take(MAX_PUBLIC_FILE_BYTES.saturating_add(1)));
+        std::io::copy(&mut hashing_source, staged.as_file_mut()).map_err(AuthoringError::Io)?;
+        staged.as_file().sync_all().map_err(AuthoringError::Io)?;
+        let (content_hash, plaintext_bytes) = hashing_source.finish();
+        if plaintext_bytes > MAX_PUBLIC_FILE_BYTES {
+            return Err(AuthoringError::InputTooLarge);
+        }
+        let (source_hash, source_bytes) = hash_bounded_file(&source, MAX_PUBLIC_FILE_BYTES)?;
+        if source_hash != content_hash || source_bytes != plaintext_bytes {
+            return Err(AuthoringError::SourceChanged);
+        }
+        prepared.push(PreparedCombinedWrite::Public(PreparedPublicWrite {
+            destination: destination.clone(),
+            parent,
+            previous,
+            staged: Some(staged),
+            result: PublicAuthoringResult {
+                path: destination,
+                content_hash: content_hash.to_hex().to_string(),
+                plaintext_bytes,
+            },
+        }));
+        source_states.push((source, source_metadata));
+    }
+
+    if sources.intersection(&destinations).next().is_some() {
+        return Err(AuthoringError::UnsafePath);
+    }
+    for (source, metadata) in &source_states {
+        ensure_unchanged(source, Some(metadata))?;
+    }
+    for item in &prepared {
+        match mode {
+            WriteMode::Create if item.destination().exists() => {
+                return Err(AuthoringError::DestinationState);
+            }
+            WriteMode::Replace => ensure_unchanged(item.destination(), item.previous())?,
+            WriteMode::Create => {}
+        }
+    }
+
+    let mut backups = Vec::with_capacity(prepared.len());
+    for item in &prepared {
+        if mode == WriteMode::Create {
+            backups.push(None);
+            continue;
+        }
+        let backup = NamedTempFile::new_in(item.parent()).map_err(AuthoringError::Io)?;
+        set_private(backup.path()).map_err(AuthoringError::Io)?;
+        let backup = backup.into_temp_path();
+        if std::fs::rename(item.destination(), &backup).is_err() {
+            if restore_combined(&prepared, &mut backups, &[]) {
+                return Err(AuthoringError::BatchRolledBack);
+            }
+            return Err(AuthoringError::BatchRecoveryUnknown);
+        }
+        backups.push(Some(backup));
+    }
+
+    let mut committed = Vec::with_capacity(prepared.len());
+    for item in &mut prepared {
+        let Some(staged) = item.staged_mut().take() else {
+            if restore_combined(&prepared, &mut backups, &committed) {
+                return Err(AuthoringError::BatchRolledBack);
+            }
+            return Err(AuthoringError::BatchRecoveryUnknown);
+        };
+        if let Err(error) = set_public(staged.path()) {
+            if restore_combined(&prepared, &mut backups, &committed) {
+                return Err(AuthoringError::BatchRolledBack);
+            }
+            return Err(AuthoringError::Io(error));
+        }
+        let persisted = match mode {
+            WriteMode::Create => staged.persist_noclobber(item.destination()),
+            WriteMode::Replace => staged.persist(item.destination()),
+        };
+        if persisted.is_err() {
+            if restore_combined(&prepared, &mut backups, &committed) {
+                return Err(AuthoringError::BatchRolledBack);
+            }
+            return Err(AuthoringError::BatchRecoveryUnknown);
+        }
+        committed.push(item.destination().to_owned());
+    }
+
+    let mut parents = BTreeSet::new();
+    for item in &prepared {
+        parents.insert(item.parent().to_owned());
+    }
+    for parent in parents {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| AuthoringError::DurabilityUnknown)?;
+    }
+
+    let mut results = Vec::with_capacity(prepared.len());
+    for item in prepared {
+        if let PreparedCombinedWrite::Public(item) = item {
+            results.push(item.result);
+        }
     }
     Ok(results)
 }
@@ -1271,6 +1575,20 @@ fn hash_file(file: &mut File) -> Result<String, AuthoringError> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn hash_bounded_file(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<(blake3::Hash, u64), AuthoringError> {
+    let mut file = open_nofollow_regular(path)?;
+    let mut input = HashingReader::new((&mut file).take(maximum_bytes.saturating_add(1)));
+    std::io::copy(&mut input, &mut std::io::sink()).map_err(AuthoringError::Io)?;
+    let (hash, bytes) = input.finish();
+    if bytes > maximum_bytes {
+        return Err(AuthoringError::InputTooLarge);
+    }
+    Ok((hash, bytes))
+}
+
 struct HashingReader<R> {
     inner: R,
     hasher: blake3::Hasher,
@@ -1740,6 +2058,75 @@ mod tests {
         ));
         assert!(!root.join("new/one.age").exists());
         assert!(root.join("legacy/one.age").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn batch_plaintext_file_write_streams_and_preserves_sources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        let recipients = vec![recipient];
+        std::fs::create_dir_all(root.join("vars/desktop/generator/token"))?;
+        std::fs::write(
+            root.join("vars/desktop/generator/token/value"),
+            b"streamed-clan-var-token",
+        )?;
+        let writes = [BatchPlaintextFileWrite {
+            relative_source: Path::new("vars/desktop/generator/token/value"),
+            relative_destination: Path::new("nix-seal/desktop/generator/token.age"),
+            recipients: &recipients,
+        }];
+        let results = write_secret_file_batch(&root, &writes, &identity, WriteMode::Create)?;
+        assert_eq!(results[0].plaintext_bytes, 23);
+        assert_eq!(
+            std::fs::read(root.join("vars/desktop/generator/token/value"))?,
+            b"streamed-clan-var-token"
+        );
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(
+            File::open(root.join("nix-seal/desktop/generator/token.age"))?,
+            &mut plaintext,
+            &identity,
+        )?;
+        assert_eq!(plaintext, b"streamed-clan-var-token");
+        Ok(())
+    }
+
+    #[test]
+    fn batch_public_file_write_streams_and_preserves_sources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let source = root.join("machines/desktop/facts/hostname");
+        std::fs::create_dir_all(source.parent().ok_or("source parent")?)?;
+        std::fs::write(&source, b"desktop.example")?;
+        let writes = [BatchPublicFileWrite {
+            relative_source: Path::new("machines/desktop/facts/hostname"),
+            relative_destination: Path::new("nix-seal/public/desktop/hostname"),
+        }];
+        let results = write_public_file_batch(&root, &writes, WriteMode::Create)?;
+        assert_eq!(results[0].plaintext_bytes, 15);
+        assert_eq!(
+            std::fs::read(root.join("machines/desktop/facts/hostname"))?,
+            b"desktop.example"
+        );
+        assert_eq!(
+            std::fs::read(root.join("nix-seal/public/desktop/hostname"))?,
+            b"desktop.example"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(root.join("nix-seal/public/desktop/hostname"))?
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
         Ok(())
     }
 
