@@ -203,8 +203,8 @@ use it for production secrets yet. Report vulnerabilities according to
 public-policy and canonical-ciphertext checks used before deployment, then
 reports authenticated and stale cache-artifact counts plus platform/runtime
 caveats. An artifact is authenticated only when its current plan, target policy,
-source hash, recipient, address, manifest, and approval threshold all verify.
-It emits only public metadata and does not decrypt secrets.
+source hash, recipient, address, manifest, and approval threshold all verify. It
+emits only public metadata and does not decrypt secrets.
 
 Non-usage failures use stable exit categories: `1` operational, `3` policy, `4`
 cryptographic or approval verification, `5` cache/canonical-storage, and `6`
