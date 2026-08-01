@@ -32,6 +32,12 @@ owned by the invoking user and have private permissions; generic objects, target
 ciphertext, and envelopes are opened with no-follow semantics and must be
 single-link regular files. Cache locks and transaction files use close-on-exec
 descriptor creation, so a substituted lock or symlink cannot redirect a write.
+Cache paths are canonicalized through existing directory ancestry before
+creation, rejecting a symlink at the configured root while resolving normal
+platform aliases such as macOS `/var`; export destinations apply the same rule
+to their parent and never replace an existing leaf. This prevents a symlinked
+spelling from silently redirecting cache state while preserving portable cache
+locations.
 Inventory validates each content hash, artifact bundle name, exact bundle member
 set, byte bound, and private metadata before reporting aggregate counts. This
 deliberately makes `cache status` fail on unexpected cache mutations instead of

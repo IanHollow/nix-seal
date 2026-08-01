@@ -219,7 +219,7 @@ pub struct Cache {
 impl Cache {
     /// Opens or creates a v1 cache root with restrictive permissions.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, CacheError> {
-        let root = root.into();
+        let root = normalize_directory_path(&root.into())?;
         match std::fs::symlink_metadata(&root) {
             Ok(metadata) => {
                 if !metadata.file_type().is_dir() {
@@ -307,15 +307,19 @@ impl Cache {
     /// has been copied and revalidated. It contains no private identities or
     /// plaintext, and deliberately omits lock and transaction files.
     pub fn export_to(&self, destination: &Path) -> Result<CacheTransferReport, CacheError> {
-        if std::fs::symlink_metadata(destination).is_ok() {
+        let destination = normalize_new_path(destination)?;
+        if std::fs::symlink_metadata(&destination).is_ok() {
             return Err(CacheError::DestinationExists);
         }
-        let parent = destination.parent().ok_or(CacheError::UnsafeMetadata)?;
-        let parent_metadata = std::fs::symlink_metadata(parent)?;
+        let parent = destination
+            .parent()
+            .ok_or(CacheError::UnsafeMetadata)?
+            .to_owned();
+        let parent_metadata = std::fs::symlink_metadata(&parent)?;
         if !parent_metadata.file_type().is_dir() {
             return Err(CacheError::UnsafeMetadata);
         }
-        let transaction = TempDir::new_in(parent)?;
+        let transaction = TempDir::new_in(&parent)?;
         set_private_permissions(transaction.path(), true)?;
         let staged = transaction.path().join("cache");
         let exported = Cache::open(&staged)?;
@@ -328,8 +332,8 @@ impl Cache {
         File::open(&staged)?.sync_all()?;
         let staged = transaction.keep();
         let published = staged.join("cache");
-        std::fs::rename(&published, destination)?;
-        File::open(parent)?.sync_all()?;
+        std::fs::rename(&published, &destination)?;
+        File::open(&parent)?.sync_all()?;
         std::fs::remove_dir(staged)?;
         Ok(report)
     }
@@ -398,11 +402,10 @@ impl Cache {
     }
 
     fn open_existing(root: &Path) -> Result<Self, CacheError> {
-        let metadata = std::fs::symlink_metadata(root)?;
+        let root = normalize_directory_path(root)?;
+        let metadata = std::fs::symlink_metadata(&root)?;
         validate_private_metadata(&metadata, true)?;
-        Ok(Self {
-            root: root.to_owned(),
-        })
+        Ok(Self { root })
     }
 
     fn copy_into(&self, destination: &Cache) -> Result<CacheTransferReport, CacheError> {
@@ -763,6 +766,63 @@ fn read_directory_if_present(path: &Path) -> Result<Option<std::fs::ReadDir>, Ca
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Resolves an existing directory ancestry without retaining a symlinked
+/// spelling. The final component is rejected when it is a symlink; ordinary
+/// platform aliases such as macOS `/var` are resolved to their real directory.
+/// Missing trailing components are appended after the last existing directory.
+fn normalize_directory_path(path: &Path) -> Result<PathBuf, CacheError> {
+    let mut current = PathBuf::new();
+    let mut missing = Vec::new();
+    current.push(path);
+    loop {
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if missing.is_empty() && metadata.file_type().is_symlink() {
+                    return Err(CacheError::UnsafeMetadata);
+                }
+                if !missing.is_empty() && metadata.file_type().is_symlink() {
+                    let mut normalized = current.canonicalize()?;
+                    for component in missing.iter().rev() {
+                        normalized.push(component);
+                    }
+                    return Ok(normalized);
+                }
+                if !metadata.file_type().is_dir() {
+                    return Err(CacheError::UnsafeMetadata);
+                }
+                let mut normalized = current.canonicalize()?;
+                for component in missing.iter().rev() {
+                    normalized.push(component);
+                }
+                return Ok(normalized);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = current
+                    .file_name()
+                    .ok_or(CacheError::UnsafeMetadata)?
+                    .to_owned();
+                missing.push(component);
+                if !current.pop() || current.as_os_str().is_empty() {
+                    current = PathBuf::from(".");
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// Canonicalizes a new path's parent while preserving the final leaf name.
+fn normalize_new_path(path: &Path) -> Result<PathBuf, CacheError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Err(CacheError::DestinationExists),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path.parent().ok_or(CacheError::UnsafeMetadata)?;
+    let name = path.file_name().ok_or(CacheError::UnsafeMetadata)?;
+    Ok(normalize_directory_path(parent)?.join(name))
 }
 
 fn file_length(path: &Path) -> Result<u64, CacheError> {
@@ -1145,6 +1205,25 @@ mod tests {
             Err(CacheError::UnsafeMetadata)
         ));
         assert!(!target.join("objects").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalizes_symlinked_cache_ancestry_before_directory_creation() -> Result<(), CacheError>
+    {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let target = temporary.path().join("target");
+        std::fs::create_dir(&target)?;
+        let linked_parent = temporary.path().join("linked-parent");
+        symlink(&target, &linked_parent)?;
+        let root = linked_parent.join("cache");
+
+        let cache = Cache::open(&root)?;
+        assert_eq!(cache.root(), target.join("cache").canonicalize()?.as_path());
+        assert!(target.join("cache").exists());
         Ok(())
     }
 
