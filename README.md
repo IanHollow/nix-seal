@@ -393,15 +393,14 @@ the complete prior set. Direct executable generators use an explicit protocol:
 `arguments` are literal public values; and the process runs with a cleared
 environment, null standard streams, a private workspace, and a bounded timeout.
 On Unix it also runs in a dedicated process group, so timeout cleanup terminates
-descendants that might otherwise retain staged plaintext.
-It must write exactly one regular file named `0`, `1`, and so on for each
-declared secret output beneath `$NIX_SEAL_OUTPUT_DIR`, plus the same numbered
-protocol beneath `$NIX_SEAL_PUBLIC_OUTPUT_DIR` for declared public outputs.
-Unlisted files, links, oversized output, nonzero exits, and timeouts fail the
-full transaction without exposing process output. Public destinations are
-repository-relative, must not collide with ciphertext sources, and are recorded
-in the public plan; built-in generators currently emit encrypted secret outputs
-only.
+descendants that might otherwise retain staged plaintext. It must write exactly
+one regular file named `0`, `1`, and so on for each declared secret output
+beneath `$NIX_SEAL_OUTPUT_DIR`, plus the same numbered protocol beneath
+`$NIX_SEAL_PUBLIC_OUTPUT_DIR` for declared public outputs. Unlisted files,
+links, oversized output, nonzero exits, and timeouts fail the full transaction
+without exposing process output. Public destinations are repository-relative,
+must not collide with ciphertext sources, and are recorded in the public plan;
+built-in generators currently emit encrypted secret outputs only.
 
 Set a generator's public `validation` value when its generated credential must
 be replaced after a specific non-secret configuration change. nix-seal records
