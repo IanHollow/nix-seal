@@ -598,7 +598,7 @@
       ]
     },
     "TargetSelectors": {
-      "description": "Public selectors for expanding a secret's authorized target set.\n\nNon-empty fields are ANDed, while values within one field are ORed. The\n`tags` field is the exception: every listed tag is required. Explicit\nconsumers remain a separate union, so adding a selector never removes an\nexisting target authorization.",
+      "description": "Public selectors for expanding a secret's authorized target set.\n\nNon-empty fields are `ANDed`, while values within one field are `ORed`. The\n`tags` field is the exception: every listed tag is required. Explicit\nconsumers remain a separate union, so adding a selector never removes an\nexisting target authorization.",
       "type": "object",
       "properties": {
         "configurations": {
