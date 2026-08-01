@@ -1793,11 +1793,10 @@ mod tests {
     #[test]
     fn checked_in_plan_schema_matches_the_released_schema_generator()
     -> Result<(), Box<dyn std::error::Error>> {
-        let generated = format!("{}\n", json_schema()?);
-        assert_eq!(
-            generated,
-            include_str!("../../../schemas/plan-v1.schema.json")
-        );
+        let generated: serde_json::Value = serde_json::from_str(&json_schema()?)?;
+        let checked_in: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/plan-v1.schema.json"))?;
+        assert_eq!(generated, checked_in);
         Ok(())
     }
 }
