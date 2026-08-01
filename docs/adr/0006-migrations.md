@@ -12,14 +12,13 @@ through replacement recipients without materializing plaintext. The bulk path
 requires an explicit repository-relative destination, identity, and recipient
 set; it reports the complete mapping before execution and opens the identity
 only for `--execute`. Every source is staged and round-trip verified before any
-destination is changed, then destinations are committed with private backups
-and rollback on failure. Legacy files remain untouched for side-by-side
-activation and rollback verification. The
-`secretctl` adapter validates group membership, target recipient expansion, and
-every secret's direct recipient set against its declared consumers before it
-emits a mapping report. With explicit target-system and approval-signer mappings
-it may also write a separate valid direct-delivery candidate plan; it never
-mutates the legacy configuration or ciphertext.
+destination is changed, then destinations are committed with private backups and
+rollback on failure. Legacy files remain untouched for side-by-side activation
+and rollback verification. The `secretctl` adapter validates group membership,
+target recipient expansion, and every secret's direct recipient set against its
+declared consumers before it emits a mapping report. With explicit target-system
+and approval-signer mappings it may also write a separate valid direct-delivery
+candidate plan; it never mutates the legacy configuration or ciphertext.
 
 SOPS JSON inspection is similarly non-destructive: it validates bounded
 cleartext metadata (including provider and age-recipient declarations) without
