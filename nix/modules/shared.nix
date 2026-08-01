@@ -19,7 +19,10 @@ let
   digestType = types.strMatching "[0-9a-f]{64}";
   privateModeType = types.strMatching "0[1-7]00";
   idIsValid =
-    value: builtins.match "[a-z0-9._-]+(/[a-z0-9._-]+)*" value != null && !lib.hasInfix ".." value;
+    value:
+    builtins.match "[a-z0-9._-]+(/[a-z0-9._-]+)*" value != null
+    && !lib.hasInfix ".." value
+    && lib.all (segment: segment != ".") (lib.splitString "/" value);
   idType = types.addCheck types.str idIsValid;
   activationPhaseType = types.enum [
     "partitioning"

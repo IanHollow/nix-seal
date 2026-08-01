@@ -135,6 +135,7 @@ fn is_id(value: &str) -> bool {
         && !value.starts_with('/')
         && value.split('/').all(|segment| {
             !segment.is_empty()
+                && segment != "."
                 && segment != ".."
                 && segment.bytes().all(|byte| {
                     byte.is_ascii_lowercase()

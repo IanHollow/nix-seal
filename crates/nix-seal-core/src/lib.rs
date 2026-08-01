@@ -25,7 +25,9 @@ impl Id {
         if value.is_empty() || value.starts_with('/') || value.contains("..") {
             return Err(IdError::Invalid(value));
         }
-        if value.split('/').any(str::is_empty)
+        if value
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == ".")
             || !value.chars().all(|c| {
                 c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '/' | '-' | '_')
             })
@@ -66,7 +68,7 @@ impl<'de> Deserialize<'de> for Id {
 pub enum IdError {
     /// The string is outside the public `ID` grammar.
     #[error(
-        "invalid ID {0:?}; use lowercase ASCII slugs without absolute paths, '..', or empty segments"
+        "invalid ID {0:?}; use lowercase ASCII slugs without absolute paths, '.', '..', or empty segments"
     )]
     Invalid(String),
 }
@@ -495,7 +497,7 @@ mod tests {
     use super::*;
     #[test]
     fn ids_follow_public_grammar() {
-        for bad in ["", "/root", "a/../b", "a//b", "Upper", "a b"] {
+        for bad in ["", "/root", "a/../b", "a//b", ".", "a/./b", "Upper", "a b"] {
             assert!(Id::parse(bad).is_err());
         }
         assert!(Id::parse("prod/db-password_v2").is_ok());

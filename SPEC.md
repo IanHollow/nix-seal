@@ -30,7 +30,8 @@ flake-parts modules, `lib`, and checks. Runtime paths are
 Typed Nix options and `nix-seal.toml` compile into strict, versioned
 `plan.v1.json`. Unknown fields and overlapping IDs are fatal. Ordering and
 canonicalization are deterministic. IDs are lowercase slugs with `.`, `/`, `-`,
-and `_`; paths, `..`, empty segments, and controls are rejected. Only public
+and `_`; absolute paths, `.`/`..` segments, empty segments, and controls are
+rejected. Only public
 metadata may enter the Nix store.
 
 The object model includes identities, groups, targets, secrets, generators,
