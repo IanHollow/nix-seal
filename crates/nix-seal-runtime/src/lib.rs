@@ -2322,6 +2322,174 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn deterministic_activation_state_machine_preserves_current_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture()?;
+        let artifact = owned_artifact(&fixture, &fixture.ciphertext, &fixture.secret_id);
+        let original_ciphertext = std::fs::read(&fixture.ciphertext)?;
+        let actions = PostSwitchSpecV1 {
+            executable: fixture.temporary.path().join("missing-service-manager"),
+            manager: ServiceManagerV1::SystemdSystem,
+            reload_units: Vec::new(),
+            restart_units: vec!["example.service".to_owned()],
+            timeout_seconds: 1,
+        };
+        let mut request = ActivationRequest {
+            runtime_root: &fixture.runtime,
+            runtime_generation: None,
+            plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
+            target_id: &fixture.target_id,
+            recipient_fingerprint: &fixture.fingerprint,
+            tool_version: "0.1.0-alpha.1",
+            now: 101,
+            allowed_clock_skew: 0,
+            target_identity: &fixture.target_identity,
+            artifacts: std::slice::from_ref(&artifact),
+            templates: &[],
+            post_switch: None,
+        };
+        let mut current = None;
+        let mut generations = BTreeSet::new();
+
+        let observed_generation = || -> Result<Option<u64>, Box<dyn std::error::Error>> {
+            let Some(path) = current_generation(&fixture.runtime)? else {
+                return Ok(None);
+            };
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or("generation path was not valid UTF-8")?;
+            Ok(Some(
+                name.strip_prefix("generation-")
+                    .ok_or("generation path had an invalid prefix")?
+                    .parse()?,
+            ))
+        };
+
+        for step in 0..24_usize {
+            match step % 6 {
+                0 => {
+                    request.runtime_generation = None;
+                    request.post_switch = None;
+                    let result = activate(&request)?;
+                    if result.changed {
+                        let generation = generations.iter().next_back().copied().unwrap_or(0) + 1;
+                        assert_eq!(
+                            result.generation_path,
+                            fixture.runtime.join(format!("generation-{generation}"))
+                        );
+                        generations.insert(generation);
+                        current = Some(generation);
+                    } else {
+                        assert_eq!(current, observed_generation()?);
+                    }
+                }
+                1 => {
+                    request.runtime_generation = None;
+                    request.post_switch = None;
+                    let result = activate(&request)?;
+                    assert!(!result.changed);
+                    assert_eq!(current, observed_generation()?);
+                }
+                2 => {
+                    request.runtime_generation = None;
+                    request.post_switch = None;
+                    if let Some(generation) = current {
+                        set_mode(
+                            &fixture
+                                .runtime
+                                .join(format!("generation-{generation}/db/password")),
+                            0o600,
+                        )?;
+                    }
+                    let result = activate(&request)?;
+                    assert!(result.changed);
+                    let generation = generations.iter().next_back().copied().unwrap_or(0) + 1;
+                    assert_eq!(
+                        result.generation_path,
+                        fixture.runtime.join(format!("generation-{generation}"))
+                    );
+                    generations.insert(generation);
+                    current = Some(generation);
+                }
+                3 => {
+                    request.runtime_generation = None;
+                    request.post_switch = None;
+                    std::fs::write(&fixture.ciphertext, b"state-machine-tamper")?;
+                    assert!(matches!(
+                        activate(&request),
+                        Err(RuntimeError::Manifest(
+                            nix_seal_manifest::ManifestError::Binding
+                        ))
+                    ));
+                    std::fs::write(&fixture.ciphertext, &original_ciphertext)?;
+                    assert_eq!(current, observed_generation()?);
+                }
+                4 => {
+                    request.post_switch = None;
+                    if let Some(generation) = current {
+                        set_mode(
+                            &fixture
+                                .runtime
+                                .join(format!("generation-{generation}/db/password")),
+                            0o600,
+                        )?;
+                        request.runtime_generation = Some(generation);
+                        assert!(matches!(
+                            activate(&request),
+                            Err(RuntimeError::InvalidDestination)
+                        ));
+                        set_mode(
+                            &fixture
+                                .runtime
+                                .join(format!("generation-{generation}/db/password")),
+                            0o400,
+                        )?;
+                        request.runtime_generation = None;
+                    }
+                    assert_eq!(current, observed_generation()?);
+                }
+                _ => {
+                    if let Some(previous) = current {
+                        set_mode(
+                            &fixture
+                                .runtime
+                                .join(format!("generation-{previous}/db/password")),
+                            0o600,
+                        )?;
+                        request.runtime_generation = None;
+                        request.post_switch = Some(&actions);
+                        assert!(matches!(
+                            activate(&request),
+                            Err(RuntimeError::ServiceAction(_))
+                        ));
+                        let generation = generations.iter().next_back().copied().unwrap_or(0) + 1;
+                        generations.insert(generation);
+                        current = Some(generation);
+                        assert!(fixture.runtime.join(PENDING_MARKER).exists());
+                        request.post_switch = None;
+                        let retry = activate(&request)?;
+                        assert!(!retry.changed);
+                        assert!(!fixture.runtime.join(PENDING_MARKER).exists());
+                    }
+                    assert_eq!(current, observed_generation()?);
+                }
+            }
+            for generation in &generations {
+                assert!(
+                    fixture
+                        .runtime
+                        .join(format!("generation-{generation}"))
+                        .is_dir()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn authentication_failure_preserves_previous_generation()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture()?;
