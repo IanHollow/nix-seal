@@ -238,8 +238,8 @@ For agenix-rekey, expose one public evaluated configuration with
 (`local` or `derivation`); `masterRecipients` contains only public master
 recipients. Each secret maps to a repository-relative string `rekeyFile` and may
 set `intermediary = true`. The inventory validates all of those public values,
-normalizes recipients, and preserves intermediary secrets as repository-only.
-It does not infer private runtime configuration or rewrite ciphertext.
+normalizes recipients, and preserves intermediary secrets as repository-only. It
+does not infer private runtime configuration or rewrite ciphertext.
 
 ```nix
 nixSeal.lib.agenixRekeyMigrationExport {
