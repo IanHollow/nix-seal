@@ -8,12 +8,13 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 use thiserror::Error;
 
 const MAX_CIPHERTEXT_BYTES: u64 = 70 * 1024 * 1024;
 const MAX_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
 const ARTIFACT_FORMAT: &str = "nix-seal.cache-artifact.v2";
+const TRANSACTION_PREFIX: &str = ".nix-seal-txn-";
 
 /// Cache error that never includes cache contents.
 #[derive(Debug, Error)]
@@ -238,7 +239,9 @@ impl Cache {
         }
         set_private_permissions(&root, true)?;
         validate_private_metadata(&std::fs::symlink_metadata(&root)?, true)?;
-        Ok(Self { root })
+        let cache = Self { root };
+        cache.recover_transactions()?;
+        Ok(cache)
     }
     /// Returns an object's content address.
     #[must_use]
@@ -257,7 +260,9 @@ impl Cache {
                 let _ = self.get(&digest)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut temporary = NamedTempFile::new_in(&objects)?;
+                let mut temporary = tempfile::Builder::new()
+                    .prefix(TRANSACTION_PREFIX)
+                    .tempfile_in(&objects)?;
                 set_private_permissions(temporary.path(), false)?;
                 temporary.write_all(bytes)?;
                 temporary.as_file().sync_all()?;
@@ -361,7 +366,9 @@ impl Cache {
             return Err(CacheError::ArtifactExists);
         }
 
-        let transaction = TempDir::new_in(&artifacts)?;
+        let transaction = tempfile::Builder::new()
+            .prefix(TRANSACTION_PREFIX)
+            .tempdir_in(&artifacts)?;
         set_private_permissions(transaction.path(), true)?;
         let ciphertext_path = transaction.path().join("ciphertext.age");
         let envelope_path = transaction.path().join("manifest.dsse.json");
@@ -665,6 +672,44 @@ impl Cache {
         let lock = open_cache_lock(&self.root.join(".lock"))?;
         lock.lock_exclusive()?;
         Ok(lock)
+    }
+
+    fn recover_transactions(&self) -> Result<(), CacheError> {
+        let lock = self.lock()?;
+        let result = (|| {
+            for directory in [self.root.join("objects"), self.root.join("artifacts")] {
+                let Some(entries) = read_directory_if_present(&directory)? else {
+                    continue;
+                };
+                let mut removed = false;
+                for entry in entries {
+                    let entry = entry?;
+                    let file_name = entry.file_name();
+                    let name = file_name.to_str().ok_or(CacheError::UnsafeMetadata)?;
+                    if !name.starts_with(TRANSACTION_PREFIX) {
+                        continue;
+                    }
+                    let path = entry.path();
+                    let metadata = std::fs::symlink_metadata(&path)?;
+                    if metadata.file_type().is_dir() {
+                        validate_private_metadata(&metadata, true)?;
+                        std::fs::remove_dir_all(path)?;
+                    } else if metadata.file_type().is_file() {
+                        validate_private_metadata(&metadata, false)?;
+                        std::fs::remove_file(path)?;
+                    } else {
+                        return Err(CacheError::UnsafeMetadata);
+                    }
+                    removed = true;
+                }
+                if removed {
+                    File::open(&directory)?.sync_all()?;
+                }
+            }
+            Ok::<(), CacheError>(())
+        })();
+        FileExt::unlock(&lock)?;
+        result
     }
 
     fn artifacts_directory(&self) -> Result<PathBuf, CacheError> {
@@ -1103,6 +1148,63 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn recovers_abandoned_transactions_on_open() -> Result<(), CacheError> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("cache");
+        let cache = Cache::open(&root)?;
+        drop(cache);
+
+        let objects = root.join("objects");
+        let artifacts = root.join("artifacts");
+        ensure_private_directory(&objects)?;
+        ensure_private_directory(&artifacts)?;
+
+        let stale_object = objects.join(format!("{TRANSACTION_PREFIX}object"));
+        let mut object = create_private_file(&stale_object)?;
+        object.write_all(b"interrupted ciphertext")?;
+        object.sync_all()?;
+
+        let stale_artifact = artifacts.join(format!("{TRANSACTION_PREFIX}artifact"));
+        std::fs::create_dir(&stale_artifact)?;
+        set_private_permissions(&stale_artifact, true)?;
+        let mut ciphertext = create_private_file(&stale_artifact.join("ciphertext.age"))?;
+        ciphertext.write_all(b"partial")?;
+        ciphertext.sync_all()?;
+
+        let reopened = Cache::open(&root)?;
+        assert!(!stale_object.exists());
+        assert!(!stale_artifact.exists());
+        assert_eq!(reopened.inventory()?, CacheInventory::default());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_linked_abandoned_transactions_without_following_them() -> Result<(), CacheError> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("cache");
+        let cache = Cache::open(&root)?;
+        drop(cache);
+        let artifacts = root.join("artifacts");
+        ensure_private_directory(&artifacts)?;
+        let outside = temporary.path().join("outside");
+        std::fs::write(&outside, b"must remain unchanged")?;
+        symlink(
+            &outside,
+            artifacts.join(format!("{TRANSACTION_PREFIX}linked")),
+        )?;
+
+        assert!(matches!(
+            Cache::open(&root),
+            Err(CacheError::UnsafeMetadata)
+        ));
+        assert_eq!(std::fs::read(&outside)?, b"must remain unchanged");
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_link_substitution_for_objects_and_artifacts() -> Result<(), CacheError> {
@@ -1112,6 +1214,7 @@ mod tests {
         let cache = Cache::open(temp.path())?;
         let lock_target = temp.path().join("outside-lock");
         std::fs::write(&lock_target, b"not-cache-lock")?;
+        std::fs::remove_file(temp.path().join(".lock"))?;
         symlink(&lock_target, temp.path().join(".lock"))?;
         assert!(matches!(
             cache.put(b"rejected lock substitution"),
