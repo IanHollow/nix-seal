@@ -962,6 +962,32 @@ body\n\
     }
 
     #[test]
+    fn plugin_recipient_matching_is_canonical_and_missing_plugins_fail_closed()
+    -> Result<(), CryptoError> {
+        let identity = secrecy::SecretString::from(
+            age::plugin::Identity::default_for_plugin("nixseal-test-missing")
+                .map_err(|_| CryptoError::Identity)?
+                .to_string(),
+        );
+        let recipient = bech32::encode_lower::<bech32::Bech32>(
+            bech32::Hrp::parse("age1nixseal-test-missing").map_err(|_| CryptoError::Recipient)?,
+            &[],
+        )
+        .map_err(|_| CryptoError::Recipient)?;
+        assert_eq!(normalize_recipient(&recipient)?, recipient);
+        assert!(identity_matches_recipient(&identity, &recipient));
+        assert!(matches!(
+            encrypt(
+                b"canary".as_slice(),
+                Vec::new(),
+                std::slice::from_ref(&recipient)
+            ),
+            Err(CryptoError::Plugin)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn x25519_round_trip() -> Result<(), CryptoError> {
         let (identity, recipient) = generate_x25519();
         assert_eq!(recipient_from_identity(&identity)?, recipient);

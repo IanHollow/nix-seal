@@ -1376,6 +1376,7 @@ name = "nix-seal-crypto"
 version = "0.1.0-alpha.1"
 dependencies = [
  "age",
+ "bech32",
  "blake3",
  "getrandom 0.4.3",
  "rustix",
