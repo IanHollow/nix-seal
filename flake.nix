@@ -78,6 +78,7 @@
               with pkgs;
               [
                 cargo
+                cargo-fuzz
                 rustc
                 rustfmt
                 clippy

@@ -50,6 +50,18 @@ jobs:
       - name: Install cargo-vet
         run: cargo install --locked --version 0.10.2 cargo-vet
       - run: cargo vet --locked
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install --locked --version 0.13.2 cargo-fuzz
+      - name: Fuzz strict public plan parsing
+        working-directory: fuzz
+        run: cargo fuzz run plan-v1 -- -max_total_time=60
   policy:
     runs-on: ubuntu-latest
     steps:

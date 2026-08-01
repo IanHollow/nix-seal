@@ -1,0 +1,24 @@
+[package]
+name = "nix-seal-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.12"
+nix-seal-core = { path = "../crates/nix-seal-core" }
+nix-seal-policy = { path = "../crates/nix-seal-policy" }
+serde_json = "1.0"
+
+[[bin]]
+name = "plan-v1"
+path = "fuzz_targets/plan_v1.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -115,6 +115,21 @@ generation changes, activation-time secret templates, post-switch service
 coordination, JSON Schema output, and NixOS/nix-darwin/Home Manager modules. See
 [SPEC.md](SPEC.md) and [ROADMAP.md](ROADMAP.md) before relying on it.
 
+## Fuzzing
+
+The checked-in `fuzz` workspace begins at the strict public `plan.v1` boundary:
+it deserializes untrusted bytes, validates a successful plan, canonicalizes it,
+and derives each target projection. Run the short sanitizer campaign locally
+with a nightly Rust toolchain:
+
+```console
+cd fuzz
+cargo fuzz run plan-v1 -- -max_total_time=60
+```
+
+The CI smoke run catches regressions quickly; sustained parser, cache, runtime,
+signature, and migration campaigns remain a required 1.0 release gate.
+
 ## Runtime templates
 
 Public template sources may be stored in the Nix store. Secret values are
