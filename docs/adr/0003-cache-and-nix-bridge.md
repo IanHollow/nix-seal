@@ -43,10 +43,9 @@ verifies that the descriptor-relative rename still writes only to the original
 directory. This prevents a symlinked spelling from silently redirecting cache
 state while preserving portable cache locations. Inventory validates each
 content hash, artifact bundle name, exact bundle member set, byte bound, and
-private metadata before reporting aggregate
-counts. This deliberately makes `cache status` fail on unexpected cache
-mutations instead of presenting a misleading count. Cache lifecycle operations
-build on this verified inventory.
+private metadata before reporting aggregate counts. This deliberately makes
+`cache status` fail on unexpected cache mutations instead of presenting a
+misleading count. Cache lifecycle operations build on this verified inventory.
 
 `cache gc` is dry-run-first. It retains a target artifact only after compiling
 the current plan, deriving the target projection, hashing the current canonical
