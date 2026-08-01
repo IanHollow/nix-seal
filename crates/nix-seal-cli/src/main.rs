@@ -4105,7 +4105,12 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
         &mut BTreeSet::new(),
         &mut order,
     )?;
-    let prompt_files = validate_generator_prompt_files(&plan, &order, &arguments.prompt_files)?;
+    let prompt_files = validate_generator_prompt_files(
+        &plan,
+        &order,
+        &arguments.prompt_files,
+        &arguments.repository_root,
+    )?;
     let mut outputs = Vec::new();
     for generator_id in order {
         let generator = plan
@@ -4183,6 +4188,12 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
             &writes,
             &identity,
             mode,
+        )?;
+        persist_generator_prompts(
+            &arguments.repository_root,
+            &generator_id,
+            generator,
+            &prompt_values,
         )?;
         if let Some(validation) = &generator.validation {
             write_generator_state(
@@ -4417,25 +4428,157 @@ fn remove_generator_state(repository_root: &Path, generator_id: &nix_seal_core::
     }
 }
 
+/// Resolves the owner-only repository state path for a persistent prompt.
+///
+/// Prompt values are deliberately kept outside the public plan and outside
+/// canonical ciphertext. The private state tree is created component by
+/// component so an attacker cannot replace an ancestor with a symlink between
+/// runs. IDs are already validated by the policy layer and therefore provide
+/// safe relative components here.
+fn generator_prompt_state_path(
+    repository_root: &Path,
+    generator_id: &nix_seal_core::Id,
+    prompt_id: &nix_seal_core::Id,
+) -> Result<PathBuf> {
+    let root = repository_root
+        .canonicalize()
+        .context("repository root must exist for persistent prompt state")?;
+    let mut directory = root;
+    for component in [".nix-seal", "prompt-state", "v1"] {
+        directory.push(component);
+        ensure_private_directory(&directory)?;
+    }
+    for component in generator_id.as_str().split('/') {
+        directory.push(component);
+        ensure_private_directory(&directory)?;
+    }
+    let mut prompt_components = prompt_id.as_str().split('/').peekable();
+    while let Some(component) = prompt_components.next() {
+        directory.push(component);
+        if prompt_components.peek().is_some() {
+            ensure_private_directory(&directory)?;
+        }
+    }
+    Ok(directory)
+}
+
+/// Stores declared persistent prompts only after all generated ciphertext
+/// outputs have committed. A failed generation therefore cannot update the
+/// remembered response. The replacement is staged and durable before rename.
+fn persist_generator_prompts(
+    repository_root: &Path,
+    generator_id: &nix_seal_core::Id,
+    generator: &nix_seal_core::Generator,
+    prompts: &[SecretBox<Vec<u8>>],
+) -> Result<()> {
+    if prompts.len() != generator.prompts.len() {
+        bail!("generator prompt count changed during generation");
+    }
+    for (prompt, value) in generator.prompts.iter().zip(prompts) {
+        if prompt.persistent {
+            let path = generator_prompt_state_path(repository_root, generator_id, &prompt.id)?;
+            write_private_bytes_atomic(&path, value.expose_secret())?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => set_private_directory(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        bail!("persistent prompt state directory has unsafe type");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+            bail!("persistent prompt state directory has unsafe ownership or permissions");
+        }
+    }
+    Ok(())
+}
+
+fn write_private_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("persistent prompt state path has no parent")?;
+    ensure_private_directory(parent)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            // Reject links and hard links before allowing replacement. The
+            // rename below replaces the directory entry, never follows a
+            // symlink.
+            open_private_identity(path)
+                .context("persistent prompt state file has unsafe metadata")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .context("could not stage persistent prompt state")?;
+    set_private_file(staged.path())?;
+    staged
+        .write_all(bytes)
+        .and_then(|()| staged.as_file().sync_all())
+        .context("could not write persistent prompt state")?;
+    staged
+        .persist(path)
+        .map_err(|error| error.error)
+        .context("could not atomically publish persistent prompt state")?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .context("persistent prompt state changed but directory durability is unknown")?;
+    Ok(())
+}
+
 fn validate_generator_prompt_files(
     plan: &nix_seal_core::PlanV1,
     order: &[nix_seal_core::Id],
     values: &[String],
+    repository_root: &Path,
 ) -> Result<BTreeMap<nix_seal_core::Id, PathBuf>> {
-    let prompt_files = parse_prompt_files(values)?;
-    let declared_prompts = order
-        .iter()
-        .flat_map(|generator_id| {
-            plan.generators[generator_id]
-                .prompts
-                .iter()
-                .map(|prompt| prompt.id.clone())
-        })
-        .collect::<BTreeSet<_>>();
-    if prompt_files.keys().collect::<BTreeSet<_>>() != declared_prompts.iter().collect() {
-        bail!("prompt files must match the declared prompts exactly");
+    let explicit = parse_prompt_files(values)?;
+    let mut declared = BTreeMap::new();
+    for generator_id in order {
+        for prompt in &plan.generators[generator_id].prompts {
+            if declared
+                .insert(prompt.id.clone(), (generator_id.clone(), prompt.persistent))
+                .is_some()
+            {
+                bail!("prompt IDs must be unique across the selected generator graph");
+            }
+        }
     }
-    Ok(prompt_files)
+    if explicit
+        .keys()
+        .any(|prompt_id| !declared.contains_key(prompt_id))
+    {
+        bail!("prompt files must refer only to prompts declared by the selected generator graph");
+    }
+    let mut resolved = BTreeMap::new();
+    for (prompt_id, (generator_id, persistent)) in declared {
+        if let Some(path) = explicit.get(&prompt_id) {
+            resolved.insert(prompt_id, path.clone());
+        } else if persistent {
+            let path = generator_prompt_state_path(repository_root, &generator_id, &prompt_id)?;
+            if !path.exists() {
+                bail!(
+                    "persistent prompt {prompt_id} has no stored response; initialize it with --prompt-file {prompt_id}=PATH"
+                );
+            }
+            resolved.insert(prompt_id, path);
+        } else {
+            bail!(
+                "prompt {prompt_id} requires an explicit private response file (--prompt-file {prompt_id}=PATH)"
+            );
+        }
+    }
+    Ok(resolved)
 }
 
 #[derive(Clone, Copy)]
@@ -7218,6 +7361,56 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         );
         remove_generator_state(&repository, &generator_id)?;
         assert!(generator_action(&plan, &generator_id, &changed, &repository, false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_prompt_state_is_private_and_reused() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(&repository)?;
+        let generator_id = nix_seal_core::Id::parse("application/bootstrap")?;
+        let prompt_id = nix_seal_core::Id::parse("database/password")?;
+        let generator = nix_seal_core::Generator {
+            executable: "/nix/store/example/bin/generator".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
+            outputs: vec![nix_seal_core::Id::parse("application/token")?],
+            prompts: vec![nix_seal_core::GeneratorPrompt {
+                id: prompt_id.clone(),
+                mode: nix_seal_core::GeneratorPromptMode::Hidden,
+                message: "Database password".to_owned(),
+                multiline: false,
+                persistent: true,
+            }],
+            parameters: BTreeMap::new(),
+            validation: None,
+        };
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.generators
+            .insert(generator_id.clone(), generator.clone());
+        let value = SecretBox::new(Box::new(b"persistent-prompt".to_vec()));
+        persist_generator_prompts(&repository, &generator_id, &generator, &[value])?;
+        let path = generator_prompt_state_path(&repository, &generator_id, &prompt_id)?;
+        let metadata = fs::metadata(&path)?;
+        assert!(metadata.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        }
+        let files = validate_generator_prompt_files(
+            &plan,
+            std::slice::from_ref(&generator_id),
+            &[],
+            &repository,
+        )?;
+        let restored = read_generator_prompts(&generator, &files)?;
+        assert_eq!(restored[0].expose_secret(), b"persistent-prompt");
         Ok(())
     }
 

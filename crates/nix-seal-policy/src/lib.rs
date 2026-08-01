@@ -1192,12 +1192,11 @@ fn validate_generator_prompts<'a>(
             prompt.message.is_empty()
                 || prompt.message.len() > 4096
                 || prompt.message.bytes().any(|byte| byte == 0)
-                || prompt.persistent
                 || !known_prompts.insert(&prompt.id)
         })
     {
         return Err(PolicyError::Violation(format!(
-            "generator {generator_id} has invalid, duplicate, or unsupported persistent prompts"
+            "generator {generator_id} has invalid or duplicate prompts"
         )));
     }
     Ok(())
