@@ -68,6 +68,9 @@ jobs:
       - name: Fuzz strict public template parsing
         working-directory: fuzz
         run: cargo fuzz run template-v1 -- -max_total_time=60
+      - name: Fuzz strict public artifact-envelope parsing
+        working-directory: fuzz
+        run: cargo fuzz run artifact-envelope-v1 -- -max_total_time=60
   policy:
     runs-on: ubuntu-latest
     steps:
