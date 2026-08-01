@@ -1,0 +1,1 @@
+endpoint = https://example.invalid/{{nix-seal:value}}
