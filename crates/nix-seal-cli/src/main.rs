@@ -22,6 +22,15 @@ use std::{
 
 const SOPS_MIGRATION_MAX_PLAINTEXT_BYTES: u64 = 64 * 1024 * 1024;
 const SOPS_MIGRATION_TIMEOUT: Duration = Duration::from_mins(2);
+const PASSPHRASE_WORDS: [&str; 64] = [
+    "amber", "anchor", "april", "arch", "aspen", "atlas", "aurora", "bamboo", "beacon", "birch",
+    "blue", "brisk", "canyon", "cedar", "cinder", "cobalt", "comet", "coral", "crystal", "dawn",
+    "delta", "dune", "ember", "falcon", "fern", "fjord", "forest", "glacier", "harbor", "hazel",
+    "island", "jade", "juniper", "lagoon", "lantern", "lilac", "maple", "meadow", "meteor", "mist",
+    "moon", "moss", "oasis", "ocean", "olive", "opal", "orchid", "pearl", "pine", "prairie",
+    "quartz", "raven", "river", "sable", "saffron", "sage", "shore", "silver", "solstice",
+    "spruce", "stone", "sunset", "thunder", "willow",
+];
 
 struct BoundedReader<R> {
     inner: R,
@@ -3644,6 +3653,7 @@ fn generate_builtin_value(generator: &nix_seal_core::Generator) -> Result<Secret
                 URL_SAFE_NO_PAD.encode(input.expose_secret()).into_bytes(),
             )))
         }
+        "builtin:passphrase" => generate_passphrase(generator),
         "builtin:wireguard-private-key" => {
             if !generator.parameters.is_empty() {
                 bail!("builtin:wireguard-private-key does not accept parameters");
@@ -3678,9 +3688,35 @@ fn generate_builtin_value(generator: &nix_seal_core::Generator) -> Result<Secret
             Ok(SecretBox::new(Box::new(output)))
         }
         _ => bail!(
-            "generator executable is unsupported; v1 accepts builtin:random, builtin:hex, builtin:base64, builtin:token, builtin:wireguard-private-key, or builtin:uuid"
+            "generator executable is unsupported; v1 accepts builtin:random, builtin:hex, builtin:base64, builtin:token, builtin:passphrase, builtin:wireguard-private-key, or builtin:uuid"
         ),
     }
+}
+
+fn generate_passphrase(generator: &nix_seal_core::Generator) -> Result<SecretBox<Vec<u8>>> {
+    if generator.parameters.keys().any(|key| key != "words") {
+        bail!("builtin:passphrase accepts only the words parameter");
+    }
+    let words = generator
+        .parameters
+        .get("words")
+        .map_or(Ok(16_usize), |value| {
+            value
+                .parse::<usize>()
+                .context("builtin:passphrase words must be an integer")
+        })?;
+    if !(12..=64).contains(&words) {
+        bail!("builtin:passphrase words must be between 12 and 64");
+    }
+    let random = nix_seal_crypto::random_bytes(words)?;
+    let mut value = Vec::with_capacity(words.saturating_mul(8));
+    for (index, byte) in random.expose_secret().iter().enumerate() {
+        if index != 0 {
+            value.push(b'-');
+        }
+        value.extend_from_slice(PASSPHRASE_WORDS[usize::from(byte & 0x3f)].as_bytes());
+    }
+    Ok(SecretBox::new(Box::new(value)))
 }
 
 fn generator_byte_length(generator: &nix_seal_core::Generator) -> Result<usize> {
@@ -5208,6 +5244,35 @@ mod tests {
             uuid.expose_secret()[19],
             b'8' | b'9' | b'a' | b'b'
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn passphrase_generator_enforces_its_entropy_floor() -> Result<(), Box<dyn std::error::Error>> {
+        let generator = nix_seal_core::Generator {
+            executable: "builtin:passphrase".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            outputs: vec![nix_seal_core::Id::parse("application/passphrase")?],
+            prompts: Vec::new(),
+            parameters: BTreeMap::from([("words".to_owned(), "12".to_owned())]),
+            validation: None,
+        };
+        let value = generate_builtin_value(&generator)?;
+        assert_eq!(
+            value.expose_secret().split(|byte| *byte == b'-').count(),
+            12
+        );
+        assert!(
+            generate_passphrase(&nix_seal_core::Generator {
+                parameters: BTreeMap::from([("words".to_owned(), "11".to_owned())]),
+                ..generator
+            })
+            .is_err()
+        );
         Ok(())
     }
 

@@ -174,13 +174,15 @@ administrator/consumer policy still references it.
 `nix-seal generate` follows the public plan, derives the canonical recipients,
 and encrypts the generated value through the normal verified authoring path. The
 current Rust-only built-ins are `builtin:random`, `builtin:hex`,
-`builtin:base64`, `builtin:token`, `builtin:wireguard-private-key`, and
+`builtin:base64`, `builtin:token`, `builtin:passphrase`, `builtin:wireguard-private-key`, and
 `builtin:uuid`. Random, hex, base64, and token generators accept one public
 `bytes` parameter (1–1,048,576; default 32). `builtin:token` emits unpadded
 URL-safe base64 for service-safe tokens; `builtin:base64` emits standard padded
 base64. `builtin:wireguard-private-key` generates a clamped 32-byte Curve25519
 private scalar in the standard WireGuard base64 format and accepts no
-parameters; UUID accepts none. Generation is create-only unless `--replace` is
+parameters; UUID accepts none. `builtin:passphrase` uses 12–64 uniformly
+selected, hyphen-separated words from an embedded 64-word list (default 16,
+96 bits of selection entropy). Generation is create-only unless `--replace` is
 explicit. Generators may produce multiple secret outputs: every output is
 encrypted and round-trip verified before an existing ciphertext is changed, and
 replacement failures restore prior ciphertext. Direct executable generators use
