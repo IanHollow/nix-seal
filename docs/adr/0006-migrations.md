@@ -24,9 +24,15 @@ optional private `SOPS_AGE_KEY_FILE` path. It streams a bounded plaintext stdout
 directly into staged native-age encryption and performs its successful-exit
 check before the atomic ciphertext commit. A watchdog terminates a stalled
 process; SOPS stderr is intentionally discarded so it cannot leak plaintext.
-This initial path accepts age identity files only. PGP and cloud/KMS migrations
-are not silently enabled through inherited environments and require their own
-reviewed capability design.
+The opt-in single-document PGP bridge is likewise migration-only: it requires
+an explicit absolute non-symlink `gpg` executable and an existing owner-only
+`GNUPGHOME`, clears the inherited environment, and accepts no passphrase or
+secret material in arguments. It runs `gpg` with option-file loading and
+automatic key location, import, and retrieval disabled, discards diagnostics,
+and streams bounded stdout directly into the same verified native-age
+transaction. This does not make PGP a native encryption backend. Cloud/KMS
+migrations are not silently enabled through inherited environments and require
+their own reviewed capability design.
 
 Clan Vars inspection recognizes the documented per-machine output layout and
 never reads values. Because the filesystem leaves do not authoritatively encode
