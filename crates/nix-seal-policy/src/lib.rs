@@ -262,6 +262,16 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
             "identity public values must be nonempty and bounded".to_owned(),
         ));
     }
+    let mut signer_keys = BTreeMap::new();
+    for (id, identity) in &plan.identities {
+        if matches!(identity.kind, IdentityKind::Signer)
+            && let Some(previous) = signer_keys.insert(&identity.public, id)
+        {
+            return Err(PolicyError::Violation(format!(
+                "signer identities {previous} and {id} reuse one public verification key"
+            )));
+        }
+    }
     for (id, target) in &plan.targets {
         let identity = plan.identities.get(&target.identity).ok_or_else(|| {
             PolicyError::Violation(format!(
@@ -1122,6 +1132,26 @@ mod tests {
         a.groups.insert(id.clone(), nix_seal_core::Group::default());
         b.groups.insert(id, nix_seal_core::Group::default());
         assert!(matches!(merge(a, b), Err(PolicyError::Duplicate { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_signer_keys_are_rejected_before_threshold_evaluation() -> Result<(), PolicyError> {
+        let mut plan = PlanV1::default();
+        let first =
+            Id::parse("signer-a").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let second =
+            Id::parse("signer-b").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        for id in [first, second] {
+            plan.identities.insert(
+                id,
+                nix_seal_core::Identity {
+                    kind: IdentityKind::Signer,
+                    public: "same-public-key".to_owned(),
+                },
+            );
+        }
+        assert!(validate(&plan).is_err());
         Ok(())
     }
 
