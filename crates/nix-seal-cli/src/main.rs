@@ -4775,6 +4775,9 @@ fn generate_external_values(
     prompts: &[SecretBox<Vec<u8>>],
     secret_inputs: GeneratorSecretInputs<'_>,
 ) -> Result<GeneratedValues> {
+    eprintln!(
+        "warning: network isolation is not enforced for this external generator; trust the declared executable and runtime inputs"
+    );
     let workspace = tempfile::Builder::new()
         .prefix("nix-seal-generator-")
         .tempdir()

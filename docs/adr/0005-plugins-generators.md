@@ -7,16 +7,19 @@ Age identities use the standard plugin protocol. Generators are built-in Rust or
 direct declared executables from Nix packages; no shell evaluation. Processes
 receive a sanitized environment, explicit descriptors and secret dependencies,
 private workspace, time/output bounds, and network isolation when enforceable.
-On Unix, nix-seal places generators and migration helpers in a dedicated process
-group so timeout and failure cleanup terminates descendants that could otherwise
-retain access to staged plaintext; other platforms retain direct child
-termination as their portable fallback. External generators receive each
-explicitly declared canonical secret dependency as one numbered `0600` file
-beneath a private `NIX_SEAL_SECRET_DIR`; no dependency value is passed through
-arguments, an ordinary environment value, or the Nix store. Built-ins reject
-secret dependencies. The CLI checks canonical recipient authorization before
-streaming any dependency into that workspace. Plugin errors are redacted and
-unrelated descriptors are closed.
+The current release cannot enforce generator network isolation and emits a
+diagnostic warning for every external-generator invocation; generators and
+declared runtime inputs must therefore be treated as trusted code. On Unix,
+nix-seal places generators and migration helpers in a dedicated process group so
+timeout and failure cleanup terminates descendants that could otherwise retain
+access to staged plaintext; other platforms retain direct child termination as
+their portable fallback. External generators receive each explicitly declared
+canonical secret dependency as one numbered `0600` file beneath a private
+`NIX_SEAL_SECRET_DIR`; no dependency value is passed through arguments, an
+ordinary environment value, or the Nix store. Built-ins reject secret
+dependencies. The CLI checks canonical recipient authorization before streaming
+any dependency into that workspace. Plugin errors are redacted and unrelated
+descriptors are closed.
 
 The Rust adapter executes standard age plugin recipients and identities through
 the hidden `__plugin-worker` command. The parent resolves each required

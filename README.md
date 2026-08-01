@@ -453,7 +453,9 @@ cannot receive secret dependencies. No undeclared canonical secret is decrypted
 for the generator, and the private workspace is removed whether generation
 succeeds or fails. If an input is itself produced by another generator, that
 producer must be a direct entry in `dependencies`, making generation order
-explicit and checkable.
+explicit and checkable. This release does not enforce network isolation for
+external generators; each invocation emits a diagnostic warning, so generators
+and their declared runtime inputs must be treated as trusted code.
 
 Set a secret's `repositoryOnly` policy bit for an intermediary output that must
 remain administrator/recovery-encrypted in the repository and cache but must
