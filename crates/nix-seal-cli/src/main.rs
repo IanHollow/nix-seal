@@ -667,14 +667,14 @@ enum SchemaKind {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    let cli = Cli::parse();
+    if let Err(error) = run(cli) {
         eprintln!("nix-seal: {error:#}");
-        std::process::exit(1);
+        std::process::exit(exit_category(&error));
     }
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init { config } => run_init(&config, cli.json)?,
         Command::Plan {
@@ -734,6 +734,28 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn exit_category(error: &anyhow::Error) -> i32 {
+    for cause in error.chain() {
+        if cause.is::<nix_seal_policy::PolicyError>() {
+            return 3;
+        }
+        if cause.is::<nix_seal_crypto::CryptoError>()
+            || cause.is::<nix_seal_manifest::ManifestError>()
+        {
+            return 4;
+        }
+        if cause.is::<nix_seal_cache::CacheError>()
+            || cause.is::<nix_seal_authoring::AuthoringError>()
+        {
+            return 5;
+        }
+        if cause.is::<nix_seal_runtime::RuntimeError>() {
+            return 6;
+        }
+    }
+    1
 }
 
 fn run_init(config: &Path, json: bool) -> Result<()> {
@@ -4829,6 +4851,21 @@ mod tests {
         let mut output = Vec::new();
         assert!(reader.read_to_end(&mut output).is_err());
         assert_eq!(output, b"ab");
+    }
+
+    #[test]
+    fn exit_categories_follow_the_documented_typed_error_contract() {
+        assert_eq!(
+            exit_category(&anyhow::Error::new(nix_seal_crypto::CryptoError::Encrypt)),
+            4
+        );
+        assert_eq!(
+            exit_category(&anyhow::Error::new(
+                nix_seal_runtime::RuntimeError::InvalidSpec
+            )),
+            6
+        );
+        assert_eq!(exit_category(&anyhow::anyhow!("operational failure")), 1);
     }
 
     #[test]

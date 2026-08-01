@@ -152,6 +152,10 @@ public-policy and canonical-ciphertext checks used before deployment, then
 reports verified cache inventory and platform/runtime caveats. It emits only
 public metadata and does not decrypt secrets.
 
+Non-usage failures use stable exit categories: `1` operational, `3` policy,
+`4` cryptographic or approval verification, `5` cache/canonical-storage, and
+`6` runtime activation. Clap reserves `2` for argument/usage errors.
+
 `nix-seal key list --plan plan.v1.json` inventories the identities declared by
 that validated public plan. It exposes only each stable ID, role, and public
 recipient, signer, or plugin reference; it never searches for or reads private
