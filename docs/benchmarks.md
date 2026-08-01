@@ -15,10 +15,10 @@ cargo bench -p nix-seal-policy --bench scale --locked
 
 To measure one case, pass `-- --size=1000`. Each output line is a versioned
 `nix-seal.benchmark.v1` JSON object. It includes the object counts, canonical
-public-plan sizes, operation timings, operating system, architecture, and
-crate version. Times are wall-clock milliseconds and are not portable latency
-claims. Compare runs only when recording the runner image, CPU model, memory,
-Rust toolchain, and repository commit alongside the JSON output.
+public-plan sizes, operation timings, operating system, architecture, and crate
+version. Times are wall-clock milliseconds and are not portable latency claims.
+Compare runs only when recording the runner image, CPU model, memory, Rust
+toolchain, and repository commit alongside the JSON output.
 
 The CI benchmark job publishes the raw JSONL and runner metadata as an artifact
 for every push and pull request. Release notes must link the artifact and state
