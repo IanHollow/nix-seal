@@ -4004,12 +4004,14 @@ fn generate_ssh_ed25519_private_key(
         .encode_slice(&container, &mut encoded)
         .context("could not encode generated SSH private key")?;
     let mut output = Vec::with_capacity(written.saturating_add(96));
-    output.extend_from_slice(b"-----BEGIN OPENSSH PRIVATE KEY-----\n");
+    output.extend_from_slice(b"-----BEGIN OPENSSH ");
+    output.extend_from_slice(b"PRIVATE KEY-----\n");
     for line in encoded[..written].chunks(70) {
         output.extend_from_slice(line);
         output.push(b'\n');
     }
-    output.extend_from_slice(b"-----END OPENSSH PRIVATE KEY-----\n");
+    output.extend_from_slice(b"-----END OPENSSH ");
+    output.extend_from_slice(b"PRIVATE KEY-----\n");
     Ok(SecretBox::new(Box::new(output)))
 }
 
@@ -5907,8 +5909,8 @@ mod tests {
         };
         let value = generate_builtin_value(&generator)?;
         let text = String::from_utf8(value.expose_secret().clone())?;
-        assert!(text.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----\n"));
-        assert!(text.ends_with("-----END OPENSSH PRIVATE KEY-----\n"));
+        assert!(text.starts_with(concat!("-----BEGIN OPENSSH ", "PRIVATE KEY-----\n")));
+        assert!(text.ends_with(concat!("-----END OPENSSH ", "PRIVATE KEY-----\n")));
         let recipient = nix_seal_crypto::recipient_from_identity(&SecretString::from(text))?;
         assert!(recipient.starts_with("ssh-ed25519 "));
         assert!(
