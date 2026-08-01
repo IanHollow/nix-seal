@@ -18,15 +18,22 @@ mutates the legacy configuration or ciphertext.
 SOPS JSON inspection is similarly non-destructive: it validates bounded
 cleartext metadata (including provider and age-recipient declarations) without
 decrypting values or invoking SOPS. Structured extraction and mutation remain
-separate, explicit operations.
+separate, explicit operations. The explicit single-document SOPS migration path
+uses an absolute non-symlink SOPS binary with an empty environment and an
+optional private `SOPS_AGE_KEY_FILE` path. It streams a bounded plaintext stdout
+directly into staged native-age encryption and performs its successful-exit
+check before the atomic ciphertext commit. A watchdog terminates a stalled
+process; SOPS stderr is intentionally discarded so it cannot leak plaintext.
+This initial path accepts age identity files only. PGP and cloud/KMS migrations
+are not silently enabled through inherited environments and require their own
+reviewed capability design.
 
 Clan Vars inspection recognizes the documented per-machine output layout and
 never reads values. Because the filesystem leaves do not authoritatively encode
 the storage backend, secrecy classification, target selection, or runtime
 policy, importing a value requires an explicit reviewed mapping.
 
-Adapters for agenix-rekey metadata, SOPS/sops-nix, and Clan Vars/Facts remain
-planned. Their format-specific policy mapping must be reviewed before any
-mutation path is added. Removal of a source manager is a separate explicit
-operation after build, activation, rollback, rotation, and recovery
-verification.
+Adapters for agenix-rekey metadata and Clan Facts remain planned. Their
+format-specific policy mapping must be reviewed before any mutation path is
+added. Removal of a source manager is a separate explicit operation after build,
+activation, rollback, rotation, and recovery verification.

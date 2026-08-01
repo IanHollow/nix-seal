@@ -104,6 +104,9 @@ pub enum AuthoringError {
     /// Round-trip plaintext differed from the input stream.
     #[error("new ciphertext failed round-trip plaintext verification")]
     RoundTrip,
+    /// An external plaintext producer failed its final status check.
+    #[error("external plaintext producer did not complete successfully")]
+    ExternalInput,
     /// Filesystem transaction failed.
     #[error("canonical ciphertext transaction failed")]
     Io(#[source] std::io::Error),
@@ -151,6 +154,30 @@ pub fn write_secret<R: Read>(
     verification_identity: &SecretString,
     mode: WriteMode,
 ) -> Result<AuthoringResult, AuthoringError> {
+    write_secret_checked(
+        repository_root,
+        relative_destination,
+        input,
+        recipients,
+        verification_identity,
+        mode,
+        || Ok(()),
+    )
+}
+
+/// Encrypts a bounded input and runs a caller-supplied final input check before
+/// committing ciphertext. This lets migration callers stream an external
+/// decryptor directly into age encryption while still failing closed when that
+/// process reports an error after closing standard output.
+pub fn write_secret_checked<R: Read, F: FnOnce() -> Result<(), AuthoringError>>(
+    repository_root: &Path,
+    relative_destination: &Path,
+    input: R,
+    recipients: &[String],
+    verification_identity: &SecretString,
+    mode: WriteMode,
+    final_input_check: F,
+) -> Result<AuthoringResult, AuthoringError> {
     let verification_recipient = nix_seal_crypto::recipient_from_identity(verification_identity)?;
     let normalized_recipients = recipients
         .iter()
@@ -178,6 +205,10 @@ pub fn write_secret<R: Read>(
     }
     staged.as_file_mut().rewind().map_err(AuthoringError::Io)?;
     let ciphertext_hash = hash_file(staged.as_file_mut())?;
+
+    // Do not make ciphertext visible until an input-producing subprocess (if
+    // any) has reported a successful final status.
+    final_input_check()?;
 
     match mode {
         WriteMode::Create => {
@@ -992,6 +1023,39 @@ mod tests {
             nix_seal_crypto::decrypt(File::open(&result.path)?, &mut plaintext, &identity)?;
             assert_eq!(plaintext, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_final_input_check_preserves_existing_ciphertext()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        let recipients = vec![recipient];
+        let destination = Path::new("secrets/checked.age");
+        let created = write_secret(
+            &root,
+            destination,
+            b"before".as_slice(),
+            &recipients,
+            &identity,
+            WriteMode::Create,
+        )?;
+        let before = std::fs::read(&created.path)?;
+        assert!(matches!(
+            write_secret_checked(
+                &root,
+                destination,
+                b"after".as_slice(),
+                &recipients,
+                &identity,
+                WriteMode::Replace,
+                || Err(AuthoringError::ExternalInput),
+            ),
+            Err(AuthoringError::ExternalInput)
+        ));
+        assert_eq!(std::fs::read(created.path)?, before);
         Ok(())
     }
 

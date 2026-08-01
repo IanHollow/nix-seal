@@ -13,10 +13,53 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
+    process::{Child, Command as ProcessCommand, Stdio},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const SOPS_MIGRATION_MAX_PLAINTEXT_BYTES: u64 = 64 * 1024 * 1024;
+const SOPS_MIGRATION_TIMEOUT: Duration = Duration::from_mins(2);
+
+struct BoundedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R> BoundedReader<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+        }
+    }
+}
+
+impl<R: Read> Read for BoundedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut probe = [0_u8; 1];
+            if self.inner.read(&mut probe)? == 0 {
+                return Ok(0);
+            }
+            return Err(std::io::Error::other(
+                "external plaintext producer exceeded the migration size limit",
+            ));
+        }
+        let usable = usize::try_from(self.remaining.min(buffer.len() as u64))
+            .map_err(|_| std::io::Error::other("invalid migration input bound"))?;
+        let read = self.inner.read(&mut buffer[..usable])?;
+        self.remaining = self
+            .remaining
+            .checked_sub(read as u64)
+            .ok_or_else(|| std::io::Error::other("invalid migration input size"))?;
+        Ok(read)
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -402,6 +445,36 @@ enum MigrateCommand {
         /// Existing directory containing SOPS-encrypted `*.json` files.
         #[arg(long, default_value = "secrets")]
         directory: PathBuf,
+    },
+    /// Stream-decrypt one SOPS document into a new native age ciphertext.
+    Sops {
+        /// Existing repository root; source and destination must remain below it.
+        #[arg(long, default_value = ".")]
+        repository_root: PathBuf,
+        /// Repository-relative SOPS-encrypted source document.
+        #[arg(long)]
+        source: PathBuf,
+        /// Repository-relative native nix-seal ciphertext destination.
+        #[arg(long)]
+        destination: PathBuf,
+        /// Absolute path to the external SOPS executable used only for this migration.
+        #[arg(long)]
+        sops: PathBuf,
+        /// Optional private age identity file passed only to SOPS as `SOPS_AGE_KEY_FILE`.
+        #[arg(long)]
+        sops_age_key_file: Option<PathBuf>,
+        /// Private identity authorized to verify the replacement ciphertext.
+        #[arg(long)]
+        identity: PathBuf,
+        /// Explicit canonical age recipient for the replacement; repeat as needed.
+        #[arg(long = "recipient", required = true)]
+        recipients: Vec<String>,
+        /// Replace an existing destination; omission is create-only.
+        #[arg(long)]
+        replace: bool,
+        /// Required acknowledgement that this performs the reported mutation.
+        #[arg(long)]
+        execute: bool,
     },
     /// Inspect Clan Vars per-machine output leaves without reading their values.
     ClanVars {
@@ -800,6 +873,28 @@ fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
         MigrateCommand::Agenix { directory } => migrate_agenix_tree(&directory, "agenix", json),
         MigrateCommand::Ragenix { directory } => migrate_agenix_tree(&directory, "ragenix", json),
         MigrateCommand::SopsJson { directory } => migrate_sops_json_tree(&directory, json),
+        MigrateCommand::Sops {
+            repository_root,
+            source,
+            destination,
+            sops,
+            sops_age_key_file,
+            identity,
+            recipients,
+            replace,
+            execute,
+        } => migrate_sops_document(
+            &repository_root,
+            &source,
+            &destination,
+            &sops,
+            sops_age_key_file.as_deref(),
+            &identity,
+            &recipients,
+            replace,
+            execute,
+            json,
+        ),
         MigrateCommand::ClanVars { directory } => migrate_clan_vars_tree(&directory, json),
         MigrateCommand::Ciphertext {
             repository_root,
@@ -893,6 +988,213 @@ fn migrate_ciphertext(
         );
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn migrate_sops_document(
+    repository_root: &Path,
+    source: &Path,
+    destination: &Path,
+    sops: &Path,
+    sops_age_key_file: Option<&Path>,
+    identity_path: &Path,
+    recipients: &[String],
+    replace: bool,
+    execute: bool,
+    json: bool,
+) -> Result<()> {
+    if recipients.is_empty() {
+        bail!("SOPS migration requires at least one replacement recipient");
+    }
+    if !execute {
+        let report = serde_json::json!({
+            "schema":"nix-seal.migration-sops.v1",
+            "dryRun":true,
+            "source":source,
+            "destination":destination,
+            "sops":sops,
+            "recipientCount":recipients.len(),
+            "replace":replace,
+            "usesExplicitAgeKeyFile":sops_age_key_file.is_some(),
+        });
+        if json {
+            println!("{report}");
+        } else {
+            println!(
+                "SOPS migration dry-run: {} -> {}",
+                source.display(),
+                destination.display()
+            );
+            eprintln!(
+                "warning: rerun with --execute only after reviewing the source, recipients, and destination"
+            );
+        }
+        return Ok(());
+    }
+
+    let source = resolve_migration_regular_file(repository_root, source)?;
+    let sops = resolve_external_executable(sops)?;
+    let sops_age_key_file = sops_age_key_file
+        .map(|path| {
+            open_private_identity(path)?;
+            path.canonicalize()
+                .context("could not canonicalize private SOPS age identity")
+        })
+        .transpose()?;
+    let identity = read_identity(identity_path)?;
+    let mode = if replace {
+        nix_seal_authoring::WriteMode::Replace
+    } else {
+        nix_seal_authoring::WriteMode::Create
+    };
+
+    let mut command = ProcessCommand::new(sops);
+    command
+        .arg("--decrypt")
+        .arg(&source)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env_clear();
+    if let Some(path) = &sops_age_key_file {
+        command.env("SOPS_AGE_KEY_FILE", path);
+    }
+    let mut child = command
+        .spawn()
+        .context("could not start the explicit SOPS migration executable")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("SOPS migration stdout was unavailable")?;
+    let child = Arc::new(Mutex::new(child));
+    let (complete_tx, complete_rx) = mpsc::channel();
+    let watchdog_child = Arc::clone(&child);
+    let watchdog = thread::spawn(move || {
+        if complete_rx.recv_timeout(SOPS_MIGRATION_TIMEOUT).is_err()
+            && let Ok(mut child) = watchdog_child.lock()
+            && child.try_wait().ok().flatten().is_none()
+        {
+            let _ = child.kill();
+        }
+    });
+    let result = nix_seal_authoring::write_secret_checked(
+        repository_root,
+        destination,
+        BoundedReader::new(stdout, SOPS_MIGRATION_MAX_PLAINTEXT_BYTES),
+        recipients,
+        &identity,
+        mode,
+        || wait_for_external_migration(&child, SOPS_MIGRATION_TIMEOUT),
+    );
+    let _ = complete_tx.send(());
+    let _ = watchdog.join();
+    if result.is_err() {
+        terminate_external_migration(&child);
+    }
+    let result = result?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.migration-sops.v1",
+                "dryRun":false,
+                "source":source,
+                "destination":result.path,
+                "ciphertextHash":result.ciphertext_hash,
+                "plaintextBytes":result.plaintext_bytes,
+                "usedExplicitAgeKeyFile":sops_age_key_file.is_some(),
+            })
+        );
+    } else {
+        println!(
+            "SOPS document migrated {} -> {}",
+            source.display(),
+            result.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn wait_for_external_migration(
+    child: &Arc<Mutex<Child>>,
+    timeout: Duration,
+) -> Result<(), nix_seal_authoring::AuthoringError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = child
+            .lock()
+            .map_err(|_| nix_seal_authoring::AuthoringError::ExternalInput)?
+            .try_wait()
+            .map_err(nix_seal_authoring::AuthoringError::Io)?;
+        if let Some(status) = status {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(nix_seal_authoring::AuthoringError::ExternalInput)
+            };
+        }
+        if Instant::now() >= deadline {
+            terminate_external_migration(child);
+            return Err(nix_seal_authoring::AuthoringError::ExternalInput);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn terminate_external_migration(child: &Arc<Mutex<Child>>) {
+    if let Ok(mut child) = child.lock() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn resolve_migration_regular_file(repository_root: &Path, relative: &Path) -> Result<PathBuf> {
+    if relative.is_absolute()
+        || relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("migration source must be a non-empty repository-relative normal path");
+    }
+    let root_metadata = fs::symlink_metadata(repository_root)
+        .context("could not inspect migration repository root")?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
+        bail!("migration repository root must be a non-symlink directory");
+    }
+    let root = repository_root
+        .canonicalize()
+        .context("could not canonicalize migration repository root")?;
+    let mut current = root.clone();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            bail!("migration source must be a normal repository-relative path");
+        };
+        current.push(name);
+        let metadata = fs::symlink_metadata(&current)
+            .with_context(|| format!("could not inspect migration source {}", current.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("migration source path contains a symbolic link");
+        }
+    }
+    let metadata = fs::symlink_metadata(&current)?;
+    if !metadata.file_type().is_file() {
+        bail!("migration source must be a regular file");
+    }
+    Ok(current)
+}
+
+fn resolve_external_executable(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("external migration executable must be an absolute path");
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("could not inspect external executable {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("external migration executable must be a non-symlink regular file");
+    }
+    path.canonicalize()
+        .context("could not canonicalize external migration executable")
 }
 
 fn migrate_agenix_tree(directory: &Path, source: &str, json: bool) -> Result<()> {
@@ -3719,6 +4021,30 @@ mod tests {
     use super::*;
     use nix_seal_manifest::{ARTIFACT_SCHEMA, TargetManifestV2};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn bounded_reader_rejects_bytes_past_the_configured_limit() {
+        let mut reader = BoundedReader::new(&b"abc"[..], 2);
+        let mut output = Vec::new();
+        assert!(reader.read_to_end(&mut output).is_err());
+        assert_eq!(output, b"ab");
+    }
+
+    #[test]
+    fn sops_migration_source_must_remain_below_its_repository_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("repository");
+        fs::create_dir(&root)?;
+        fs::write(root.join("legacy.yaml"), b"public test input")?;
+        assert_eq!(
+            resolve_migration_regular_file(&root, Path::new("legacy.yaml"))?,
+            root.canonicalize()?.join("legacy.yaml")
+        );
+        assert!(resolve_migration_regular_file(&root, Path::new("../outside")).is_err());
+        assert!(resolve_migration_regular_file(&root, Path::new("/absolute")).is_err());
+        Ok(())
+    }
 
     #[test]
     fn built_in_generators_are_bounded_and_format_safe() -> Result<(), Box<dyn std::error::Error>> {

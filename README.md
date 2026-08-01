@@ -198,6 +198,11 @@ nix-seal migrate agenix --directory ./secrets --json
 nix-seal migrate ragenix --directory ./secrets --json
 # inspect structured SOPS JSON metadata without decrypting values or invoking SOPS
 nix-seal migrate sops-json --directory ./secrets --json
+# Convert one SOPS document using only an explicit SOPS binary and private age key file.
+nix-seal migrate sops --repository-root . --source legacy/token.yaml \
+  --destination secrets/token.age --sops /absolute/path/to/sops \
+  --sops-age-key-file /absolute/private/sops-age-key.txt \
+  --identity /absolute/private/nix-seal-admin.age --recipient age1... --execute
 # inventory Clan's documented per-machine output leaves without reading values
 nix-seal migrate clan-vars --directory ./vars/per-machine --json
 # First inspect the mutation; then add --execute to stream-reencrypt it.
@@ -251,6 +256,18 @@ groups, then reports public provider types. It does not decrypt or authenticate
 the document values; structured extraction and SOPS invocation remain an
 explicit later migration step. YAML, dotenv, INI, and binary SOPS inputs are not
 silently treated as JSON.
+
+`migrate sops` is the separate mutation path for a single reviewed SOPS
+document. It invokes only an absolute, non-symlink SOPS executable with an
+empty environment, optionally passing a private `SOPS_AGE_KEY_FILE` path. Its
+plaintext stdout is bounded to 64 MiB and streamed directly into a staged native
+age ciphertext; no plaintext file is created. The staged result is round-trip
+verified and is committed only after SOPS exits successfully. SOPS diagnostics
+are deliberately discarded to avoid leaking values into the invoking terminal;
+failure is reported as a redacted status error. A 120-second watchdog terminates
+a stalled process. This initial mutation path therefore supports SOPS age
+identities explicitly; PGP and cloud/KMS SOPS migrations remain a separately
+reviewed extension rather than implicitly inheriting credential environments.
 
 `migrate clan-vars` recognizes only the documented
 `vars/per-machine/<machine>/<generator>/<output>/value` leaves. It validates the
