@@ -165,7 +165,7 @@ pkgs.testers.nixosTest {
 
       # Establish the first immutable generation without service actions. The
       # credential consumer needs an existing source before systemd can start.
-      jq '.postSwitch = null | .templates = []' "$root/activation.json" > "$root/activation-initial.json"
+      jq '.postSwitch = null' "$root/activation.json" > "$root/activation-initial.json"
       systemctl daemon-reload
       nix-seal activate --spec "$root/activation-initial.json" --identity "$root/target.age"
       systemctl start nix-seal-test.service
