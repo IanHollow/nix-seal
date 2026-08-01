@@ -63,9 +63,12 @@ file creation.
 Before publishing, activation compares the complete candidate generation with
 the active generation using bounded in-memory hashes plus owner, group, and mode
 metadata. An identical candidate is discarded without generation churn. Platform
-service actions are declared as bounded unit names and a fixed manager kind, run
-through an absolute executable with a sanitized environment and a hard timeout,
-and are attempted only after a changed generation has switched.
+service actions are declared as bounded unit names and a fixed manager kind. The
+runtime resolves the manager executable through a no-follow canonical path,
+requires the expected `systemctl`/`launchctl` basename, accepts only the Nix
+store or protected operating-system path, and rejects writable/non-executable
+metadata before spawning it with a sanitized environment and hard timeout.
+Actions are attempted only after a changed generation has switched.
 
 Before switching a changed generation, activation durably records a restrictive
 pending-action marker bound to the generation and plan hash. It clears that

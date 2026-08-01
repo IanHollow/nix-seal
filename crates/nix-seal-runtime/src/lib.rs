@@ -937,7 +937,8 @@ fn run_manager_action(
     unit: &str,
     arguments: &[String],
 ) -> Result<(), RuntimeError> {
-    let mut command = Command::new(&actions.executable);
+    let executable = trusted_service_executable(actions, unit)?;
+    let mut command = Command::new(executable);
     command
         .args(arguments)
         .env_clear()
@@ -974,6 +975,62 @@ fn run_manager_action(
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// Resolves the service-manager executable before spawning it. Activation
+/// documents are public inputs, so an arbitrary absolute path must not become
+/// an ambient-code-execution primitive. The shipped Nix modules use a system
+/// manager binary from the Nix store or the operating system's protected path.
+fn trusted_service_executable(
+    actions: &PostSwitchSpecV1,
+    unit: &str,
+) -> Result<PathBuf, RuntimeError> {
+    let expected_name = match actions.manager {
+        ServiceManagerV1::SystemdSystem | ServiceManagerV1::SystemdUser => "systemctl",
+        ServiceManagerV1::LaunchdSystem | ServiceManagerV1::LaunchdUser => "launchctl",
+    };
+    if actions
+        .executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some(expected_name)
+    {
+        return Err(RuntimeError::ServiceAction(unit.to_owned()));
+    }
+    let canonical = actions
+        .executable
+        .canonicalize()
+        .map_err(|_| RuntimeError::ServiceAction(unit.to_owned()))?;
+    let protected_path = match actions.manager {
+        ServiceManagerV1::SystemdSystem | ServiceManagerV1::SystemdUser => {
+            canonical.starts_with("/nix/store")
+                || canonical == Path::new("/bin/systemctl")
+                || canonical == Path::new("/usr/bin/systemctl")
+        }
+        ServiceManagerV1::LaunchdSystem | ServiceManagerV1::LaunchdUser => {
+            canonical == Path::new("/bin/launchctl") || canonical == Path::new("/usr/bin/launchctl")
+        }
+    };
+    if !protected_path {
+        return Err(RuntimeError::ServiceAction(unit.to_owned()));
+    }
+    let file = open_regular_nofollow(&canonical)
+        .map_err(|_| RuntimeError::ServiceAction(unit.to_owned()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| RuntimeError::ServiceAction(unit.to_owned()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner = metadata.uid();
+        if owner != 0 && owner != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o022 != 0
+            || metadata.permissions().mode() & 0o111 == 0
+        {
+            return Err(RuntimeError::ServiceAction(unit.to_owned()));
+        }
+    }
+    Ok(canonical)
 }
 
 fn count_regular_files(root: &Path) -> Result<usize, RuntimeError> {
@@ -2271,6 +2328,17 @@ mod tests {
             manager_arguments(ServiceManagerV1::LaunchdSystem, false, "example.service")?,
             ["kickstart", "-k", "system/example.service"]
         );
+        let untrusted_executable = PostSwitchSpecV1 {
+            executable: PathBuf::from("/bin/sh"),
+            manager: ServiceManagerV1::SystemdSystem,
+            reload_units: Vec::new(),
+            restart_units: vec!["example.service".to_owned()],
+            timeout_seconds: 30,
+        };
+        assert!(matches!(
+            trusted_service_executable(&untrusted_executable, "example.service"),
+            Err(RuntimeError::ServiceAction(_))
+        ));
         Ok(())
     }
 

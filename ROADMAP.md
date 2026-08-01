@@ -19,7 +19,7 @@
   artifact and export publication now use atomic no-replace renames with
   regression coverage; adversarial race injection remains required. The Linux
   NixOS VM now exercises a real systemd credential consumer and post-switch
-  restart after activation.
+  restart after activation; service actions now reject untrusted manager paths.
 - Phase 3: authoring and lifecycle commands, identity/value rotation,
   generators, prompts, templates, and provisioning phases.
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,

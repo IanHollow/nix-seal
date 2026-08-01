@@ -47,6 +47,9 @@ runtime inputs remain trusted-code boundaries on every platform.
 Security tests cover traversal, symlink/hardlink/TOCTOU races, malformed crypto
 and signatures, replay and target substitution, disk exhaustion, crashes,
 concurrency, secret canaries, and denial-of-service bounds.
+Post-switch service actions are constrained to the expected manager binary and
+protected canonical paths; writable or non-executable manager files are
+rejected before any process is spawned.
 
 ## Out of scope and unavoidable limits
 
