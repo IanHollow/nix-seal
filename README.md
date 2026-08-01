@@ -112,6 +112,27 @@ Rendered files use the same owner/group/mode controls, unchanged generation
 detection, atomic switch, rollback preservation, and post-switch action protocol
 as ordinary secret files.
 
+`nix-seal check` and `nix-seal doctor` validate every bounded public template
+source and its declared placeholders before a deployment attempt. For a
+deliberate local render outside activation, use an absolute, existing private
+directory and an explicit output file:
+
+```console
+nix-seal template render \
+  --plan plan.v1.json \
+  --template application/config \
+  --repository-root . \
+  --identity /private/administrator.agekey \
+  --output /private/runtime/application.conf
+```
+
+The command checks that the identity is authorized for every referenced
+canonical secret, streams plaintext only into a same-directory staging file,
+sets the final file to mode `0600`, and atomically creates it. It never prints
+the result; replacement requires `--replace`. The destination must be absolute,
+outside `/nix/store`, owned by the invoking user, and in a directory that is not
+group- or world-writable.
+
 ## Systemd service credentials
 
 NixOS system services and Linux Home Manager user services can receive an

@@ -647,11 +647,10 @@ impl Generation {
             template.uid,
             template.gid,
         )?;
-        let mut limited = LimitedWriter::new(&mut output, MAX_TEMPLATE_OUTPUT_BYTES);
-        render_template_source(
+        render_template_into(
             &template.source,
             template.placeholders,
-            &mut limited,
+            &mut output,
             |placeholder, writer| {
                 let source = self.transaction.path().join(placeholder.secret_id.as_str());
                 let mut secret = open_regular_nofollow(&source)?;
@@ -665,7 +664,6 @@ impl Generation {
                 }
             },
         )?;
-        limited.flush().map_err(template_io_error)?;
         output.sync_all()?;
         Ok(())
     }
@@ -1129,7 +1127,13 @@ pub fn validate_template_source(
     visit_template_source(source, placeholders, |_| Ok(()))
 }
 
-fn render_template_source<W, F>(
+/// Renders a validated public template into a caller-owned private writer.
+///
+/// The placeholder callback receives a bounded writer, so callers can stream
+/// decrypted secret bytes directly without ever materializing a whole rendered
+/// value. It is the caller's responsibility to authenticate each secret source
+/// before providing it to the callback.
+pub fn render_template_into<W, F>(
     source: &[u8],
     placeholders: &BTreeMap<String, TemplatePlaceholderSpecV1>,
     writer: &mut W,
@@ -1137,12 +1141,14 @@ fn render_template_source<W, F>(
 ) -> Result<(), RuntimeError>
 where
     W: Write,
-    F: FnMut(&TemplatePlaceholderSpecV1, &mut W) -> Result<(), RuntimeError>,
+    F: FnMut(&TemplatePlaceholderSpecV1, &mut dyn Write) -> Result<(), RuntimeError>,
 {
+    let mut limited = LimitedWriter::new(writer, MAX_TEMPLATE_OUTPUT_BYTES);
     visit_template_source(source, placeholders, |part| match part {
-        TemplatePart::Literal(literal) => template_write_all(writer, literal),
-        TemplatePart::Placeholder(placeholder) => render_placeholder(placeholder, writer),
-    })
+        TemplatePart::Literal(literal) => template_write_all(&mut limited, literal),
+        TemplatePart::Placeholder(placeholder) => render_placeholder(placeholder, &mut limited),
+    })?;
+    limited.flush().map_err(template_io_error)
 }
 
 struct LimitedWriter<'a, W> {
@@ -1189,7 +1195,7 @@ fn template_io_error(error: std::io::Error) -> RuntimeError {
     }
 }
 
-fn template_write_all<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<(), RuntimeError> {
+fn template_write_all<W: Write + ?Sized>(writer: &mut W, bytes: &[u8]) -> Result<(), RuntimeError> {
     writer.write_all(bytes).map_err(template_io_error)
 }
 
@@ -1203,7 +1209,10 @@ fn read_secret<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<usize, Runt
     }
 }
 
-fn copy_utf8<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<(), RuntimeError> {
+fn copy_utf8<R: Read, W: Write + ?Sized>(
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<(), RuntimeError> {
     let mut buffer = Zeroizing::new(vec![0_u8; 8 * 1024 + 3]);
     let mut carried = 0_usize;
     loop {
@@ -1234,7 +1243,10 @@ fn copy_utf8<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<(), Ru
     }
 }
 
-fn copy_base64<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<(), RuntimeError> {
+fn copy_base64<R: Read, W: Write + ?Sized>(
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<(), RuntimeError> {
     use base64::Engine as _;
     let mut input = Zeroizing::new(vec![0_u8; 8 * 1024 + 2]);
     let mut encoded = Zeroizing::new(vec![0_u8; 11 * 1024]);
@@ -1257,7 +1269,10 @@ fn copy_base64<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<(), 
     }
 }
 
-fn copy_hex<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<(), RuntimeError> {
+fn copy_hex<R: Read, W: Write + ?Sized>(
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<(), RuntimeError> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut input = Zeroizing::new(vec![0_u8; 8 * 1024]);
     let mut encoded = Zeroizing::new(vec![0_u8; 16 * 1024]);

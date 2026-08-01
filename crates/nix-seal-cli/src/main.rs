@@ -287,6 +287,27 @@ enum TemplateCommand {
         #[arg(long, default_value = "plan.v1.json")]
         plan: PathBuf,
     },
+    /// Render one template into an explicit private file; plaintext is never printed.
+    Render {
+        /// Canonical compiled plan.v1 JSON.
+        #[arg(long, default_value = "plan.v1.json")]
+        plan: PathBuf,
+        /// Declared template ID selected from the plan.
+        #[arg(long)]
+        template: nix_seal_core::Id,
+        /// Repository root used to resolve canonical ciphertext sources.
+        #[arg(long, default_value = ".")]
+        repository_root: PathBuf,
+        /// Administrator or recovery identity authorized for every placeholder secret.
+        #[arg(long)]
+        identity: PathBuf,
+        /// Absolute private output path. It is created with mode 0600.
+        #[arg(long)]
+        output: PathBuf,
+        /// Replace an existing safe regular output file atomically.
+        #[arg(long)]
+        replace: bool,
+    },
 }
 
 #[derive(Args)]
@@ -717,6 +738,22 @@ fn run(cli: Cli) -> Result<()> {
         Command::Recipients(arguments) => run_recipients(&arguments, cli.json)?,
         Command::Schema { kind } => run_schema(kind)?,
         Command::Template(TemplateCommand::Check { plan }) => run_template_check(&plan, cli.json)?,
+        Command::Template(TemplateCommand::Render {
+            plan,
+            template,
+            repository_root,
+            identity,
+            output,
+            replace,
+        }) => run_template_render(
+            &plan,
+            &template,
+            &repository_root,
+            &identity,
+            &output,
+            replace,
+            cli.json,
+        )?,
         Command::Completions { shell } => completions(shell),
         Command::Migrate(command) => run_migrate(command, cli.json)?,
         Command::Cache(CacheCommand::Status { root }) => cache_status(root, cli.json)?,
@@ -863,6 +900,7 @@ fn run_check(
     let plan = load_plan(toml, nix_plan)?;
     nix_seal_policy::validate(&plan)?;
     validate_plan_identity_material(&plan, false)?;
+    validate_plan_templates(&plan, toml)?;
     let hash = nix_seal_policy::plan_hash(&plan)?;
     if deep {
         deep_check_plan(&plan, repository_root)?;
@@ -892,6 +930,7 @@ fn run_doctor(
     json: bool,
 ) -> Result<()> {
     let plan = read_plan_bounded(plan_path)?;
+    validate_plan_templates(&plan, plan_path)?;
     deep_check_plan(&plan, repository_root)?;
     let plan_hash = nix_seal_policy::plan_hash(&plan)?;
     let cache = nix_seal_cache::Cache::open(cache_root.unwrap_or_else(default_cache_root))?;
@@ -972,51 +1011,7 @@ fn run_schema(kind: SchemaKind) -> Result<()> {
 
 fn run_template_check(plan_path: &Path, json: bool) -> Result<()> {
     let plan = read_plan_bounded(plan_path)?;
-    let parent = plan_path
-        .parent()
-        .context("compiled plan path has no parent")?;
-    for (template_id, template) in &plan.templates {
-        let source = Path::new(&template.source);
-        let source = if source.is_absolute() {
-            source.to_owned()
-        } else {
-            parent.join(source)
-        };
-        let mut bytes = Vec::new();
-        fs::File::open(&source)
-            .with_context(|| format!("could not open public template source for {template_id}"))?
-            .take(2 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > 2 * 1024 * 1024 {
-            bail!("public template source for {template_id} exceeds the 2 MiB safety limit");
-        }
-        let placeholders = template
-            .placeholders
-            .iter()
-            .map(|(name, placeholder)| {
-                let encoding = match placeholder.encoding {
-                    nix_seal_core::TemplateEncoding::Utf8 => {
-                        nix_seal_runtime::TemplateEncodingV1::Utf8
-                    }
-                    nix_seal_core::TemplateEncoding::Base64 => {
-                        nix_seal_runtime::TemplateEncodingV1::Base64
-                    }
-                    nix_seal_core::TemplateEncoding::Hex => {
-                        nix_seal_runtime::TemplateEncodingV1::Hex
-                    }
-                };
-                (
-                    name.clone(),
-                    nix_seal_runtime::TemplatePlaceholderSpecV1 {
-                        secret_id: placeholder.secret.clone(),
-                        encoding,
-                    },
-                )
-            })
-            .collect();
-        nix_seal_runtime::validate_template_source(&bytes, &placeholders)
-            .with_context(|| format!("public template source for {template_id} is invalid"))?;
-    }
+    validate_plan_templates(&plan, plan_path)?;
     if json {
         println!(
             "{}",
@@ -1026,6 +1021,170 @@ fn run_template_check(plan_path: &Path, json: bool) -> Result<()> {
         println!("{} public templates are valid", plan.templates.len());
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_template_render(
+    plan_path: &Path,
+    template_id: &nix_seal_core::Id,
+    repository_root: &Path,
+    identity_path: &Path,
+    output: &Path,
+    replace: bool,
+    json: bool,
+) -> Result<()> {
+    let plan = read_plan_bounded(plan_path)?;
+    let template = plan
+        .templates
+        .get(template_id)
+        .with_context(|| format!("template {template_id} is absent from plan"))?;
+    let source = read_template_source(template_id, template, plan_path)?;
+    let placeholders = runtime_template_placeholders(template);
+    nix_seal_runtime::validate_template_source(&source, &placeholders)
+        .with_context(|| format!("public template source for {template_id} is invalid"))?;
+
+    let identity = read_identity(identity_path)?;
+    let public = nix_seal_crypto::recipient_from_identity(&identity)?;
+    let mut secret_paths = BTreeMap::new();
+    for placeholder in template.placeholders.values() {
+        let recipients = nix_seal_policy::secret_recipients(&plan, &placeholder.secret)?;
+        if !recipients
+            .recipients
+            .values()
+            .any(|recipient| recipient == &public)
+        {
+            bail!(
+                "render identity is not authorized by canonical recipient policy for {}",
+                placeholder.secret
+            );
+        }
+        let secret = plan
+            .secrets
+            .get(&placeholder.secret)
+            .context("template placeholder secret is absent from plan")?;
+        secret_paths
+            .entry(placeholder.secret.clone())
+            .or_insert(existing_secret_path(repository_root, &secret.source)?);
+    }
+
+    let (destination, parent) = prepare_private_template_destination(output, replace)?;
+    let mut staged = tempfile::NamedTempFile::new_in(&parent)
+        .context("could not create a private template output transaction")?;
+    set_private_template_output(staged.as_file())?;
+    nix_seal_runtime::render_template_into(
+        &source,
+        &placeholders,
+        staged.as_file_mut(),
+        |placeholder, writer| {
+            let path = secret_paths
+                .get(&placeholder.secret_id)
+                .ok_or(nix_seal_runtime::RuntimeError::InvalidSpec)?;
+            let ciphertext = open_public_ciphertext(path)
+                .map_err(|_| nix_seal_runtime::RuntimeError::InvalidSpec)?;
+            nix_seal_crypto::decrypt(ciphertext, writer, &identity)?;
+            Ok(())
+        },
+    )?;
+    staged
+        .as_file()
+        .sync_all()
+        .context("could not durably stage private template output")?;
+    if replace {
+        staged
+            .persist(&destination)
+            .map_err(|error| error.error)
+            .context("could not atomically replace private template output")?;
+    } else {
+        staged
+            .persist_noclobber(&destination)
+            .map_err(|error| error.error)
+            .context("refusing to overwrite private template output")?;
+    }
+    fs::File::open(&parent)
+        .and_then(|directory| directory.sync_all())
+        .context(
+            "template output changed atomically but directory durability could not be confirmed",
+        )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.output.v1",
+                "rendered":true,
+                "templateId":template_id,
+                "output":output
+            })
+        );
+    } else {
+        println!("rendered template {template_id} to {}", output.display());
+    }
+    Ok(())
+}
+
+/// Validates bounded public template sources relative to a plan location.
+///
+/// Sources are intentionally public, but strict validation still belongs in
+/// routine preflight: an undeclared, missing, or malformed placeholder must
+/// fail before an activation attempt can decrypt any dependent secret.
+fn validate_plan_templates(plan: &nix_seal_core::PlanV1, plan_path: &Path) -> Result<()> {
+    for (template_id, template) in &plan.templates {
+        let bytes = read_template_source(template_id, template, plan_path)?;
+        let placeholders = runtime_template_placeholders(template);
+        nix_seal_runtime::validate_template_source(&bytes, &placeholders)
+            .with_context(|| format!("public template source for {template_id} is invalid"))?;
+    }
+    Ok(())
+}
+
+fn read_template_source(
+    template_id: &nix_seal_core::Id,
+    template: &nix_seal_core::Template,
+    plan_path: &Path,
+) -> Result<Vec<u8>> {
+    const LIMIT: u64 = 2 * 1024 * 1024;
+    let parent = plan_path
+        .parent()
+        .context("compiled plan path has no parent")?;
+    let source = Path::new(&template.source);
+    let source = if source.is_absolute() {
+        source.to_owned()
+    } else {
+        parent.join(source)
+    };
+    let mut bytes = Vec::new();
+    fs::File::open(&source)
+        .with_context(|| format!("could not open public template source for {template_id}"))?
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LIMIT {
+        bail!("public template source for {template_id} exceeds the 2 MiB safety limit");
+    }
+    Ok(bytes)
+}
+
+fn runtime_template_placeholders(
+    template: &nix_seal_core::Template,
+) -> BTreeMap<String, nix_seal_runtime::TemplatePlaceholderSpecV1> {
+    template
+        .placeholders
+        .iter()
+        .map(|(name, placeholder)| {
+            let encoding = match placeholder.encoding {
+                nix_seal_core::TemplateEncoding::Utf8 => nix_seal_runtime::TemplateEncodingV1::Utf8,
+                nix_seal_core::TemplateEncoding::Base64 => {
+                    nix_seal_runtime::TemplateEncodingV1::Base64
+                }
+                nix_seal_core::TemplateEncoding::Hex => nix_seal_runtime::TemplateEncodingV1::Hex,
+            };
+            (
+                name.clone(),
+                nix_seal_runtime::TemplatePlaceholderSpecV1 {
+                    secret_id: placeholder.secret.clone(),
+                    encoding,
+                },
+            )
+        })
+        .collect()
 }
 
 #[derive(serde::Deserialize)]
@@ -4353,6 +4512,76 @@ fn existing_secret_path(repository_root: &Path, relative: &str) -> Result<PathBu
     Ok(path)
 }
 
+/// Resolves an explicit plaintext render destination without permitting the
+/// Nix store, links, shared writable parents, or implicit overwrite behavior.
+fn prepare_private_template_destination(
+    output: &Path,
+    replace: bool,
+) -> Result<(PathBuf, PathBuf)> {
+    if !output.is_absolute() {
+        bail!("template render output must be an absolute path outside the Nix store");
+    }
+    let parent = output
+        .parent()
+        .context("template render output has no parent directory")?
+        .canonicalize()
+        .context("template render output parent must already exist")?;
+    if parent.starts_with("/nix/store") {
+        bail!("template render output must not be placed in the Nix store");
+    }
+    let parent_metadata = fs::metadata(&parent)?;
+    if !parent_metadata.is_dir() {
+        bail!("template render output parent is not a directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if parent_metadata.uid() != rustix::process::geteuid().as_raw()
+            || parent_metadata.mode() & 0o022 != 0
+        {
+            bail!("template render output parent has unsafe ownership or write permissions");
+        }
+    }
+    let name = output
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .context("template render output is not a normal file path")?;
+    let destination = parent.join(name);
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) => {
+            if !replace {
+                bail!("template render output already exists; pass --replace to update it");
+            }
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                bail!("template render output is not a safe regular file");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() != 1 || metadata.uid() != rustix::process::geteuid().as_raw() {
+                    bail!("template render output has unsafe ownership or link metadata");
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if replace {
+                bail!("template render --replace requires an existing regular output file");
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok((destination, parent))
+}
+
+fn set_private_template_output(file: &fs::File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn open_public_ciphertext(path: &Path) -> Result<std::fs::File> {
     use rustix::fs::{FileType, Mode, OFlags, fstat, open};
@@ -4906,6 +5135,138 @@ mod tests {
         );
         nix_seal_policy::validate(&plan)?;
         assert!(validate_plan_identity_material(&plan, false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn routine_template_preflight_rejects_malformed_public_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let plan_path = temporary.path().join("plan.v1.json");
+        let source = temporary.path().join("application.conf.template");
+        std::fs::write(&source, b"literal public template\n")?;
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.templates.insert(
+            nix_seal_core::Id::parse("application/config")?,
+            nix_seal_core::Template {
+                source: "application.conf.template".to_owned(),
+                placeholders: BTreeMap::new(),
+                runtime: nix_seal_core::RuntimeSettings::default(),
+            },
+        );
+        validate_plan_templates(&plan, &plan_path)?;
+
+        std::fs::write(&source, b"value={{nix-seal:missing}}\n")?;
+        assert!(validate_plan_templates(&plan, &plan_path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn template_render_streams_to_a_private_atomic_output() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        let secrets = repository.join("secrets");
+        std::fs::create_dir_all(&secrets)?;
+        let identity_path = temporary.path().join("administrator.identity");
+        let plan_path = temporary.path().join("plan.v1.json");
+        let source = temporary.path().join("application.conf.template");
+        let output = temporary.path().join("application.conf");
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        write_new_private(&identity_path, identity.expose_secret().as_bytes())?;
+        let secret_id = nix_seal_core::Id::parse("application/password")?;
+        let template_id = nix_seal_core::Id::parse("application/config")?;
+        let ciphertext_path = secrets.join("password.age");
+        let mut ciphertext = fs::File::create(&ciphertext_path)?;
+        nix_seal_crypto::encrypt(
+            b"template-render-canary".as_slice(),
+            &mut ciphertext,
+            std::slice::from_ref(&recipient),
+        )?;
+        ciphertext.sync_all()?;
+        fs::write(&source, b"password={{nix-seal:password}}\n")?;
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.identities.insert(
+            nix_seal_core::Id::parse("administrator")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: recipient,
+            },
+        );
+        plan.identities.insert(
+            nix_seal_core::Id::parse("signer.release")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Signer,
+                public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public(),
+            },
+        );
+        plan.secrets.insert(
+            secret_id.clone(),
+            nix_seal_core::Secret {
+                source: "secrets/password.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: Vec::new(),
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: None,
+            },
+        );
+        plan.templates.insert(
+            template_id.clone(),
+            nix_seal_core::Template {
+                source: source.to_string_lossy().into_owned(),
+                placeholders: BTreeMap::from([(
+                    "password".to_owned(),
+                    nix_seal_core::TemplatePlaceholder {
+                        secret: secret_id,
+                        encoding: nix_seal_core::TemplateEncoding::Utf8,
+                    },
+                )]),
+                runtime: nix_seal_core::RuntimeSettings::default(),
+            },
+        );
+        nix_seal_policy::validate(&plan)?;
+        fs::write(&plan_path, nix_seal_policy::canonical_json(&plan)?)?;
+
+        run_template_render(
+            &plan_path,
+            &template_id,
+            &repository,
+            &identity_path,
+            &output,
+            false,
+            false,
+        )?;
+        assert_eq!(fs::read(&output)?, b"password=template-render-canary\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&output)?.permissions().mode() & 0o777, 0o600);
+        }
+        assert!(
+            run_template_render(
+                &plan_path,
+                &template_id,
+                &repository,
+                &identity_path,
+                &output,
+                false,
+                false,
+            )
+            .is_err()
+        );
+        run_template_render(
+            &plan_path,
+            &template_id,
+            &repository,
+            &identity_path,
+            &output,
+            true,
+            false,
+        )?;
         Ok(())
     }
 
