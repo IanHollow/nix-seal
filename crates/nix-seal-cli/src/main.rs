@@ -997,6 +997,12 @@ fn run_doctor(
     let plan_hash = nix_seal_policy::plan_hash(&plan)?;
     let cache = nix_seal_cache::Cache::open(cache_root.unwrap_or_else(default_cache_root))?;
     let inventory = cache.inventory()?;
+    let retention = authenticated_gc_retention(&cache, &plan, repository_root)?;
+    let authenticated_artifacts = u64::try_from(retention.artifact_keys.len())
+        .context("authenticated artifact count exceeds supported range")?;
+    let stale_artifacts = inventory
+        .artifact_count
+        .saturating_sub(authenticated_artifacts);
     let mut warnings = Vec::new();
     if cfg!(target_os = "macos") {
         warnings.push(
@@ -1026,6 +1032,17 @@ fn run_doctor(
                 .to_owned(),
         );
     }
+    if stale_artifacts > 0 {
+        warnings.push(format!(
+            "{stale_artifacts} cache artifact(s) do not match the current authenticated plan and are garbage-collection candidates"
+        ));
+    }
+    if retention.unavailable_sources > 0 {
+        warnings.push(format!(
+            "{} canonical ciphertext source(s) were unavailable while authenticating cache artifacts",
+            retention.unavailable_sources
+        ));
+    }
     if json {
         println!(
             "{}",
@@ -1038,18 +1055,22 @@ fn run_doctor(
                 "cache":{
                     "root":cache.root(),
                     "objects":inventory.object_count,
-                    "artifacts":inventory.artifact_count
+                    "artifacts":inventory.artifact_count,
+                    "authenticatedArtifacts":authenticated_artifacts,
+                    "staleArtifacts":stale_artifacts,
+                    "unavailableSources":retention.unavailable_sources
                 },
                 "warnings":warnings
             })
         );
     } else {
         println!(
-            "doctor: plan {plan_hash} is deeply valid; {} secrets, {} targets; cache has {} objects and {} artifacts",
+            "doctor: plan {plan_hash} is deeply valid; {} secrets, {} targets; cache has {} objects, {} authenticated artifacts, and {} stale artifacts",
             plan.secrets.len(),
             plan.targets.len(),
             inventory.object_count,
-            inventory.artifact_count,
+            authenticated_artifacts,
+            stale_artifacts,
         );
         for warning in warnings {
             eprintln!("warning: {warning}");
