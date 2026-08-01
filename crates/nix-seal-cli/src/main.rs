@@ -7,6 +7,7 @@ use base64::{
     engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use fs2::FileExt;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -134,6 +135,9 @@ enum Command {
     /// Identity operations.
     #[command(subcommand)]
     Key(KeyCommand),
+    /// Manage public identities declared by a TOML plan.
+    #[command(subcommand)]
+    Identity(IdentityCommand),
     /// Signed target-artifact operations.
     #[command(subcommand)]
     Artifact(ArtifactCommand),
@@ -193,6 +197,66 @@ enum KeyCommand {
         #[arg(long)]
         key: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum IdentityCommand {
+    /// List identities from the validated merged plan.
+    List(IdentityPlanArgs),
+    /// Add a new public identity to the TOML plan.
+    Add {
+        #[command(flatten)]
+        plan: IdentityPlanArgs,
+        #[arg(long)]
+        id: nix_seal_core::Id,
+        #[arg(long, value_enum)]
+        kind: IdentityRole,
+        /// Public age recipient, approval key, or plugin reference.
+        #[arg(long)]
+        public: String,
+    },
+    /// Remove an unreferenced public identity from the TOML plan.
+    Remove {
+        #[command(flatten)]
+        plan: IdentityPlanArgs,
+        #[arg(long)]
+        id: nix_seal_core::Id,
+        /// Acknowledge removal of this public policy object.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Replace an existing identity's public value without changing its role.
+    Rotate {
+        #[command(flatten)]
+        plan: IdentityPlanArgs,
+        #[arg(long)]
+        id: nix_seal_core::Id,
+        /// Replacement public age recipient, approval key, or plugin reference.
+        #[arg(long)]
+        public: String,
+        /// Acknowledge that artifacts must be rekeyed or reapproved afterwards.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Args)]
+struct IdentityPlanArgs {
+    /// TOML source that this command is allowed to rewrite.
+    #[arg(long, default_value = "nix-seal.toml")]
+    toml: PathBuf,
+    /// Optional public Nix-emitted plan merged for validation only; it is never rewritten.
+    #[arg(long)]
+    nix_plan: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum IdentityRole {
+    Administrator,
+    Target,
+    Recovery,
+    Signer,
+    Plugin,
 }
 
 #[derive(Subcommand)]
@@ -588,6 +652,7 @@ fn run() -> Result<()> {
             cache_root,
         } => run_doctor(&plan, &repository_root, cache_root, cli.json)?,
         Command::Key(command) => run_key(command, cli.json)?,
+        Command::Identity(command) => run_identity(command, cli.json)?,
         Command::Artifact(command) => run_artifact(command, cli.json)?,
         Command::Rekey(arguments) => run_rekey(arguments, cli.json)?,
         Command::Generate(arguments) => run_generate(&arguments, cli.json)?,
@@ -2463,6 +2528,233 @@ fn run_key(command: KeyCommand, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_identity(command: IdentityCommand, json: bool) -> Result<()> {
+    match command {
+        IdentityCommand::List(plan) => {
+            let plan = load_plan(&plan.toml, plan.nix_plan.as_deref())?;
+            nix_seal_policy::validate(&plan)?;
+            print_identity_records(public_identity_records(&plan), json);
+        }
+        IdentityCommand::Add {
+            plan,
+            id,
+            kind,
+            public,
+        } => {
+            let kind = identity_role_kind(kind);
+            validate_identity_public(&kind, &public)?;
+            mutate_toml_plan(&plan, |toml_plan| {
+                if toml_plan.identities.contains_key(&id) {
+                    bail!("identity {id} already exists in the TOML plan");
+                }
+                toml_plan
+                    .identities
+                    .insert(id.clone(), nix_seal_core::Identity { kind, public });
+                Ok(())
+            })?;
+            print_identity_mutation("added", &id, json, false);
+        }
+        IdentityCommand::Remove { plan, id, yes } => {
+            if !yes {
+                bail!("identity removal requires --yes");
+            }
+            mutate_toml_plan(&plan, |toml_plan| {
+                if !toml_plan.identities.contains_key(&id) {
+                    bail!("identity {id} does not exist in the TOML plan");
+                }
+                let references = identity_references(toml_plan, &id);
+                if !references.is_empty() {
+                    bail!(
+                        "identity {id} is still referenced by {}",
+                        references.join(", ")
+                    );
+                }
+                toml_plan.identities.remove(&id);
+                Ok(())
+            })?;
+            print_identity_mutation("removed", &id, json, false);
+        }
+        IdentityCommand::Rotate {
+            plan,
+            id,
+            public,
+            yes,
+        } => {
+            if !yes {
+                bail!("identity rotation requires --yes");
+            }
+            mutate_toml_plan(&plan, |toml_plan| {
+                let identity = toml_plan
+                    .identities
+                    .get_mut(&id)
+                    .with_context(|| format!("identity {id} does not exist in the TOML plan"))?;
+                validate_identity_public(&identity.kind, &public)?;
+                identity.public = public;
+                Ok(())
+            })?;
+            print_identity_mutation("rotated", &id, json, true);
+        }
+    }
+    Ok(())
+}
+
+fn print_identity_records(identities: Vec<PublicIdentityRecord>, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"schema":"nix-seal.identities.v1","identities":identities})
+        );
+    } else {
+        for PublicIdentityRecord { id, kind, public } in identities {
+            println!("{id} {kind} {public}");
+        }
+    }
+}
+
+fn print_identity_mutation(operation: &str, id: &nix_seal_core::Id, json: bool, rekey: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"schema":"nix-seal.output.v1","operation":operation,"identity":id,"rekeyRequired":rekey})
+        );
+    } else {
+        println!("identity {operation}: {id}");
+        if rekey {
+            eprintln!(
+                "warning: existing artifacts are no longer valid; run nix-seal rekey and obtain required approvals"
+            );
+        }
+    }
+}
+
+fn identity_role_kind(role: IdentityRole) -> nix_seal_core::IdentityKind {
+    match role {
+        IdentityRole::Administrator => nix_seal_core::IdentityKind::Administrator,
+        IdentityRole::Target => nix_seal_core::IdentityKind::Target,
+        IdentityRole::Recovery => nix_seal_core::IdentityKind::Recovery,
+        IdentityRole::Signer => nix_seal_core::IdentityKind::Signer,
+        IdentityRole::Plugin => nix_seal_core::IdentityKind::Plugin,
+    }
+}
+
+fn validate_identity_public(kind: &nix_seal_core::IdentityKind, public: &str) -> Result<()> {
+    if public.is_empty()
+        || public.len() > 16 * 1024
+        || public.bytes().any(|byte| byte.is_ascii_control())
+    {
+        bail!("identity public value is empty, oversized, or contains control characters");
+    }
+    match kind {
+        nix_seal_core::IdentityKind::Administrator
+        | nix_seal_core::IdentityKind::Target
+        | nix_seal_core::IdentityKind::Recovery => {
+            nix_seal_crypto::normalize_recipient(public)?;
+        }
+        nix_seal_core::IdentityKind::Signer => {
+            let mut trusted = nix_seal_manifest::TrustedKeys::new();
+            trusted.insert_encoded(public)?;
+        }
+        nix_seal_core::IdentityKind::Plugin => {}
+    }
+    Ok(())
+}
+
+fn identity_references(plan: &nix_seal_core::PlanV1, id: &nix_seal_core::Id) -> Vec<String> {
+    let mut references = Vec::new();
+    for (group_id, group) in &plan.groups {
+        if group.members.iter().any(|member| member == id) {
+            references.push(format!("group {group_id}"));
+        }
+    }
+    for (target_id, target) in &plan.targets {
+        if &target.identity == id {
+            references.push(format!("target {target_id}"));
+        }
+    }
+    for (secret_id, secret) in &plan.secrets {
+        if secret
+            .administrators
+            .iter()
+            .any(|administrator| administrator == id)
+        {
+            references.push(format!("secret {secret_id}"));
+        }
+    }
+    for (policy_id, policy) in &plan.approval_policies {
+        if policy.signers.iter().any(|signer| signer == id) {
+            references.push(format!("approval policy {policy_id}"));
+        }
+    }
+    references
+}
+
+fn mutate_toml_plan<F>(arguments: &IdentityPlanArgs, mutate: F) -> Result<()>
+where
+    F: FnOnce(&mut nix_seal_core::PlanV1) -> Result<()>,
+{
+    let parent = arguments
+        .toml
+        .parent()
+        .context("TOML plan path has no parent")?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
+        bail!("TOML plan parent must be an existing non-symlink directory");
+    }
+    let lock_path = parent.join(".nix-seal-plan.lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .context("could not open the public plan lock")?;
+    lock.lock_exclusive()
+        .context("could not acquire the public plan lock")?;
+    let result = mutate_toml_plan_locked(arguments, mutate);
+    lock.unlock()
+        .context("could not release the public plan lock")?;
+    result
+}
+
+fn mutate_toml_plan_locked<F>(arguments: &IdentityPlanArgs, mutate: F) -> Result<()>
+where
+    F: FnOnce(&mut nix_seal_core::PlanV1) -> Result<()>,
+{
+    let metadata = fs::symlink_metadata(&arguments.toml)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        bail!("TOML plan must be a non-symlink regular file");
+    }
+    let mut plan = nix_seal_policy::load_toml(&arguments.toml)?;
+    mutate(&mut plan)?;
+    let merged = if let Some(nix_plan) = arguments.nix_plan.as_deref() {
+        nix_seal_policy::merge(plan.clone(), nix_seal_policy::load_json(nix_plan)?)?
+    } else {
+        plan.clone()
+    };
+    nix_seal_policy::validate(&merged)?;
+    let text = toml::to_string_pretty(&plan).context("could not encode canonical TOML plan")?;
+    let parent = arguments
+        .toml
+        .parent()
+        .context("TOML plan path has no parent")?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged
+        .as_file_mut()
+        .set_permissions(metadata.permissions())?;
+    staged.write_all(text.as_bytes())?;
+    staged.write_all(b"\n")?;
+    staged.as_file().sync_all()?;
+    let current = fs::symlink_metadata(&arguments.toml)?;
+    if !current.file_type().is_file() || current.file_type().is_symlink() {
+        bail!("TOML plan changed to an unsafe file during the transaction");
+    }
+    staged
+        .persist(&arguments.toml)
+        .map_err(|error| error.error)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 fn public_identity_records(plan: &nix_seal_core::PlanV1) -> Vec<PublicIdentityRecord> {
     plan.identities
         .iter()
@@ -4325,6 +4617,100 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&identities)?[0]["kind"],
             serde_json::Value::String("administrator".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn toml_identity_lifecycle_is_atomic_and_refuses_referenced_removal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let toml_path = temporary.path().join("nix-seal.toml");
+        fs::write(
+            &toml_path,
+            toml::to_string_pretty(&nix_seal_core::PlanV1::default())?,
+        )?;
+        let id = nix_seal_core::Id::parse("administrator")?;
+        let (_, first_recipient) = nix_seal_crypto::generate_x25519();
+        let (_, second_recipient) = nix_seal_crypto::generate_x25519();
+
+        run_identity(
+            IdentityCommand::Add {
+                plan: IdentityPlanArgs {
+                    toml: toml_path.clone(),
+                    nix_plan: None,
+                },
+                id: id.clone(),
+                kind: IdentityRole::Administrator,
+                public: first_recipient,
+            },
+            true,
+        )?;
+        run_identity(
+            IdentityCommand::Rotate {
+                plan: IdentityPlanArgs {
+                    toml: toml_path.clone(),
+                    nix_plan: None,
+                },
+                id: id.clone(),
+                public: second_recipient.clone(),
+                yes: true,
+            },
+            true,
+        )?;
+        let plan = nix_seal_policy::load_toml(&toml_path)?;
+        assert_eq!(plan.identities[&id].public, second_recipient);
+
+        let mut referenced = plan.clone();
+        referenced.groups.insert(
+            nix_seal_core::Id::parse("administrators")?,
+            nix_seal_core::Group {
+                members: vec![id.clone()],
+            },
+        );
+        assert_eq!(
+            identity_references(&referenced, &id),
+            vec!["group administrators"]
+        );
+
+        fs::write(&toml_path, toml::to_string_pretty(&referenced)?)?;
+        assert!(
+            run_identity(
+                IdentityCommand::Remove {
+                    plan: IdentityPlanArgs {
+                        toml: toml_path.clone(),
+                        nix_plan: None,
+                    },
+                    id: id.clone(),
+                    yes: true,
+                },
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            nix_seal_policy::load_toml(&toml_path)?
+                .identities
+                .contains_key(&id)
+        );
+
+        fs::write(&toml_path, toml::to_string_pretty(&plan)?)?;
+
+        run_identity(
+            IdentityCommand::Remove {
+                plan: IdentityPlanArgs {
+                    toml: toml_path.clone(),
+                    nix_plan: None,
+                },
+                id: id.clone(),
+                yes: true,
+            },
+            true,
+        )?;
+        assert!(
+            !nix_seal_policy::load_toml(&toml_path)?
+                .identities
+                .contains_key(&id)
         );
         Ok(())
     }

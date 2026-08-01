@@ -157,6 +157,13 @@ that validated public plan. It exposes only each stable ID, role, and public
 recipient, signer, or plugin reference; it never searches for or reads private
 identity files.
 
+For TOML-managed plans, `nix-seal identity add|remove|rotate` updates only the
+public TOML source in a same-directory atomic transaction. It validates the
+merged Nix/TOML policy before committing and refuses to remove referenced IDs.
+Rotation requires `--yes` and deliberately invalidates old artifacts, so it
+reports that rekeying and approval are required. Nix-emitted plan sources are
+validation inputs and are never rewritten by these commands.
+
 ## Built-in generation
 
 `nix-seal generate` follows the public plan, derives the canonical recipients,

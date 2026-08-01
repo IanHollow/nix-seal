@@ -1255,6 +1255,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_complete_nushell",
+ "fs2",
  "jiff",
  "nix-seal-authoring",
  "nix-seal-cache",
