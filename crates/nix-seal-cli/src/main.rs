@@ -7396,9 +7396,17 @@ fn set_private_template_output(file: &fs::File) -> Result<()> {
 
 #[cfg(unix)]
 fn open_public_ciphertext(path: &Path) -> Result<std::fs::File> {
-    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
-    let descriptor = open(
-        path,
+    use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+    let parent = path
+        .parent()
+        .context("canonical ciphertext path has no parent")?;
+    let directory = open_directory_chain_nofollow(parent)?;
+    let leaf = path
+        .file_name()
+        .context("canonical ciphertext path has no filename")?;
+    let descriptor = openat(
+        &directory,
+        leaf,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
@@ -7409,6 +7417,49 @@ fn open_public_ciphertext(path: &Path) -> Result<std::fs::File> {
         bail!("canonical ciphertext is not a no-follow single-link regular file");
     }
     Ok(std::fs::File::from(descriptor))
+}
+
+/// Opens every directory component without following symlinks. A final
+/// `O_NOFOLLOW` on a file is not sufficient: an attacker could otherwise swap
+/// an ancestor directory between the caller's metadata check and the open.
+#[cfg(unix)]
+fn open_directory_chain_nofollow(path: &Path) -> Result<std::fs::File> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
+
+    let start = if path.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    };
+    let descriptor = open(
+        start,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let mut directory = std::fs::File::from(descriptor);
+    for component in path.components() {
+        let name = match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => name,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                bail!("canonical ciphertext path is not normalized")
+            }
+        };
+        let descriptor = openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
+            bail!("canonical ciphertext ancestry is not a directory");
+        }
+        directory = std::fs::File::from(descriptor);
+    }
+    Ok(directory)
 }
 
 #[cfg(not(unix))]
@@ -7928,6 +7979,23 @@ mod tests {
         let mut output = Vec::new();
         assert!(reader.read_to_end(&mut output).is_err());
         assert_eq!(output, b"ab");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_ciphertext_open_rejects_symlinked_ancestry() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let real = temporary.path().join("real");
+        std::fs::create_dir(&real)?;
+        std::fs::write(real.join("secret.age"), b"ciphertext")?;
+        let linked = temporary.path().join("linked");
+        symlink(&real, &linked)?;
+
+        assert!(open_public_ciphertext(&linked.join("secret.age")).is_err());
+        Ok(())
     }
 
     #[test]
