@@ -4609,14 +4609,34 @@ fn ensure_rekey_identity_authorized(
     let recipients = nix_seal_policy::secret_recipients(plan, secret)?;
     let authorized = recipients
         .recipients
-        .values()
-        .any(|candidate| nix_seal_crypto::identity_matches_recipient(identity, candidate));
+        .iter()
+        .any(|(identity_id, candidate)| {
+            plan.identities.get(identity_id).is_some_and(|declared| {
+                matches!(
+                    declared.kind,
+                    nix_seal_core::IdentityKind::Administrator
+                        | nix_seal_core::IdentityKind::Recovery
+                ) && nix_seal_crypto::identity_matches_recipient(identity, candidate)
+            })
+        });
     if !authorized {
         bail!(
             "identity is not an authorized administrator or recovery recipient for secret {secret}"
         );
     }
     Ok(())
+}
+
+/// Canonical authoring is an administrator/recovery operation, even when the
+/// ciphertext is configured for advanced direct delivery. Target identities
+/// are deliberately excluded here: they may decrypt an authorized artifact,
+/// but must never be able to create or replace repository ciphertext.
+fn ensure_canonical_authoring_identity_authorized(
+    plan: &nix_seal_core::PlanV1,
+    secret: &nix_seal_core::Id,
+    identity: &SecretString,
+) -> Result<()> {
+    ensure_rekey_identity_authorized(plan, secret, Some(identity))
 }
 
 fn issue_time(expires_at: Option<u64>) -> Result<u64> {
@@ -4950,6 +4970,15 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
         &mut BTreeSet::new(),
         &mut order,
     )?;
+    for generator_id in &order {
+        let generator = plan
+            .generators
+            .get(generator_id)
+            .context("generator disappeared from validated plan")?;
+        for output in &generator.outputs {
+            ensure_canonical_authoring_identity_authorized(&plan, output, &identity)?;
+        }
+    }
     let prompt_files = validate_generator_prompt_files(
         &plan,
         &order,
@@ -6918,6 +6947,7 @@ fn run_secret_write(
         .canonicalize()
         .context("repository root must exist")?;
     let identity = read_identity(&arguments.identity)?;
+    ensure_canonical_authoring_identity_authorized(&plan, &arguments.policy.secret, &identity)?;
     let input = read_structured_secret_input(arguments.format)?;
     let result = nix_seal_authoring::write_secret(
         &root,
@@ -7156,6 +7186,11 @@ fn run_secret_edit(arguments: SecretEditArgs, json: bool) -> Result<()> {
     }
     .canonicalize()
     .context("editor workspace root must exist")?;
+    ensure_canonical_authoring_identity_authorized(
+        &plan,
+        &arguments.secret.policy.secret,
+        &identity,
+    )?;
     if matches!(secret.delivery, nix_seal_core::DeliveryMode::Direct) {
         eprintln!(
             "warning: direct mode allows matching target keys to decrypt current and historical Git ciphertext"
@@ -8045,6 +8080,80 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_authoring_rejects_target_identities_even_in_direct_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (administrator, administrator_recipient) = nix_seal_crypto::generate_x25519();
+        let (target, target_recipient) = nix_seal_crypto::generate_x25519();
+        let administrator_id = nix_seal_core::Id::parse("administrator")?;
+        let signer_id = nix_seal_core::Id::parse("release-signer")?;
+        let target_identity_id = nix_seal_core::Id::parse("target-identity")?;
+        let target_id = nix_seal_core::Id::parse("desktop")?;
+        let secret_id = nix_seal_core::Id::parse("application/token")?;
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.identities.insert(
+            administrator_id.clone(),
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: administrator_recipient,
+            },
+        );
+        plan.identities.insert(
+            target_identity_id.clone(),
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Target,
+                public: target_recipient,
+            },
+        );
+        plan.identities.insert(
+            signer_id.clone(),
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Signer,
+                public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public()?,
+            },
+        );
+        plan.targets.insert(
+            target_id.clone(),
+            nix_seal_core::Target {
+                kind: nix_seal_core::TargetKind::NixOs,
+                system: "x86_64-linux".to_owned(),
+                identity: target_identity_id,
+                username: None,
+                configuration: None,
+                environment: None,
+                tags: Vec::new(),
+            },
+        );
+        plan.secrets.insert(
+            secret_id.clone(),
+            nix_seal_core::Secret {
+                source: "secrets/token.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Direct,
+                administrators: vec![administrator_id],
+                consumers: vec![target_id],
+                selectors: nix_seal_core::TargetSelectors::default(),
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: Some(nix_seal_core::Id::parse("release")?),
+                repository_only: false,
+            },
+        );
+        plan.approval_policies.insert(
+            nix_seal_core::Id::parse("release")?,
+            nix_seal_core::ApprovalPolicy {
+                threshold: 1,
+                signers: vec![signer_id],
+            },
+        );
+        nix_seal_policy::validate(&plan)?;
+        assert!(
+            ensure_canonical_authoring_identity_authorized(&plan, &secret_id, &target).is_err()
+        );
+        ensure_canonical_authoring_identity_authorized(&plan, &secret_id, &administrator)?;
         Ok(())
     }
 

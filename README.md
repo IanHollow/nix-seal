@@ -126,7 +126,10 @@ local storage policy.
 
 The plan determines canonical administrator/recovery recipients. Direct mode
 additionally includes authorized target recipients and emits a history-exposure
-warning. Every create, import, edit, and rotation is encrypted into a private
+warning. Canonical create, import, edit, rotation, and rekey operations require
+an identity declared as an administrator or recovery identity; a target key may
+decrypt an authorized delivery artifact but cannot author repository ciphertext.
+Every create, import, edit, and rotation is encrypted into a private
 same-directory transaction, round-trip decrypted and hashed, then atomically
 committed. Editor execution uses no shell, inherits no environment, and runs in
 a private ephemeral workspace. `secret rekey` changes canonical encryption

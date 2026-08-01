@@ -1704,6 +1704,151 @@ mod tests {
     }
 
     #[test]
+    fn property_canonical_hash_is_invariant_under_public_insertion_order() -> Result<(), PolicyError>
+    {
+        let mut forward = PlanV1::default();
+        let mut reverse = PlanV1::default();
+        for index in 0..32 {
+            let id = Id::parse(format!("administrator/{index:02}"))
+                .map_err(|error| PolicyError::Violation(error.to_string()))?;
+            let identity = Identity {
+                kind: IdentityKind::Administrator,
+                public: RECIPIENT.to_owned(),
+            };
+            forward.identities.insert(id.clone(), identity.clone());
+            reverse.identities.insert(id, identity);
+        }
+        // BTreeMap canonicalization is an explicit IR invariant, not an
+        // implementation detail: callers may construct plans in any order.
+        assert_eq!(canonical_json(&forward)?, canonical_json(&reverse)?);
+        assert_eq!(plan_hash(&forward)?, plan_hash(&reverse)?);
+        Ok(())
+    }
+
+    #[test]
+    fn property_disjoint_merge_is_commutative_and_duplicate_merge_is_fatal()
+    -> Result<(), PolicyError> {
+        let mut left = PlanV1::default();
+        let mut right = PlanV1::default();
+        left.identities.insert(
+            Id::parse("administrator/left")
+                .map_err(|error| PolicyError::Violation(error.to_string()))?,
+            Identity {
+                kind: IdentityKind::Administrator,
+                public: RECIPIENT.to_owned(),
+            },
+        );
+        right.identities.insert(
+            Id::parse("administrator/right")
+                .map_err(|error| PolicyError::Violation(error.to_string()))?,
+            Identity {
+                kind: IdentityKind::Administrator,
+                public: RECIPIENT.to_owned(),
+            },
+        );
+        let first = merge(left.clone(), right.clone())?;
+        let second = merge(right, left)?;
+        assert_eq!(canonical_json(&first)?, canonical_json(&second)?);
+        assert!(matches!(
+            merge(first.clone(), first),
+            Err(PolicyError::Duplicate { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn property_selector_authorization_is_monotonic_for_explicit_consumers()
+    -> Result<(), PolicyError> {
+        let mut plan = PlanV1::default();
+        let admin = Id::parse("administrator")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let signer =
+            Id::parse("release").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.identities.insert(
+            admin,
+            Identity {
+                kind: IdentityKind::Administrator,
+                public: RECIPIENT.to_owned(),
+            },
+        );
+        plan.identities.insert(
+            signer.clone(),
+            Identity {
+                kind: IdentityKind::Signer,
+                public: SIGNER.to_owned(),
+            },
+        );
+        plan.approval_policies.insert(
+            Id::parse("approval").map_err(|error| PolicyError::Violation(error.to_string()))?,
+            ApprovalPolicy {
+                threshold: 1,
+                signers: vec![signer],
+            },
+        );
+        let mut targets = Vec::new();
+        for index in 0..4 {
+            let target = Id::parse(format!("target/{index}"))
+                .map_err(|error| PolicyError::Violation(error.to_string()))?;
+            let identity = Id::parse(format!("target-identity-{index}"))
+                .map_err(|error| PolicyError::Violation(error.to_string()))?;
+            plan.identities.insert(
+                identity.clone(),
+                Identity {
+                    kind: IdentityKind::Target,
+                    public: RECIPIENT.to_owned(),
+                },
+            );
+            plan.targets.insert(
+                target.clone(),
+                Target {
+                    kind: TargetKind::NixOs,
+                    system: "x86_64-linux".to_owned(),
+                    identity,
+                    username: None,
+                    configuration: None,
+                    environment: None,
+                    tags: vec!["prod".to_owned()],
+                },
+            );
+            targets.push(target);
+        }
+        let secret = Id::parse("application/token")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.secrets.insert(
+            secret.clone(),
+            Secret {
+                source: "secrets/token.age".to_owned(),
+                delivery: DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: Vec::new(),
+                selectors: nix_seal_core::TargetSelectors {
+                    tags: vec!["prod".to_owned()],
+                    ..nix_seal_core::TargetSelectors::default()
+                },
+                phase: ActivationPhase::Activation,
+                runtime: RuntimeSettings::default(),
+                lifecycle: Lifecycle::default(),
+                approval_policy: Some(
+                    Id::parse("approval")
+                        .map_err(|error| PolicyError::Violation(error.to_string()))?,
+                ),
+                repository_only: false,
+            },
+        );
+        validate(&plan)?;
+        let selected = target_policy(&plan, &targets[0])?.secrets.len();
+        plan.secrets
+            .get_mut(&secret)
+            .ok_or_else(|| PolicyError::Violation("secret missing".to_owned()))?
+            .consumers
+            .push(targets[1].clone());
+        validate(&plan)?;
+        assert!(target_policy(&plan, &targets[0])?.secrets.len() >= selected);
+        assert_eq!(target_policy(&plan, &targets[1])?.secrets.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn repository_only_secrets_cannot_be_target_delivered() -> Result<(), PolicyError> {
         let mut plan = PlanV1::default();
         let admin = Id::parse("administrator")
