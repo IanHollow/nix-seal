@@ -31,8 +31,9 @@
   runs a disposable end-to-end dogfood check covering generated identities,
   canonical authoring, deep validation, signed provisioning, cache
   export/import, activation, and template rendering without copying plaintext
-  into its output; mutation fixtures and migration of actual nix-conf secrets
-  remain required.
+  into its output. Negative migration fixtures now cover path traversal,
+  malformed age recipients, inconsistent recipient sets, and symlinked legacy
+  trees; migration of actual nix-conf secrets remains required.
 - Phase 5: attack-path review, sustained fuzz/mutation/platform/performance work
   (the reproducible scale benchmark protocol and scheduled Miri, sanitizer, and
   mutation jobs are now published), release build/SBOM/attestation scaffolding,

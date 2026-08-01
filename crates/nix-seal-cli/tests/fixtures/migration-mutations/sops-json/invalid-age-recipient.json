@@ -1,0 +1,13 @@
+{
+  "token": "ENC[AES256_GCM,data=fixture,type:str]",
+  "sops": {
+    "age": [
+      {
+        "recipient": "not-an-age-recipient",
+        "enc": "-----BEGIN AGE ENCRYPTED FILE-----"
+      }
+    ],
+    "mac": "ENC[AES256_GCM,data=fixture,type:str]",
+    "version": "3.9.0"
+  }
+}

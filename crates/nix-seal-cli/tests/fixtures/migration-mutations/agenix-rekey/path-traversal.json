@@ -1,0 +1,19 @@
+{
+  "schema": "nix-seal.agenix-rekey-export.v1",
+  "target": {
+    "id": "desktop",
+    "kind": "nixos",
+    "system": "x86_64-linux",
+    "recipient": "age1ml79lp4sk2gz59n3xux5xhasg7p5qa0pnm634rd8pnw80avag4js2etr0l",
+    "storageMode": "derivation"
+  },
+  "masterRecipients": [
+    "age1ml79lp4sk2gz59n3xux5xhasg7p5qa0pnm634rd8pnw80avag4js2etr0l"
+  ],
+  "secrets": {
+    "service-token": {
+      "rekeyFile": "../outside.age",
+      "intermediary": false
+    }
+  }
+}
