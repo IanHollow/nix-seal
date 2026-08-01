@@ -5605,9 +5605,7 @@ fn artifact_is_active(
     let Some(secret_policy) = policy.secrets.get(&manifest.secret_id) else {
         return false;
     };
-    if manifest.target_policy_hash != policy_hash
-        || !matches!(secret_policy.delivery, nix_seal_core::DeliveryMode::Rekeyed)
-    {
+    if manifest.target_policy_hash != policy_hash {
         return false;
     }
     let source_hash = match source_hashes.entry(manifest.secret_id.clone()) {
@@ -6050,7 +6048,7 @@ mod tests {
         run_provision(
             ProvisionArgs {
                 plan: plan_path,
-                repository_root: repository,
+                repository_root: repository.clone(),
                 identity: None,
                 target: target_id,
                 generation: 1,
@@ -6061,7 +6059,7 @@ mod tests {
             },
             false,
         )?;
-        let records = nix_seal_cache::Cache::open(cache_root)?.artifact_records()?;
+        let records = nix_seal_cache::Cache::open(cache_root.clone())?.artifact_records()?;
         assert_eq!(records.len(), 1);
         let mut plaintext = Vec::new();
         nix_seal_crypto::decrypt(
@@ -6070,6 +6068,12 @@ mod tests {
             &target_identity,
         )?;
         assert_eq!(plaintext, b"direct-cli-canary");
+        let retention = authenticated_gc_retention(
+            &nix_seal_cache::Cache::open(cache_root)?,
+            &plan,
+            &repository,
+        )?;
+        assert_eq!(retention.artifact_keys.len(), 1);
         Ok(())
     }
 

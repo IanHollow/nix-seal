@@ -92,7 +92,9 @@ nix-seal cache gc --plan plan.v1.json --repository-root . --execute
 Any malformed, expired, stale, source-mismatched, target-mismatched, or
 untrusted artifact is a deletion candidate. Version 1 generic cache objects do
 not have an authenticated plan reference, so they are always candidates. The
-command never removes anything without `--execute`.
+command never removes anything without `--execute`. Both rekeyed and advanced
+direct-delivery artifacts are retained only after the same signed manifest,
+source-hash, recipient, policy, and target checks succeed.
 
 For air-gapped or remote deployment workflows, cache exchange is an explicit
 ciphertext-only directory operation. Export refuses to overwrite its destination
