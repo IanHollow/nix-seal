@@ -208,6 +208,8 @@ nix-seal migrate sops --repository-root . --source legacy/token.yaml \
   --identity /absolute/private/nix-seal-admin.age --recipient age1... --execute
 # inventory Clan's documented per-machine output leaves without reading values
 nix-seal migrate clan-vars --directory ./vars/per-machine --json
+# inventory documented Clan Facts public leaves without reading values
+nix-seal migrate clan-facts --directory ./machines --json
 # First inspect the mutation; then add --execute to stream-reencrypt it.
 nix-seal migrate ciphertext --source legacy/token.age --destination secrets/token.age \
   --identity /absolute/path/to/administrator.age --recipient age1... --json
@@ -302,6 +304,11 @@ and never reads, decrypts, prints, or passes a value to another process. Clan
 storage backend, secret/public classification, target authorization, and runtime
 policy are not encoded by those leaves, so they must be supplied in a reviewed
 mapping before import.
+
+`migrate clan-facts` inventories only documented public
+`machines/<machine>/facts/<fact>` leaves, with link/type and 64 MiB bounds. It
+never reads their values. Clan secret facts have configurable stores and paths,
+so they need an explicit reviewed export instead of filesystem inference.
 
 ## Development
 

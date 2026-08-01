@@ -36,6 +36,7 @@ policy, importing a value requires an explicit reviewed mapping.
 The agenix-rekey adapter consumes an explicit public evaluated export instead of
 guessing policy from filenames. It checks the master-to-target boundary,
 canonical source paths, target platform, storage mode, recipients, and
-repository-only intermediaries. Clan Facts still requires format-specific policy
+repository-only intermediaries. Clan Facts public leaves are inventoried without
+reading values; configurable secret fact stores still require explicit policy
 mapping. Removal of a source manager is a separate explicit operation after
 build, activation, rollback, rotation, and recovery verification.
