@@ -232,6 +232,15 @@ each declared output beneath `$NIX_SEAL_OUTPUT_DIR`. Unlisted files, links,
 oversized output, nonzero exits, and timeouts fail the full transaction without
 exposing process output.
 
+Set a generator's public `validation` value when its generated credential must
+be replaced after a specific non-secret configuration change. nix-seal records
+only the generator ID, output IDs, and validation value in a private local
+`.nix-seal/generator-state/v1` file. The first matching run creates the outputs;
+later matching runs are no-ops, while a changed validation value performs a
+transactional replacement. Existing outputs without this state intentionally
+require `--replace` to establish a baseline, preventing an unreviewed metadata
+file from silently rotating a credential.
+
 Declared external-generator prompts are non-interactive by default. Supply each
 response with
 `nix-seal generate --prompt-file prompt/id=/absolute/private-file`; the response

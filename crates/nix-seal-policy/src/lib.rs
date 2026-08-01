@@ -856,6 +856,11 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
                     || value.len() > 4096
                     || value.bytes().any(|byte| byte.is_ascii_control())
             })
+            || generator.validation.as_ref().is_some_and(|value| {
+                value.is_empty()
+                    || value.len() > 4096
+                    || value.bytes().any(|byte| byte.is_ascii_control())
+            })
         {
             return Err(PolicyError::Violation(format!(
                 "generator {generator_id} has invalid public parameters"

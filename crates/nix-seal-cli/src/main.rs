@@ -51,6 +51,26 @@ struct PublicIdentityRecord {
     public: String,
 }
 
+const GENERATOR_STATE_SCHEMA: &str = "nix-seal.generator-state.v1";
+
+/// Private, non-secret bookkeeping for explicit generator validation values.
+/// It never contains generated plaintext, identities, or recipient material.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct GeneratorStateV1 {
+    schema: String,
+    generator_id: nix_seal_core::Id,
+    validation: String,
+    outputs: Vec<nix_seal_core::Id>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GeneratorAction {
+    Create,
+    Replace,
+    Unchanged,
+}
+
 impl<R> BoundedReader<R> {
     fn new(inner: R, limit: u64) -> Self {
         Self {
@@ -3534,6 +3554,7 @@ fn verify_service_projection(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
     struct GeneratedSecret {
         id: nix_seal_core::Id,
@@ -3552,17 +3573,34 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
         &mut order,
     )?;
     let prompt_files = validate_generator_prompt_files(&plan, &order, &arguments.prompt_files)?;
-    let mode = if arguments.replace {
-        nix_seal_authoring::WriteMode::Replace
-    } else {
-        nix_seal_authoring::WriteMode::Create
-    };
     let mut outputs = Vec::new();
     for generator_id in order {
         let generator = plan
             .generators
             .get(&generator_id)
             .context("generator disappeared from validated plan")?;
+        let action = generator_action(
+            &plan,
+            &generator_id,
+            generator,
+            &arguments.repository_root,
+            arguments.replace,
+        )?;
+        if action == GeneratorAction::Unchanged {
+            for secret_id in &generator.outputs {
+                let secret = plan
+                    .secrets
+                    .get(secret_id)
+                    .context("generator output secret disappeared from validated plan")?;
+                outputs.push(serde_json::json!({
+                    "generator":generator_id,
+                    "secretId":secret_id,
+                    "ciphertextPath":existing_secret_path(&arguments.repository_root, &secret.source)?,
+                    "action":"unchanged"
+                }));
+            }
+            continue;
+        }
         let prompt_values = read_generator_prompts(generator, &prompt_files)?;
         let generated_values = generate_generator_values(generator, &prompt_values)?;
         if generated_values.len() != generator.outputs.len() {
@@ -3594,19 +3632,35 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                 recipients: &output.recipients,
             })
             .collect::<Vec<_>>();
+        let mode = match action {
+            GeneratorAction::Create => nix_seal_authoring::WriteMode::Create,
+            GeneratorAction::Replace => nix_seal_authoring::WriteMode::Replace,
+            GeneratorAction::Unchanged => bail!("unchanged generator reached write transaction"),
+        };
         let results = nix_seal_authoring::write_secret_batch(
             &arguments.repository_root,
             &writes,
             &identity,
             mode,
         )?;
+        if let Some(validation) = &generator.validation {
+            write_generator_state(
+                &arguments.repository_root,
+                &generator_id,
+                validation,
+                &generator.outputs,
+            )?;
+        } else {
+            remove_generator_state(&arguments.repository_root, &generator_id)?;
+        }
         for (output, result) in generated.iter().zip(results) {
             outputs.push(serde_json::json!({
                 "generator":generator_id,
                 "secretId":output.id,
                 "ciphertextPath":result.path,
                 "ciphertextHash":result.ciphertext_hash,
-                "plaintextBytes":result.plaintext_bytes
+                "plaintextBytes":result.plaintext_bytes,
+                "action":match action { GeneratorAction::Create => "created", GeneratorAction::Replace => "replaced", GeneratorAction::Unchanged => "unchanged" }
             }));
         }
     }
@@ -3629,6 +3683,197 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Selects a safe generator action from explicit replacement intent, the
+/// public validation fingerprint, and complete canonical-output presence.
+fn generator_action(
+    plan: &nix_seal_core::PlanV1,
+    generator_id: &nix_seal_core::Id,
+    generator: &nix_seal_core::Generator,
+    repository_root: &Path,
+    explicit_replace: bool,
+) -> Result<GeneratorAction> {
+    if explicit_replace {
+        return Ok(GeneratorAction::Replace);
+    }
+    let present = generator
+        .outputs
+        .iter()
+        .map(|secret_id| {
+            // Policy validation already guarantees every generator output has a
+            // secret. A missing or unsafe ciphertext counts as absent only if
+            // it genuinely does not exist; unsafe existing paths fail closed.
+            let secret = plan
+                .secrets
+                .get(secret_id)
+                .context("generator output secret disappeared from validated plan")?;
+            match existing_secret_path(repository_root, &secret.source) {
+                Ok(_) => Ok(Some(secret_id)),
+                Err(error) if is_missing_canonical_ciphertext(&error) => Ok(None),
+                Err(error) => Err(error),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let present_count = present.iter().flatten().count();
+    if present_count != 0 && present_count != generator.outputs.len() {
+        bail!(
+            "generator {generator_id} has a partial canonical-output set; repair it with --replace"
+        );
+    }
+    let Some(validation) = generator.validation.as_deref() else {
+        return Ok(GeneratorAction::Create);
+    };
+    let state = read_generator_state(repository_root, generator_id)?;
+    match state {
+        Some(state) if state.validation == validation && state.outputs == generator.outputs => {
+            if present_count == generator.outputs.len() {
+                Ok(GeneratorAction::Unchanged)
+            } else {
+                Ok(GeneratorAction::Create)
+            }
+        }
+        Some(_) if present_count == generator.outputs.len() => Ok(GeneratorAction::Replace),
+        Some(_) => Ok(GeneratorAction::Create),
+        None if present_count == 0 => Ok(GeneratorAction::Create),
+        None => bail!(
+            "generator {generator_id} outputs exist without validation state; pass --replace to establish an explicit validation baseline"
+        ),
+    }
+}
+
+fn is_missing_canonical_ciphertext(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn generator_state_path(
+    repository_root: &Path,
+    generator_id: &nix_seal_core::Id,
+) -> Result<PathBuf> {
+    let root = repository_root
+        .canonicalize()
+        .context("repository root must exist for generator state")?;
+    let mut directory = root;
+    for component in [".nix-seal", "generator-state", "v1"] {
+        directory.push(component);
+        match fs::create_dir(&directory) {
+            Ok(()) => set_private_directory(&directory)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        let metadata = fs::symlink_metadata(&directory)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            bail!("generator state directory has unsafe type");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0
+            {
+                bail!("generator state directory has unsafe ownership or permissions");
+            }
+        }
+    }
+    for component in generator_id.as_str().split('/') {
+        directory.push(component);
+        match fs::create_dir(&directory) {
+            Ok(()) => set_private_directory(&directory)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        let metadata = fs::symlink_metadata(&directory)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            bail!("generator state directory has unsafe type");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0
+            {
+                bail!("generator state directory has unsafe ownership or permissions");
+            }
+        }
+    }
+    Ok(directory.join("state.json"))
+}
+
+fn read_generator_state(
+    repository_root: &Path,
+    generator_id: &nix_seal_core::Id,
+) -> Result<Option<GeneratorStateV1>> {
+    let path = generator_state_path(repository_root, generator_id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let input = open_private_identity(&path)
+        .context("generator validation state has unsafe ownership or permissions")?;
+    let mut bytes = Vec::new();
+    input
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .context("could not read generator validation state")?;
+    if bytes.len() > 64 * 1024 {
+        bail!("generator validation state exceeds the 64 KiB safety limit");
+    }
+    let state: GeneratorStateV1 =
+        serde_json::from_slice(&bytes).context("generator validation state is malformed")?;
+    if state.schema != GENERATOR_STATE_SCHEMA || state.generator_id != *generator_id {
+        bail!("generator validation state has an incompatible schema or ID");
+    }
+    Ok(Some(state))
+}
+
+fn write_generator_state(
+    repository_root: &Path,
+    generator_id: &nix_seal_core::Id,
+    validation: &str,
+    outputs: &[nix_seal_core::Id],
+) -> Result<()> {
+    let path = generator_state_path(repository_root, generator_id)?;
+    let parent = path
+        .parent()
+        .context("generator state path has no parent")?;
+    let bytes = serde_jcs::to_vec(&GeneratorStateV1 {
+        schema: GENERATOR_STATE_SCHEMA.to_owned(),
+        generator_id: generator_id.clone(),
+        validation: validation.to_owned(),
+        outputs: outputs.to_vec(),
+    })?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .context("could not stage generator validation state")?;
+    set_private_file(staged.path())?;
+    staged
+        .write_all(&bytes)
+        .and_then(|()| staged.as_file().sync_all())
+        .context("could not write generator validation state")?;
+    staged
+        .persist(&path)
+        .map_err(|error| error.error)
+        .context("could not atomically publish generator validation state")?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .context("generator validation state changed but directory durability is unknown")?;
+    Ok(())
+}
+
+fn remove_generator_state(repository_root: &Path, generator_id: &nix_seal_core::Id) -> Result<()> {
+    let path = generator_state_path(repository_root, generator_id)?;
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            fs::File::open(
+                path.parent()
+                    .context("generator state path has no parent")?,
+            )?
+            .sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn validate_generator_prompt_files(
@@ -5889,6 +6134,63 @@ mod tests {
             })
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn generator_validation_state_triggers_only_explicit_fingerprint_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(repository.join("secrets"))?;
+        let generator_id = nix_seal_core::Id::parse("application-token")?;
+        let secret_id = nix_seal_core::Id::parse("application/token")?;
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.secrets.insert(
+            secret_id.clone(),
+            nix_seal_core::Secret {
+                source: "secrets/token.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: Vec::new(),
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: None,
+            },
+        );
+        let generator = nix_seal_core::Generator {
+            executable: "builtin:uuid".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            outputs: vec![secret_id],
+            prompts: Vec::new(),
+            parameters: BTreeMap::new(),
+            validation: Some("v1".to_owned()),
+        };
+        assert_eq!(
+            generator_action(&plan, &generator_id, &generator, &repository, false)?,
+            GeneratorAction::Create
+        );
+        fs::write(repository.join("secrets/token.age"), b"ciphertext")?;
+        write_generator_state(&repository, &generator_id, "v1", &generator.outputs)?;
+        assert_eq!(
+            generator_action(&plan, &generator_id, &generator, &repository, false)?,
+            GeneratorAction::Unchanged
+        );
+        let changed = nix_seal_core::Generator {
+            validation: Some("v2".to_owned()),
+            ..generator
+        };
+        assert_eq!(
+            generator_action(&plan, &generator_id, &changed, &repository, false)?,
+            GeneratorAction::Replace
+        );
+        remove_generator_state(&repository, &generator_id)?;
+        assert!(generator_action(&plan, &generator_id, &changed, &repository, false).is_err());
         Ok(())
     }
 
