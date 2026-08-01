@@ -11,7 +11,10 @@
 - Phase 3: authoring and lifecycle commands, identity/value rotation,
   generators, prompts, templates, and provisioning phases.
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
-  starting with a synthetic low-risk secret.
+  starting with a synthetic low-risk secret. Public migration compatibility
+  goldens now cover agenix/ragenix, agenix-rekey, SOPS metadata, Clan
+  Vars/Facts, and the current secretctl index; mutation fixtures and actual
+  nix-conf dogfooding remain required.
 - Phase 5: attack-path review, sustained fuzz/mutation/platform/performance work
   (the reproducible scale benchmark protocol and scheduled Miri, sanitizer, and
   mutation jobs are now published), release build/SBOM/attestation scaffolding,

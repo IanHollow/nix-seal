@@ -623,6 +623,14 @@ rollback verification. `--replace` is explicit and still preserves the legacy
 tree. The same flow is available for ragenix because its ciphertext layout is
 standard age-compatible.
 
+Public migration compatibility goldens are checked into
+`crates/nix-seal-cli/tests/fixtures/migrations` and exercised through the
+released binary. They cover agenix, ragenix, agenix-rekey, SOPS JSON metadata,
+Clan Vars, Clan Facts, and the current `secretctl` index format. The fixtures
+contain only public metadata, empty/public leaves, or ciphertext without its
+private identity; mutation adapters remain dry-run-first and require separate
+round-trip tests before a 1.0 migration claim.
+
 For agenix-rekey, expose one public evaluated configuration with
 `nixSeal.lib.agenixRekeyMigrationExport`. The target must declare `id`, `kind`
 (`nixos`, `darwin`, or `home-manager`), `system`, `recipient`, and `storageMode`

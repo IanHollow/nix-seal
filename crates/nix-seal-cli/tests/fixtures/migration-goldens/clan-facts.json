@@ -1,0 +1,18 @@
+{
+  "dryRun": true,
+  "facts": [
+    {
+      "destination": null,
+      "legacyId": "desktop/serial",
+      "nixSealId": "clan-facts/desktop/serial",
+      "source": "desktop/facts/serial",
+      "valueBytes": 20
+    }
+  ],
+  "schema": "nix-seal.migration-report.v1",
+  "source": "clan-facts",
+  "warnings": [
+    "dry run only: no value, configuration, or source manager was changed",
+    "only documented public facts were inventoried without reading them; secret facts use configurable stores and require an explicit reviewed export"
+  ]
+}

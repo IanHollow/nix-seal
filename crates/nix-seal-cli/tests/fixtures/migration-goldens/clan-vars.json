@@ -1,0 +1,22 @@
+{
+  "auxiliaryFileCount": 1,
+  "dryRun": true,
+  "recipientPolicy": null,
+  "schema": "nix-seal.migration-report.v1",
+  "source": "clan-vars",
+  "values": [
+    {
+      "destination": null,
+      "legacyId": "desktop/service-token/api-token",
+      "nixSealId": "clan-vars/desktop/service-token/api-token",
+      "source": "desktop/service-token/api-token/value",
+      "valueBytes": 0
+    }
+  ],
+  "warnings": [
+    "dry run only: no value, configuration, or source manager was changed",
+    "Clan Vars storage backend and secret/public classification are not recoverable from an output leaf; provide explicit target, recipient, runtime, and public-output mappings before import",
+    "output values were never read, decrypted, emitted, or passed to an external process",
+    "auxiliary regular files were ignored after link/type validation; only machine/generator/output/value leaves are migration candidates"
+  ]
+}
