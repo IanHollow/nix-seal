@@ -1,12 +1,6 @@
 
 # cargo-vet audits file
 
-[[audits.spin]]
-who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
-criteria = "safe-to-deploy"
-delta = "0.9.8 -> 0.9.9"
-notes = "Reviewed the 0.9.8 to 0.9.9 delta: the only production code change fixes Once ownership with ManuallyDrop and assume_init_read, avoiding a double-drop. No new unsafe blocks, capabilities, dependencies, build script, or network/filesystem behavior."
-
 [[audits.ed25519]]
 who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
 criteria = "safe-to-deploy"
@@ -24,6 +18,12 @@ who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
 criteria = "safe-to-deploy"
 version = "0.7.0"
 notes = "Reviewed the PEM codec used only for SSHSIG/key parsing. It denies unsafe code except one UTF-8 conversion after its ASCII-only Base64 encoder; it has no build script or I/O capability."
+
+[[audits.spin]]
+who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+delta = "0.9.8 -> 0.9.9"
+notes = "Reviewed the 0.9.8 to 0.9.9 delta: the only production code change fixes Once ownership with ManuallyDrop and assume_init_read, avoiding a double-drop. No new unsafe blocks, capabilities, dependencies, build script, or network/filesystem behavior."
 
 [[audits.ssh-cipher]]
 who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
