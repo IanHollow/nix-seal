@@ -13,8 +13,8 @@
   export/import equivalence; interrupted-operation and activation state-machine
   coverage now exercises idempotent activation, generation repair, failed
   authentication, collision refusal, post-switch failure, and retry; interrupted
-  cache-operation recovery is now lock-protected and link-safe; concurrent
-  cache open/write coverage now verifies serialized recovery and inventory
+  cache-operation recovery is now lock-protected and link-safe; concurrent cache
+  open/write coverage now verifies serialized recovery and inventory
   consistency; adversarial race injection remains required.
 - Phase 3: authoring and lifecycle commands, identity/value rotation,
   generators, prompts, templates, and provisioning phases.
