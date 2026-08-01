@@ -1069,16 +1069,25 @@ fn validate_approval(id: &Id, policy: &ApprovalPolicy, plan: &PlanV1) -> Result<
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
     let mut indegree = BTreeMap::new();
     let mut dependents: BTreeMap<&Id, Vec<&Id>> = BTreeMap::new();
     let mut generated_outputs = BTreeSet::new();
+    let mut generated_public_output_ids = BTreeSet::new();
+    let mut public_destinations = BTreeSet::new();
     let mut output_producers = BTreeMap::new();
     let mut generator_prompts = BTreeSet::new();
+    let secret_sources: BTreeSet<_> = plan
+        .secrets
+        .values()
+        .map(|secret| secret.source.as_str())
+        .collect();
     for (generator_id, generator) in &plan.generators {
         if generator.dependencies.len() > 10_000
             || generator.secret_dependencies.len() > 10_000
             || generator.outputs.len() > 10_000
+            || generator.public_outputs.len() > 10_000
         {
             return Err(PolicyError::Violation(format!(
                 "generator {generator_id} exceeds dependency or output limits"
@@ -1086,19 +1095,21 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
         }
         validate_generator_execution(generator_id, generator)?;
         validate_generator_prompts(generator_id, generator, &mut generator_prompts)?;
-        if generator.outputs.is_empty() {
+        if generator.outputs.is_empty() && generator.public_outputs.is_empty() {
             return Err(PolicyError::Violation(format!(
-                "generator {generator_id} must declare at least one output"
+                "generator {generator_id} must declare at least one secret or public output"
             )));
         }
-        for output in &generator.outputs {
-            if !plan.secrets.contains_key(output) || !generated_outputs.insert(output) {
-                return Err(PolicyError::Violation(format!(
-                    "generator {generator_id} has a missing or duplicate secret output {output}"
-                )));
-            }
-            output_producers.insert(output, generator_id);
-        }
+        validate_generator_outputs(
+            plan,
+            generator_id,
+            generator,
+            &mut generated_outputs,
+            &mut generated_public_output_ids,
+            &mut public_destinations,
+            &mut output_producers,
+            &secret_sources,
+        )?;
         validate_generator_secret_dependencies(plan, generator_id, generator)?;
         if generator.parameters.len() > 128
             || generator.parameters.iter().any(|(key, value)| {
@@ -1161,6 +1172,44 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
         ));
     }
     validate_generated_secret_dependency_order(plan, &output_producers)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_generator_outputs<'a>(
+    plan: &PlanV1,
+    generator_id: &'a Id,
+    generator: &'a nix_seal_core::Generator,
+    generated_outputs: &mut BTreeSet<&'a Id>,
+    generated_public_output_ids: &mut BTreeSet<Id>,
+    public_destinations: &mut BTreeSet<String>,
+    output_producers: &mut BTreeMap<&'a Id, &'a Id>,
+    secret_sources: &BTreeSet<&str>,
+) -> Result<(), PolicyError> {
+    for output in &generator.outputs {
+        if !plan.secrets.contains_key(output)
+            || generated_public_output_ids.contains(output)
+            || !generated_outputs.insert(output)
+        {
+            return Err(PolicyError::Violation(format!(
+                "generator {generator_id} has a missing or duplicate secret output {output}"
+            )));
+        }
+        output_producers.insert(output, generator_id);
+    }
+    for output in &generator.public_outputs {
+        if !generated_public_output_ids.insert(output.id.clone())
+            || generated_outputs.contains(&output.id)
+            || !valid_repository_relative_path(&output.destination)
+            || !public_destinations.insert(output.destination.clone())
+            || secret_sources.contains(output.destination.as_str())
+        {
+            return Err(PolicyError::Violation(format!(
+                "generator {generator_id} has a duplicate or unsafe public output {}",
+                output.id
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1285,7 +1334,23 @@ fn validate_generator_execution(
             "built-in generator {generator_id} cannot declare secret dependencies"
         )));
     }
+    if is_builtin && !generator.public_outputs.is_empty() {
+        return Err(PolicyError::Violation(format!(
+            "built-in generator {generator_id} cannot declare public outputs"
+        )));
+    }
     Ok(())
+}
+
+fn valid_repository_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && value.split('/').all(|component| {
+            !component.is_empty()
+                && component != "."
+                && component != ".."
+                && !component.bytes().any(|byte| byte.is_ascii_control())
+        })
 }
 
 fn validate_argon2id_password_hash_generator(
@@ -1498,6 +1563,59 @@ mod tests {
     }
 
     #[test]
+    fn public_generator_outputs_are_validated_and_disjoint() -> Result<(), PolicyError> {
+        let generator_id = Id::parse("application/public-output")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let output_id = Id::parse("application/public-key")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let mut plan = PlanV1::default();
+        plan.generators.insert(
+            generator_id.clone(),
+            Generator {
+                executable: "/nix/store/example-generator/bin/generate".to_owned(),
+                arguments: Vec::new(),
+                runtime_inputs: Vec::new(),
+                timeout_seconds: 30,
+                max_output_bytes: 1024,
+                dependencies: Vec::new(),
+                secret_dependencies: Vec::new(),
+                outputs: Vec::new(),
+                public_outputs: vec![nix_seal_core::GeneratorPublicOutput {
+                    id: output_id.clone(),
+                    destination: "public/application-key".to_owned(),
+                }],
+                prompts: Vec::new(),
+                parameters: BTreeMap::new(),
+                validation: None,
+            },
+        );
+        validate(&plan)?;
+
+        let invalid_destination = Generator {
+            public_outputs: vec![nix_seal_core::GeneratorPublicOutput {
+                id: output_id.clone(),
+                destination: "../outside".to_owned(),
+            }],
+            ..plan.generators[&generator_id].clone()
+        };
+        plan.generators
+            .insert(generator_id.clone(), invalid_destination);
+        assert!(validate(&plan).is_err());
+
+        let builtin_public = Generator {
+            executable: "builtin:uuid".to_owned(),
+            public_outputs: vec![nix_seal_core::GeneratorPublicOutput {
+                id: output_id,
+                destination: "public/uuid".to_owned(),
+            }],
+            ..plan.generators[&generator_id].clone()
+        };
+        plan.generators.insert(generator_id, builtin_public);
+        assert!(validate(&plan).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn passphrase_ssh_and_argon2id_are_admitted_builtin_generators() -> Result<(), PolicyError> {
         let generator = nix_seal_core::Generator {
             executable: "builtin:passphrase".to_owned(),
@@ -1508,6 +1626,7 @@ mod tests {
             dependencies: Vec::new(),
             secret_dependencies: Vec::new(),
             outputs: Vec::new(),
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::from([("words".to_owned(), "16".to_owned())]),
             validation: None,
@@ -1730,6 +1849,7 @@ mod tests {
                 dependencies: Vec::new(),
                 secret_dependencies: vec![input.clone(), output.clone()],
                 outputs: vec![output.clone()],
+                public_outputs: Vec::new(),
                 prompts: Vec::new(),
                 parameters: BTreeMap::new(),
                 validation: None,

@@ -43,12 +43,85 @@ pub struct BatchSecretWrite<'a> {
     pub recipients: &'a [String],
 }
 
+/// One unencrypted public output staged as part of a mixed generation
+/// transaction. Public outputs are still written atomically and are never
+/// allowed to collide with canonical ciphertext destinations.
+pub struct BatchPublicWrite<'a> {
+    /// Repository-relative public output destination.
+    pub relative_destination: &'a Path,
+    /// Public bytes retained by the caller only for the duration of the transaction.
+    pub plaintext: &'a [u8],
+}
+
+/// Public metadata for one committed public output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicAuthoringResult {
+    /// Final public output path.
+    pub path: PathBuf,
+    /// BLAKE3 hash of the committed bytes.
+    pub content_hash: String,
+    /// Number of committed bytes.
+    pub plaintext_bytes: u64,
+}
+
+/// Results from a mixed secret/public generation transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchAuthoringResult {
+    /// Committed encrypted secret outputs.
+    pub secrets: Vec<AuthoringResult>,
+    /// Committed unencrypted public outputs.
+    pub public_outputs: Vec<PublicAuthoringResult>,
+}
+
 struct PreparedBatchWrite {
     destination: PathBuf,
     parent: PathBuf,
     previous: Option<std::fs::Metadata>,
     staged: Option<NamedTempFile>,
     result: AuthoringResult,
+}
+
+struct PreparedPublicWrite {
+    destination: PathBuf,
+    parent: PathBuf,
+    previous: Option<std::fs::Metadata>,
+    staged: Option<NamedTempFile>,
+    result: PublicAuthoringResult,
+}
+
+enum PreparedCombinedWrite {
+    Secret(PreparedBatchWrite),
+    Public(PreparedPublicWrite),
+}
+
+impl PreparedCombinedWrite {
+    fn destination(&self) -> &Path {
+        match self {
+            Self::Secret(item) => &item.destination,
+            Self::Public(item) => &item.destination,
+        }
+    }
+
+    fn parent(&self) -> &Path {
+        match self {
+            Self::Secret(item) => &item.parent,
+            Self::Public(item) => &item.parent,
+        }
+    }
+
+    fn previous(&self) -> Option<&std::fs::Metadata> {
+        match self {
+            Self::Secret(item) => item.previous.as_ref(),
+            Self::Public(item) => item.previous.as_ref(),
+        }
+    }
+
+    fn staged_mut(&mut self) -> &mut Option<NamedTempFile> {
+        match self {
+            Self::Secret(item) => &mut item.staged,
+            Self::Public(item) => &mut item.staged,
+        }
+    }
 }
 
 /// Inputs for a recoverable canonical-ciphertext deletion.
@@ -346,6 +419,199 @@ pub fn write_secret_batch(
             .map_err(|_| AuthoringError::DurabilityUnknown)?;
     }
     Ok(results)
+}
+
+/// Stages and commits encrypted secret outputs and unencrypted public outputs
+/// as one all-or-recover transaction. Every output is validated before any
+/// destination changes, and replacements are restored if a later commit or
+/// durability step fails.
+#[allow(clippy::too_many_lines)]
+pub fn write_secret_and_public_batch(
+    repository_root: &Path,
+    secret_writes: &[BatchSecretWrite<'_>],
+    public_writes: &[BatchPublicWrite<'_>],
+    verification_identity: &SecretString,
+    mode: WriteMode,
+) -> Result<BatchAuthoringResult, AuthoringError> {
+    if secret_writes.is_empty() && public_writes.is_empty() {
+        return Err(AuthoringError::UnsafePath);
+    }
+    if secret_writes
+        .len()
+        .checked_add(public_writes.len())
+        .is_none_or(|count| count > 10_000)
+    {
+        return Err(AuthoringError::UnsafePath);
+    }
+    let secret_prepared = if secret_writes.is_empty() {
+        Vec::new()
+    } else {
+        prepare_batch_writes(repository_root, secret_writes, verification_identity, mode)?
+    };
+    let secret_destinations: BTreeSet<_> = secret_prepared
+        .iter()
+        .map(|item| item.destination.clone())
+        .collect();
+    let public_prepared =
+        prepare_public_writes(repository_root, public_writes, mode, &secret_destinations)?;
+    let mut prepared: Vec<_> = secret_prepared
+        .into_iter()
+        .map(PreparedCombinedWrite::Secret)
+        .collect();
+    prepared.extend(
+        public_prepared
+            .into_iter()
+            .map(PreparedCombinedWrite::Public),
+    );
+
+    for item in &prepared {
+        match mode {
+            WriteMode::Create if item.destination().exists() => {
+                return Err(AuthoringError::DestinationState);
+            }
+            WriteMode::Replace => ensure_unchanged(item.destination(), item.previous())?,
+            WriteMode::Create => {}
+        }
+    }
+
+    let mut backups = Vec::with_capacity(prepared.len());
+    for item in &prepared {
+        if mode == WriteMode::Create {
+            backups.push(None);
+            continue;
+        }
+        let backup = NamedTempFile::new_in(item.parent()).map_err(AuthoringError::Io)?;
+        set_private(backup.path()).map_err(AuthoringError::Io)?;
+        let backup = backup.into_temp_path();
+        if std::fs::rename(item.destination(), &backup).is_err() {
+            if restore_combined(&prepared, &mut backups, &[]) {
+                return Err(AuthoringError::BatchRolledBack);
+            }
+            return Err(AuthoringError::BatchRecoveryUnknown);
+        }
+        backups.push(Some(backup));
+    }
+
+    let mut committed = Vec::with_capacity(prepared.len());
+    for item in &mut prepared {
+        let Some(staged) = item.staged_mut().take() else {
+            if restore_combined(&prepared, &mut backups, &committed) {
+                return Err(AuthoringError::BatchRolledBack);
+            }
+            return Err(AuthoringError::BatchRecoveryUnknown);
+        };
+        if matches!(item, PreparedCombinedWrite::Public(_))
+            && let Err(error) = set_public(staged.path())
+        {
+            if restore_combined(&prepared, &mut backups, &committed) {
+                return Err(AuthoringError::BatchRolledBack);
+            }
+            return Err(AuthoringError::Io(error));
+        }
+        let persisted = match mode {
+            WriteMode::Create => staged.persist_noclobber(item.destination()),
+            WriteMode::Replace => staged.persist(item.destination()),
+        };
+        if persisted.is_err() {
+            if restore_combined(&prepared, &mut backups, &committed) {
+                return Err(AuthoringError::BatchRolledBack);
+            }
+            return Err(AuthoringError::BatchRecoveryUnknown);
+        }
+        committed.push(item.destination().to_owned());
+    }
+
+    let mut parents = BTreeSet::new();
+    for item in &prepared {
+        parents.insert(item.parent().to_owned());
+    }
+    for parent in parents {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| AuthoringError::DurabilityUnknown)?;
+    }
+
+    let mut secrets = Vec::with_capacity(secret_writes.len());
+    let mut public_outputs = Vec::with_capacity(public_writes.len());
+    for item in prepared {
+        match item {
+            PreparedCombinedWrite::Secret(item) => secrets.push(item.result),
+            PreparedCombinedWrite::Public(item) => public_outputs.push(item.result),
+        }
+    }
+    Ok(BatchAuthoringResult {
+        secrets,
+        public_outputs,
+    })
+}
+
+fn prepare_public_writes(
+    repository_root: &Path,
+    writes: &[BatchPublicWrite<'_>],
+    mode: WriteMode,
+    forbidden_destinations: &BTreeSet<PathBuf>,
+) -> Result<Vec<PreparedPublicWrite>, AuthoringError> {
+    const MAX_PUBLIC_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+    let mut destinations = forbidden_destinations.clone();
+    let mut prepared = Vec::with_capacity(writes.len());
+    for write in writes {
+        if write.plaintext.len() > MAX_PUBLIC_OUTPUT_BYTES {
+            return Err(AuthoringError::UnsafePath);
+        }
+        let destination = resolve_destination(repository_root, write.relative_destination)?;
+        if !destinations.insert(destination.clone()) {
+            return Err(AuthoringError::DestinationState);
+        }
+        let previous = validate_destination(&destination, mode)?;
+        let parent = destination
+            .parent()
+            .ok_or(AuthoringError::UnsafePath)?
+            .to_owned();
+        let mut staged = NamedTempFile::new_in(&parent).map_err(AuthoringError::Io)?;
+        set_private(staged.path()).map_err(AuthoringError::Io)?;
+        staged
+            .write_all(write.plaintext)
+            .and_then(|()| staged.as_file().sync_all())
+            .map_err(AuthoringError::Io)?;
+        staged.as_file_mut().rewind().map_err(AuthoringError::Io)?;
+        let content_hash = hash_file(staged.as_file_mut())?;
+        let plaintext_bytes =
+            u64::try_from(write.plaintext.len()).map_err(|_| AuthoringError::UnsafePath)?;
+        prepared.push(PreparedPublicWrite {
+            destination: destination.clone(),
+            parent,
+            previous,
+            staged: Some(staged),
+            result: PublicAuthoringResult {
+                path: destination,
+                content_hash,
+                plaintext_bytes,
+            },
+        });
+    }
+    Ok(prepared)
+}
+
+fn restore_combined(
+    prepared: &[PreparedCombinedWrite],
+    backups: &mut [Option<TempPath>],
+    committed: &[PathBuf],
+) -> bool {
+    let committed: BTreeSet<&Path> = committed.iter().map(PathBuf::as_path).collect();
+    let mut restored = true;
+    for (item, backup) in prepared.iter().zip(backups.iter_mut()).rev() {
+        if committed.contains(item.destination())
+            && std::fs::remove_file(item.destination()).is_err()
+        {
+            restored = false;
+        }
+        if let Some(backup) = backup.take()
+            && std::fs::rename(&backup, item.destination()).is_err()
+        {
+            restored = false;
+        }
+    }
+    restored
 }
 
 fn prepare_batch_writes(
@@ -846,6 +1112,12 @@ fn set_private(path: &Path) -> Result<(), std::io::Error> {
 }
 
 #[cfg(unix)]
+fn set_public(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+}
+
+#[cfg(unix)]
 fn set_private_directory(path: &Path) -> Result<(), std::io::Error> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
@@ -853,6 +1125,11 @@ fn set_private_directory(path: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(not(unix))]
 fn set_private(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_public(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
@@ -1112,6 +1389,71 @@ mod tests {
             nix_seal_crypto::decrypt(File::open(&result.path)?, &mut plaintext, &identity)?;
             assert_eq!(plaintext, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_secret_and_public_batch_is_atomic_and_mode_safe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        let recipients = vec![recipient];
+        let result = write_secret_and_public_batch(
+            &root,
+            &[BatchSecretWrite {
+                relative_destination: Path::new("secrets/generated.age"),
+                plaintext: b"private-output",
+                recipients: &recipients,
+            }],
+            &[BatchPublicWrite {
+                relative_destination: Path::new("public/generated.pub"),
+                plaintext: b"public-output",
+            }],
+            &identity,
+            WriteMode::Create,
+        )?;
+        assert_eq!(result.secrets.len(), 1);
+        assert_eq!(result.public_outputs.len(), 1);
+        assert_eq!(
+            std::fs::read(&result.public_outputs[0].path)?,
+            b"public-output"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&result.public_outputs[0].path)?
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
+        let mut private = Vec::new();
+        nix_seal_crypto::decrypt(
+            File::open(&result.secrets[0].path)?,
+            &mut private,
+            &identity,
+        )?;
+        assert_eq!(private, b"private-output");
+        assert!(matches!(
+            write_secret_and_public_batch(
+                &root,
+                &[BatchSecretWrite {
+                    relative_destination: Path::new("secrets/second.age"),
+                    plaintext: b"second-private",
+                    recipients: &recipients,
+                }],
+                &[BatchPublicWrite {
+                    relative_destination: Path::new("secrets/second.age"),
+                    plaintext: b"collision",
+                }],
+                &identity,
+                WriteMode::Create,
+            ),
+            Err(AuthoringError::DestinationState)
+        ));
         Ok(())
     }
 

@@ -384,15 +384,21 @@ prompt value is never put in the plan, arguments, environment, or logs.
 key, which is immediately encrypted through the normal canonical-secret
 transaction; its public key is derivable from that secret. Generation is
 create-only unless `--replace` is explicit. Generators may produce multiple
-secret outputs: every output is encrypted and round-trip verified before an
-existing ciphertext is changed, and replacement failures restore prior
-ciphertext. Direct executable generators use an explicit protocol: `executable`
-and every `runtimeInputs` entry must be under `/nix/store`; `arguments` are
-literal public values; and the process runs with a cleared environment, null
-standard streams, a private workspace, and a bounded timeout. It must write
-exactly one regular file named `0`, `1`, and so on for each declared output
-beneath `$NIX_SEAL_OUTPUT_DIR`. Unlisted files, links, oversized output, nonzero
-exits, and timeouts fail the full transaction without exposing process output.
+secret outputs and declared public outputs. Every output is validated before any
+destination changes; secret outputs are encrypted and round-trip verified,
+public outputs are written with mode `0644`, and replacement failures restore
+the complete prior set. Direct executable generators use an explicit protocol:
+`executable` and every `runtimeInputs` entry must be under `/nix/store`;
+`arguments` are literal public values; and the process runs with a cleared
+environment, null standard streams, a private workspace, and a bounded timeout.
+It must write exactly one regular file named `0`, `1`, and so on for each
+declared secret output beneath `$NIX_SEAL_OUTPUT_DIR`, plus the same numbered
+protocol beneath `$NIX_SEAL_PUBLIC_OUTPUT_DIR` for declared public outputs.
+Unlisted files, links, oversized output, nonzero exits, and timeouts fail the
+full transaction without exposing process output. Public destinations are
+repository-relative, must not collide with ciphertext sources, and are recorded
+in the public plan; built-in generators currently emit encrypted secret outputs
+only.
 
 Set a generator's public `validation` value when its generated credential must
 be replaced after a specific non-secret configuration change. nix-seal records

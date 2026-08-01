@@ -362,6 +362,10 @@ pub struct Generator {
     pub secret_dependencies: Vec<Id>,
     /// Declared outputs.
     pub outputs: Vec<Id>,
+    /// Declared public output files. These are never encrypted and may be
+    /// consumed by public authoring or Nix evaluation workflows.
+    #[serde(default)]
+    pub public_outputs: Vec<GeneratorPublicOutput>,
     /// Explicit prompt declarations. Prompt values never enter the public plan.
     #[serde(default)]
     pub prompts: Vec<GeneratorPrompt>,
@@ -370,6 +374,20 @@ pub struct Generator {
     pub parameters: BTreeMap<String, String>,
     /// Public validation fingerprint.
     pub validation: Option<String>,
+}
+
+/// One public output produced by an external generator.
+///
+/// The destination is repository-relative metadata. The output bytes are
+/// written only after every secret and public output has passed validation and
+/// the complete generation transaction is ready to commit.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GeneratorPublicOutput {
+    /// Stable output identifier used by the generator protocol and reports.
+    pub id: Id,
+    /// Repository-relative destination for the public output bytes.
+    pub destination: String,
 }
 
 /// One declared external-generator prompt.

@@ -65,6 +65,8 @@ struct GeneratorStateV1 {
     generator_id: nix_seal_core::Id,
     validation: String,
     outputs: Vec<nix_seal_core::Id>,
+    #[serde(default)]
+    public_outputs: Vec<nix_seal_core::Id>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4095,6 +4097,11 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
         plaintext: SecretBox<Vec<u8>>,
         recipients: Vec<String>,
     }
+    struct GeneratedPublic {
+        id: nix_seal_core::Id,
+        destination: String,
+        plaintext: SecretBox<Vec<u8>>,
+    }
 
     let plan = read_plan_bounded(&arguments.plan)?;
     let identity = read_identity(&arguments.identity)?;
@@ -4137,6 +4144,18 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                     "action":"unchanged"
                 }));
             }
+            for public_output in &generator.public_outputs {
+                let path = existing_public_output_path(
+                    &arguments.repository_root,
+                    &public_output.destination,
+                )?;
+                outputs.push(serde_json::json!({
+                    "generator":generator_id,
+                    "publicOutputId":public_output.id,
+                    "path":path,
+                    "action":"unchanged"
+                }));
+            }
             continue;
         }
         let prompt_values = read_generator_prompts(generator, &prompt_files)?;
@@ -4149,13 +4168,15 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                 identity: &identity,
             },
         )?;
-        if generated_values.len() != generator.outputs.len() {
+        if generated_values.secrets.len() != generator.outputs.len()
+            || generated_values.public.len() != generator.public_outputs.len()
+        {
             bail!("generator produced an unexpected output count");
         }
         let generated = generator
             .outputs
             .iter()
-            .zip(generated_values)
+            .zip(generated_values.secrets)
             .map(|(secret_id, plaintext)| {
                 let secret = plan
                     .secrets
@@ -4170,6 +4191,16 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let generated_public = generator
+            .public_outputs
+            .iter()
+            .zip(generated_values.public)
+            .map(|(output, plaintext)| GeneratedPublic {
+                id: output.id.clone(),
+                destination: output.destination.clone(),
+                plaintext,
+            })
+            .collect::<Vec<_>>();
         let writes = generated
             .iter()
             .map(|output| nix_seal_authoring::BatchSecretWrite {
@@ -4178,14 +4209,22 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                 recipients: &output.recipients,
             })
             .collect::<Vec<_>>();
+        let public_writes = generated_public
+            .iter()
+            .map(|output| nix_seal_authoring::BatchPublicWrite {
+                relative_destination: Path::new(&output.destination),
+                plaintext: output.plaintext.expose_secret(),
+            })
+            .collect::<Vec<_>>();
         let mode = match action {
             GeneratorAction::Create => nix_seal_authoring::WriteMode::Create,
             GeneratorAction::Replace => nix_seal_authoring::WriteMode::Replace,
             GeneratorAction::Unchanged => bail!("unchanged generator reached write transaction"),
         };
-        let results = nix_seal_authoring::write_secret_batch(
+        let results = nix_seal_authoring::write_secret_and_public_batch(
             &arguments.repository_root,
             &writes,
+            &public_writes,
             &identity,
             mode,
         )?;
@@ -4201,16 +4240,31 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                 &generator_id,
                 validation,
                 &generator.outputs,
+                &generator
+                    .public_outputs
+                    .iter()
+                    .map(|output| output.id.clone())
+                    .collect::<Vec<_>>(),
             )?;
         } else {
             remove_generator_state(&arguments.repository_root, &generator_id)?;
         }
-        for (output, result) in generated.iter().zip(results) {
+        for (output, result) in generated.iter().zip(results.secrets) {
             outputs.push(serde_json::json!({
                 "generator":generator_id,
                 "secretId":output.id,
                 "ciphertextPath":result.path,
                 "ciphertextHash":result.ciphertext_hash,
+                "plaintextBytes":result.plaintext_bytes,
+                "action":match action { GeneratorAction::Create => "created", GeneratorAction::Replace => "replaced", GeneratorAction::Unchanged => "unchanged" }
+            }));
+        }
+        for (output, result) in generated_public.iter().zip(results.public_outputs) {
+            outputs.push(serde_json::json!({
+                "generator":generator_id,
+                "publicOutputId":output.id,
+                "path":result.path,
+                "contentHash":result.content_hash,
                 "plaintextBytes":result.plaintext_bytes,
                 "action":match action { GeneratorAction::Create => "created", GeneratorAction::Replace => "replaced", GeneratorAction::Unchanged => "unchanged" }
             }));
@@ -4227,11 +4281,18 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
         );
     } else {
         for output in outputs {
-            println!(
-                "generated {} -> {}",
-                output["secretId"].as_str().unwrap_or("unknown"),
-                output["ciphertextPath"].as_str().unwrap_or("unknown")
-            );
+            if let (Some(secret_id), Some(path)) = (
+                output["secretId"].as_str(),
+                output["ciphertextPath"].as_str(),
+            ) {
+                println!("generated {secret_id} -> {path}");
+            } else if let (Some(output_id), Some(path)) =
+                (output["publicOutputId"].as_str(), output["path"].as_str())
+            {
+                println!("generated public output {output_id} -> {path}");
+            } else {
+                bail!("generation result omitted a stable output identifier or path");
+            }
         }
     }
     Ok(())
@@ -4267,27 +4328,54 @@ fn generator_action(
             }
         })
         .collect::<Result<Vec<_>>>()?;
+    let public_present = generator
+        .public_outputs
+        .iter()
+        .map(
+            |output| match existing_public_output_path(repository_root, &output.destination) {
+                Ok(_) => Ok(Some(output)),
+                Err(error) if is_missing_canonical_ciphertext(&error) => Ok(None),
+                Err(error) => Err(error),
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
     let present_count = present.iter().flatten().count();
-    if present_count != 0 && present_count != generator.outputs.len() {
-        bail!(
-            "generator {generator_id} has a partial canonical-output set; repair it with --replace"
-        );
+    let public_present_count = public_present.iter().flatten().count();
+    let total_outputs = generator
+        .outputs
+        .len()
+        .checked_add(generator.public_outputs.len())
+        .context("generator output count overflow")?;
+    let total_present = present_count
+        .checked_add(public_present_count)
+        .context("generator output count overflow")?;
+    if total_present != 0 && total_present != total_outputs {
+        bail!("generator {generator_id} has a partial output set; repair it with --replace");
     }
     let Some(validation) = generator.validation.as_deref() else {
         return Ok(GeneratorAction::Create);
     };
     let state = read_generator_state(repository_root, generator_id)?;
     match state {
-        Some(state) if state.validation == validation && state.outputs == generator.outputs => {
-            if present_count == generator.outputs.len() {
+        Some(state)
+            if state.validation == validation
+                && state.outputs == generator.outputs
+                && state.public_outputs
+                    == generator
+                        .public_outputs
+                        .iter()
+                        .map(|output| output.id.clone())
+                        .collect::<Vec<_>>() =>
+        {
+            if total_present == total_outputs {
                 Ok(GeneratorAction::Unchanged)
             } else {
                 Ok(GeneratorAction::Create)
             }
         }
-        Some(_) if present_count == generator.outputs.len() => Ok(GeneratorAction::Replace),
+        Some(_) if total_present == total_outputs => Ok(GeneratorAction::Replace),
         Some(_) => Ok(GeneratorAction::Create),
-        None if present_count == 0 => Ok(GeneratorAction::Create),
+        None if total_present == 0 => Ok(GeneratorAction::Create),
         None => bail!(
             "generator {generator_id} outputs exist without validation state; pass --replace to establish an explicit validation baseline"
         ),
@@ -4384,6 +4472,7 @@ fn write_generator_state(
     generator_id: &nix_seal_core::Id,
     validation: &str,
     outputs: &[nix_seal_core::Id],
+    public_outputs: &[nix_seal_core::Id],
 ) -> Result<()> {
     let path = generator_state_path(repository_root, generator_id)?;
     let parent = path
@@ -4394,6 +4483,7 @@ fn write_generator_state(
         generator_id: generator_id.clone(),
         validation: validation.to_owned(),
         outputs: outputs.to_vec(),
+        public_outputs: public_outputs.to_vec(),
     })?;
     let mut staged = tempfile::NamedTempFile::new_in(parent)
         .context("could not stage generator validation state")?;
@@ -4595,14 +4685,22 @@ enum GeneratorSecretInputs<'a> {
     None,
 }
 
+struct GeneratedValues {
+    secrets: Vec<SecretBox<Vec<u8>>>,
+    public: Vec<SecretBox<Vec<u8>>>,
+}
+
 fn generate_generator_values(
     generator: &nix_seal_core::Generator,
     prompts: &[SecretBox<Vec<u8>>],
     secret_inputs: GeneratorSecretInputs<'_>,
-) -> Result<Vec<SecretBox<Vec<u8>>>> {
+) -> Result<GeneratedValues> {
     if generator.executable.starts_with("builtin:") {
         if generator.executable == "builtin:argon2id-password-hash" {
-            return Ok(vec![generate_argon2id_password_hash(generator, prompts)?]);
+            return Ok(GeneratedValues {
+                secrets: vec![generate_argon2id_password_hash(generator, prompts)?],
+                public: Vec::new(),
+            });
         }
         if !prompts.is_empty() {
             bail!("built-in generators do not accept prompts");
@@ -4610,20 +4708,24 @@ fn generate_generator_values(
         if !generator.secret_dependencies.is_empty() {
             bail!("built-in generators do not accept secret dependencies");
         }
-        return generator
-            .outputs
-            .iter()
-            .map(|_| generate_builtin_value(generator))
-            .collect();
+        return Ok(GeneratedValues {
+            secrets: generator
+                .outputs
+                .iter()
+                .map(|_| generate_builtin_value(generator))
+                .collect::<Result<Vec<_>>>()?,
+            public: Vec::new(),
+        });
     }
     generate_external_values(generator, prompts, secret_inputs)
 }
 
+#[allow(clippy::too_many_lines)]
 fn generate_external_values(
     generator: &nix_seal_core::Generator,
     prompts: &[SecretBox<Vec<u8>>],
     secret_inputs: GeneratorSecretInputs<'_>,
-) -> Result<Vec<SecretBox<Vec<u8>>>> {
+) -> Result<GeneratedValues> {
     let workspace = tempfile::Builder::new()
         .prefix("nix-seal-generator-")
         .tempdir()
@@ -4633,6 +4735,10 @@ fn generate_external_values(
     fs::create_dir(&output_directory)
         .context("could not create private generator output directory")?;
     set_private_directory(&output_directory)?;
+    let public_output_directory = workspace.path().join("public-outputs");
+    fs::create_dir(&public_output_directory)
+        .context("could not create private generator public-output directory")?;
+    set_private_directory(&public_output_directory)?;
     let prompt_directory = workspace.path().join("prompts");
     fs::create_dir(&prompt_directory)
         .context("could not create private generator prompt directory")?;
@@ -4663,6 +4769,11 @@ fn generate_external_values(
         .env("TMPDIR", workspace.path())
         .env("NIX_SEAL_OUTPUT_DIR", &output_directory)
         .env("NIX_SEAL_OUTPUT_COUNT", generator.outputs.len().to_string())
+        .env("NIX_SEAL_PUBLIC_OUTPUT_DIR", &public_output_directory)
+        .env(
+            "NIX_SEAL_PUBLIC_OUTPUT_COUNT",
+            generator.public_outputs.len().to_string(),
+        )
         .env("NIX_SEAL_PROMPT_DIR", &prompt_directory)
         .env("NIX_SEAL_PROMPT_COUNT", prompts.len().to_string())
         .env("NIX_SEAL_SECRET_DIR", &secret_directory)
@@ -4714,10 +4825,45 @@ fn generate_external_values(
     if actual != expected {
         bail!("constrained generator created undeclared or missing outputs");
     }
-    expected
+    let secrets = expected
         .iter()
         .map(|name| read_generator_output(&output_directory.join(name), generator.max_output_bytes))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let expected_public = generator
+        .public_outputs
+        .iter()
+        .enumerate()
+        .map(|(index, _)| index.to_string())
+        .collect::<BTreeSet<_>>();
+    let actual_public = fs::read_dir(&public_output_directory)
+        .context("could not inspect constrained generator public outputs")?
+        .map(|entry| {
+            let entry = entry.context("could not inspect constrained generator public output")?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("generator public output name is not UTF-8"))?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .context("could not inspect constrained generator public output metadata")?;
+            if !metadata.file_type().is_file() {
+                bail!("constrained generator public output is not a regular file");
+            }
+            Ok(name)
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if actual_public != expected_public {
+        bail!("constrained generator created undeclared or missing public outputs");
+    }
+    let public = expected_public
+        .iter()
+        .map(|name| {
+            read_generator_output(
+                &public_output_directory.join(name),
+                generator.max_output_bytes,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GeneratedValues { secrets, public })
 }
 
 fn materialize_generator_secret_dependencies(
@@ -5799,6 +5945,11 @@ fn existing_secret_path(repository_root: &Path, relative: &str) -> Result<PathBu
         }
     }
     Ok(path)
+}
+
+fn existing_public_output_path(repository_root: &Path, relative: &str) -> Result<PathBuf> {
+    existing_secret_path(repository_root, relative)
+        .context("public output path is missing or unsafe")
 }
 
 /// Resolves an explicit plaintext render destination without permitting the
@@ -7122,6 +7273,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             dependencies: Vec::new(),
             secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "48".to_owned())]),
             validation: None,
@@ -7136,6 +7288,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             dependencies: Vec::new(),
             secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
             validation: None,
@@ -7152,6 +7305,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             dependencies: Vec::new(),
             secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
             validation: None,
@@ -7166,6 +7320,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             dependencies: Vec::new(),
             secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
             validation: None,
@@ -7187,6 +7342,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             dependencies: Vec::new(),
             secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
             validation: None,
@@ -7206,6 +7362,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             dependencies: Vec::new(),
             secret_dependencies: Vec::new(),
             outputs: vec![output],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
             validation: None,
@@ -7231,6 +7388,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             dependencies: Vec::new(),
             secret_dependencies: Vec::new(),
             outputs: vec![nix_seal_core::Id::parse("application/passphrase")?],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::from([("words".to_owned(), "12".to_owned())]),
             validation: None,
@@ -7262,6 +7420,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             dependencies: Vec::new(),
             secret_dependencies: Vec::new(),
             outputs: vec![nix_seal_core::Id::parse("application/password-hash")?],
+            public_outputs: Vec::new(),
             prompts: vec![nix_seal_core::GeneratorPrompt {
                 id: nix_seal_core::Id::parse("password")?,
                 mode: nix_seal_core::GeneratorPromptMode::Hidden,
@@ -7279,7 +7438,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         let password = SecretBox::new(Box::new(b"argon2id-test-password".to_vec()));
         let generated =
             generate_generator_values(&generator, &[password], GeneratorSecretInputs::None)?;
-        let encoded = std::str::from_utf8(generated[0].expose_secret())?;
+        let encoded = std::str::from_utf8(generated.secrets[0].expose_secret())?;
         assert!(encoded.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
         let parsed = PasswordHash::new(encoded)
             .map_err(|_| "generated Argon2id output is not a valid PHC hash")?;
@@ -7337,6 +7496,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             dependencies: Vec::new(),
             secret_dependencies: Vec::new(),
             outputs: vec![secret_id],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
             validation: Some("v1".to_owned()),
@@ -7346,7 +7506,17 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             GeneratorAction::Create
         );
         fs::write(repository.join("secrets/token.age"), b"ciphertext")?;
-        write_generator_state(&repository, &generator_id, "v1", &generator.outputs)?;
+        write_generator_state(
+            &repository,
+            &generator_id,
+            "v1",
+            &generator.outputs,
+            &generator
+                .public_outputs
+                .iter()
+                .map(|output| output.id.clone())
+                .collect::<Vec<_>>(),
+        )?;
         assert_eq!(
             generator_action(&plan, &generator_id, &generator, &repository, false)?,
             GeneratorAction::Unchanged
@@ -7380,6 +7550,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             dependencies: Vec::new(),
             secret_dependencies: Vec::new(),
             outputs: vec![nix_seal_core::Id::parse("application/token")?],
+            public_outputs: Vec::new(),
             prompts: vec![nix_seal_core::GeneratorPrompt {
                 id: prompt_id.clone(),
                 mode: nix_seal_core::GeneratorPromptMode::Hidden,
@@ -7426,6 +7597,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             dependencies: Vec::new(),
             secret_dependencies: Vec::new(),
             outputs: vec![nix_seal_core::Id::parse("application/ssh-private-key")?],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
             validation: None,
@@ -7476,7 +7648,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             executable: shell.to_string_lossy().into_owned(),
             arguments: vec![
                 "-c".to_owned(),
-                "IFS= read -r value < \"$NIX_SEAL_PROMPT_DIR/0\"; printf %s \"$value\" > \"$NIX_SEAL_OUTPUT_DIR/0\"; printf second > \"$NIX_SEAL_OUTPUT_DIR/1\"".to_owned(),
+                "IFS= read -r value < \"$NIX_SEAL_PROMPT_DIR/0\"; printf %s \"$value\" > \"$NIX_SEAL_OUTPUT_DIR/0\"; printf second > \"$NIX_SEAL_OUTPUT_DIR/1\"; printf public > \"$NIX_SEAL_PUBLIC_OUTPUT_DIR/0\"".to_owned(),
             ],
             runtime_inputs: Vec::new(),
             timeout_seconds: 5,
@@ -7487,6 +7659,10 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 nix_seal_core::Id::parse("generator/one")?,
                 nix_seal_core::Id::parse("generator/two")?,
             ],
+            public_outputs: vec![nix_seal_core::GeneratorPublicOutput {
+                id: nix_seal_core::Id::parse("generator/public")?,
+                destination: "public/generator-output".to_owned(),
+            }],
             prompts: vec![nix_seal_core::GeneratorPrompt {
                 id: nix_seal_core::Id::parse("generator/value")?,
                 mode: nix_seal_core::GeneratorPromptMode::Hidden,
@@ -7502,9 +7678,11 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             &[SecretBox::new(Box::new(b"first".to_vec()))],
             GeneratorSecretInputs::None,
         )?;
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[0].expose_secret(), b"first");
-        assert_eq!(values[1].expose_secret(), b"second");
+        assert_eq!(values.secrets.len(), 2);
+        assert_eq!(values.secrets[0].expose_secret(), b"first");
+        assert_eq!(values.secrets[1].expose_secret(), b"second");
+        assert_eq!(values.public.len(), 1);
+        assert_eq!(values.public[0].expose_secret(), b"public");
         Ok(())
     }
 
@@ -7569,6 +7747,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             dependencies: Vec::new(),
             secret_dependencies: vec![dependency_id],
             outputs: vec![output_id],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
             validation: None,
@@ -7582,8 +7761,8 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 identity: &identity,
             },
         )?;
-        assert_eq!(values.len(), 1);
-        assert_eq!(values[0].expose_secret(), b"dependency-canary");
+        assert_eq!(values.secrets.len(), 1);
+        assert_eq!(values.secrets[0].expose_secret(), b"dependency-canary");
         let (unauthorized_identity, _) = nix_seal_crypto::generate_x25519();
         assert!(
             generate_external_values(
@@ -7881,6 +8060,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 dependencies: Vec::new(),
                 secret_dependencies: Vec::new(),
                 outputs: vec![secret_id, second_secret_id],
+                public_outputs: Vec::new(),
                 prompts: Vec::new(),
                 parameters: BTreeMap::from([("bytes".to_owned(), "20".to_owned())]),
                 validation: None,
