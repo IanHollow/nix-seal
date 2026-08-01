@@ -1,0 +1,43 @@
+{
+  "schema": "nix-seal.activation.v2",
+  "runtimeRoot": "/run/nix-seal",
+  "plan": "/nix/store/example-plan.v1.json",
+  "targetId": "host-one",
+  "phase": "activation",
+  "artifacts": [
+    {
+      "ciphertext": "/nix/store/example-token.age",
+      "envelope": "/nix/store/example-token.envelope.json",
+      "secretId": "application/token",
+      "phase": "activation",
+      "sourceCiphertextHash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "artifactGeneration": 1,
+      "mode": "0400",
+      "owner": "root",
+      "group": "root"
+    }
+  ],
+  "templates": [
+    {
+      "source": "/nix/store/example-config.template",
+      "templateId": "application/config",
+      "phase": "activation",
+      "placeholders": {
+        "token": {
+          "secretId": "application/token",
+          "encoding": "utf8"
+        }
+      },
+      "mode": "0400",
+      "owner": "root",
+      "group": "root"
+    }
+  ],
+  "postSwitch": {
+    "executable": "/run/current-system/sw/bin/systemctl",
+    "manager": "systemd-system",
+    "reloadUnits": ["example.service"],
+    "restartUnits": ["example-worker.service"],
+    "timeoutSeconds": 30
+  }
+}

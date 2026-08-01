@@ -11,11 +11,19 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.12"
 nix-seal-core = { path = "../crates/nix-seal-core" }
 nix-seal-policy = { path = "../crates/nix-seal-policy" }
+nix-seal-runtime = { path = "../crates/nix-seal-runtime" }
 serde_json = "1.0"
 
 [[bin]]
 name = "plan-v1"
 path = "fuzz_targets/plan_v1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "activation-v2"
+path = "fuzz_targets/activation_v2.rs"
 test = false
 doc = false
 bench = false
