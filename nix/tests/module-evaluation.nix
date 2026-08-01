@@ -33,6 +33,9 @@ let
       };
     };
   };
+  commonNoPlan = common // {
+    nixSeal = builtins.removeAttrs common.nixSeal [ "planFile" ];
+  };
   credentialMapping = {
     nixSeal.secrets."db/password".serviceCredentials = [
       {
@@ -51,6 +54,17 @@ let
       common
       credentialMapping
       { system.stateVersion = "26.05"; }
+    ];
+  };
+  nixosCompiledPlan = inputs.nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = [
+      self.nixosModules.default
+      commonNoPlan
+      {
+        system.stateVersion = "26.05";
+        nixSeal.planObjects = { };
+      }
     ];
   };
   credentialCollision = inputs.nixpkgs.lib.nixosSystem {
@@ -277,6 +291,13 @@ let
   );
 in
 {
+  module-plan-objects =
+    pkgs.runCommand "nix-seal-module-plan-objects" { nativeBuildInputs = [ pkgs.jq ]; }
+      ''
+        jq -e '.schema == "nix-seal.plan.v1" and (.secrets | length) == 0' \
+          ${nixosCompiledPlan.config.nixSeal.planFile} >/dev/null
+        touch "$out"
+      '';
   lib-plan-builder =
     assert !invalidCollectionId.success;
     pkgs.runCommand "nix-seal-lib-plan-builder" { nativeBuildInputs = [ pkgs.jq ]; } ''

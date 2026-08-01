@@ -158,8 +158,21 @@ in
     };
     planFile = mkOption {
       type = types.nullOr types.path;
-      default = null;
+      default =
+        if cfg.planObjects == null then
+          null
+        else
+          pkgs.writeText "nix-seal-plan-v1.json" (self.lib.mkPlan cfg.planObjects);
       description = "Canonical compiled plan.v1 JSON used to derive and verify target policy.";
+    };
+    planObjects = mkOption {
+      type = types.nullOr types.attrs;
+      default = null;
+      description = ''
+        Public Nix plan collections compiled by `nixSeal.lib.mkPlan` when
+        `planFile` is not supplied. Plaintext secret values, prompts, and
+        private identities must never be placed in this option.
+      '';
     };
     allowedClockSkew = mkOption {
       type = types.ints.between 0 86400;
