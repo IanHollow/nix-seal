@@ -177,6 +177,8 @@ enum Command {
     Artifact(ArtifactCommand),
     /// Explicitly create or verify a target-encrypted cache artifact.
     Rekey(RekeyArgs),
+    /// Dry-run-first creation or verification of every target artifact.
+    Provision(ProvisionArgs),
     /// Generate plan-declared canonical ciphertext using a built-in Rust generator.
     Generate(GenerateArgs),
     /// Internal authenticated runtime activation entrypoint.
@@ -430,6 +432,39 @@ struct RekeyArgs {
     /// Override the standard XDG cache root.
     #[arg(long)]
     cache_root: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ProvisionArgs {
+    /// Canonical compiled plan.v1 JSON.
+    #[arg(long, default_value = "plan.v1.json")]
+    plan: PathBuf,
+    /// Repository root used to resolve canonical relative ciphertext paths.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Administrator X25519 identity. Required only when this target has
+    /// rekeyed secrets; direct artifacts are staged without decrypting them.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Bound target ID whose complete artifact set is provisioned.
+    #[arg(long)]
+    target: nix_seal_core::Id,
+    /// Monotonic artifact generation applied to the complete target set.
+    #[arg(long)]
+    generation: u64,
+    /// Separate Ed25519 artifact-approval key.
+    #[arg(long)]
+    signing_key: PathBuf,
+    /// Optional approval expiry as Unix seconds.
+    #[arg(long)]
+    expires_at: Option<u64>,
+    /// Override the standard XDG cache root.
+    #[arg(long)]
+    cache_root: Option<PathBuf>,
+    /// Perform cache writes. Without this flag, validate and print a public
+    /// target-wide provisioning plan without changing state.
+    #[arg(long)]
+    execute: bool,
 }
 
 #[derive(Args)]
@@ -749,6 +784,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Group(command) => run_group(command, cli.json)?,
         Command::Artifact(command) => run_artifact(command, cli.json)?,
         Command::Rekey(arguments) => run_rekey(arguments, cli.json)?,
+        Command::Provision(arguments) => run_provision(arguments, cli.json)?,
         Command::Generate(arguments) => run_generate(&arguments, cli.json)?,
         Command::Activate(arguments) => run_activate(&arguments, cli.json)?,
         Command::Secret(command) => run_secret(command, cli.json)?,
@@ -3292,76 +3328,40 @@ fn run_rekey(arguments: RekeyArgs, json: bool) -> Result<()> {
             arguments.secret, arguments.target
         )
     })?;
-    let source = arguments.repository_root.join(&secret_policy.source);
     let signing_key = read_signing_key(&arguments.signing_key)?;
-    let signing_public = signing_key.encode_public();
-    if !secret_policy
-        .approval
-        .signers
-        .values()
-        .any(|public| public == &signing_public)
+    ensure_signing_key_authorized(secret_policy, &signing_key, &arguments.secret)?;
+    let issued_at = issue_time(arguments.expires_at)?;
+    if matches!(secret_policy.delivery, nix_seal_core::DeliveryMode::Direct)
+        && arguments.identity.is_some()
     {
         bail!(
-            "signing key is not authorized by the approval policy for secret {}",
-            arguments.secret
+            "--identity is not accepted for direct delivery; staging never decrypts canonical ciphertext"
         );
     }
-    let issued_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_secs();
-    if arguments
-        .expires_at
-        .is_some_and(|expiry| expiry <= issued_at)
-    {
-        bail!("--expires-at must be later than the current time");
+    let identity = arguments
+        .identity
+        .as_deref()
+        .map(read_identity)
+        .transpose()?;
+    if matches!(secret_policy.delivery, nix_seal_core::DeliveryMode::Rekeyed) {
+        ensure_rekey_identity_authorized(&plan, &arguments.secret, identity.as_ref())?;
     }
     let root = arguments.cache_root.unwrap_or_else(default_cache_root);
     let cache = nix_seal_cache::Cache::open(root)?;
-    let (result, delivery) = match secret_policy.delivery {
-        nix_seal_core::DeliveryMode::Rekeyed => {
-            let identity_path = arguments.identity.as_deref().context(
-                "--identity is required to rekey administrator-encrypted canonical ciphertext",
-            )?;
-            let identity = read_identity(identity_path)?;
-            let request = nix_seal_rekey::RekeyRequest {
-                source: &source,
-                administrator_identity: &identity,
-                target_recipient: &policy.recipient,
-                plan_hash: &policy.plan_hash,
-                target_policy_hash: &target_policy_hash,
-                target_id: &arguments.target,
-                secret_id: &arguments.secret,
-                artifact_generation: arguments.generation,
-                issued_at,
-                expires_at: arguments.expires_at,
-                tool_version: env!("CARGO_PKG_VERSION"),
-                signing_key: &signing_key,
-            };
-            (nix_seal_rekey::rekey(&cache, &request)?, "rekeyed")
-        }
-        nix_seal_core::DeliveryMode::Direct => {
-            if arguments.identity.is_some() {
-                bail!(
-                    "--identity is not accepted for direct delivery; staging never decrypts canonical ciphertext"
-                );
-            }
-            let request = nix_seal_rekey::DirectRequest {
-                source: &source,
-                target_recipient: &policy.recipient,
-                plan_hash: &policy.plan_hash,
-                target_policy_hash: &target_policy_hash,
-                target_id: &arguments.target,
-                secret_id: &arguments.secret,
-                artifact_generation: arguments.generation,
-                issued_at,
-                expires_at: arguments.expires_at,
-                tool_version: env!("CARGO_PKG_VERSION"),
-                signing_key: &signing_key,
-            };
-            (nix_seal_rekey::stage_direct(&cache, &request)?, "direct")
-        }
-    };
+    let (result, delivery) = create_target_artifact(
+        &cache,
+        &policy,
+        &target_policy_hash,
+        secret_policy,
+        &arguments.repository_root,
+        &arguments.target,
+        &arguments.secret,
+        identity.as_ref(),
+        arguments.generation,
+        issued_at,
+        arguments.expires_at,
+        &signing_key,
+    )?;
     if json {
         println!(
             "{}",
@@ -3396,6 +3396,234 @@ fn run_rekey(arguments: RekeyArgs, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_target_artifact(
+    cache: &nix_seal_cache::Cache,
+    policy: &nix_seal_policy::TargetPolicyV1,
+    target_policy_hash: &str,
+    secret_policy: &nix_seal_policy::TargetSecretPolicyV1,
+    repository_root: &Path,
+    target: &nix_seal_core::Id,
+    secret: &nix_seal_core::Id,
+    administrator_identity: Option<&SecretString>,
+    generation: u64,
+    issued_at: u64,
+    expires_at: Option<u64>,
+    signing_key: &nix_seal_manifest::ApprovalSigningKey,
+) -> Result<(nix_seal_rekey::RekeyResult, &'static str)> {
+    let source = existing_secret_path(repository_root, &secret_policy.source)?;
+    match secret_policy.delivery {
+        nix_seal_core::DeliveryMode::Rekeyed => {
+            let administrator_identity = administrator_identity.context(
+                "--identity is required to rekey administrator-encrypted canonical ciphertext",
+            )?;
+            let request = nix_seal_rekey::RekeyRequest {
+                source: &source,
+                administrator_identity,
+                target_recipient: &policy.recipient,
+                plan_hash: &policy.plan_hash,
+                target_policy_hash,
+                target_id: target,
+                secret_id: secret,
+                artifact_generation: generation,
+                issued_at,
+                expires_at,
+                tool_version: env!("CARGO_PKG_VERSION"),
+                signing_key,
+            };
+            Ok((nix_seal_rekey::rekey(cache, &request)?, "rekeyed"))
+        }
+        nix_seal_core::DeliveryMode::Direct => {
+            let request = nix_seal_rekey::DirectRequest {
+                source: &source,
+                target_recipient: &policy.recipient,
+                plan_hash: &policy.plan_hash,
+                target_policy_hash,
+                target_id: target,
+                secret_id: secret,
+                artifact_generation: generation,
+                issued_at,
+                expires_at,
+                tool_version: env!("CARGO_PKG_VERSION"),
+                signing_key,
+            };
+            Ok((nix_seal_rekey::stage_direct(cache, &request)?, "direct"))
+        }
+    }
+}
+
+fn ensure_signing_key_authorized(
+    secret_policy: &nix_seal_policy::TargetSecretPolicyV1,
+    signing_key: &nix_seal_manifest::ApprovalSigningKey,
+    secret: &nix_seal_core::Id,
+) -> Result<()> {
+    let signing_public = signing_key.encode_public();
+    if !secret_policy
+        .approval
+        .signers
+        .values()
+        .any(|public| public == &signing_public)
+    {
+        bail!("signing key is not authorized by the approval policy for secret {secret}");
+    }
+    Ok(())
+}
+
+fn ensure_rekey_identity_authorized(
+    plan: &nix_seal_core::PlanV1,
+    secret: &nix_seal_core::Id,
+    identity: Option<&SecretString>,
+) -> Result<()> {
+    let identity = identity
+        .context("--identity is required to rekey administrator-encrypted canonical ciphertext")?;
+    let actual = nix_seal_crypto::recipient_from_identity(identity)?;
+    let recipients = nix_seal_policy::secret_recipients(plan, secret)?;
+    let authorized = recipients.recipients.values().any(|candidate| {
+        nix_seal_crypto::normalize_recipient(candidate).is_ok_and(|candidate| candidate == actual)
+    });
+    if !authorized {
+        bail!(
+            "identity is not an authorized administrator or recovery recipient for secret {secret}"
+        );
+    }
+    Ok(())
+}
+
+fn issue_time(expires_at: Option<u64>) -> Result<u64> {
+    let issued_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    if expires_at.is_some_and(|expiry| expiry <= issued_at) {
+        bail!("--expires-at must be later than the current time");
+    }
+    Ok(issued_at)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_provision(arguments: ProvisionArgs, json: bool) -> Result<()> {
+    let plan = read_plan_bounded(&arguments.plan)?;
+    let policy = nix_seal_policy::target_policy(&plan, &arguments.target)?;
+    let target_policy_hash = nix_seal_policy::target_policy_hash(&policy)?;
+    let signing_key = read_signing_key(&arguments.signing_key)?;
+    let issued_at = issue_time(arguments.expires_at)?;
+    let identity = arguments
+        .identity
+        .as_deref()
+        .map(read_identity)
+        .transpose()?;
+
+    let mut prepared = Vec::with_capacity(policy.secrets.len());
+    for (secret, secret_policy) in &policy.secrets {
+        ensure_signing_key_authorized(secret_policy, &signing_key, secret)?;
+        if matches!(secret_policy.delivery, nix_seal_core::DeliveryMode::Rekeyed) {
+            ensure_rekey_identity_authorized(&plan, secret, identity.as_ref())?;
+        }
+        let path = existing_secret_path(&arguments.repository_root, &secret_policy.source)?;
+        let file = open_public_ciphertext(&path)?;
+        nix_seal_crypto::validate_ciphertext_header(file)
+            .with_context(|| format!("canonical ciphertext for {secret} is malformed"))?;
+        prepared.push((
+            secret.clone(),
+            secret_policy,
+            canonical_ciphertext_hash(&arguments.repository_root, &secret_policy.source)?,
+            nix_seal_crypto::recipient_fingerprint(&policy.recipient)?,
+        ));
+    }
+
+    if !arguments.execute {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema":"nix-seal.provision.v1",
+                    "executed":false,
+                    "target":arguments.target,
+                    "planHash":policy.plan_hash,
+                    "generation":arguments.generation,
+                    "artifacts":prepared.iter().map(|(secret, secret_policy, source_hash, recipient)| serde_json::json!({
+                        "secretId":secret,
+                        "delivery":secret_policy.delivery,
+                        "sourceCiphertextHash":source_hash,
+                        "recipientFingerprint":recipient
+                    })).collect::<Vec<_>>()
+                })
+            );
+        } else {
+            println!(
+                "validated {} target artifact(s) for {}; rerun with --execute to write the ciphertext cache",
+                prepared.len(),
+                arguments.target
+            );
+            for (secret, secret_policy, _, _) in &prepared {
+                println!("{}\t{}", secret, delivery_name(&secret_policy.delivery));
+            }
+        }
+        return Ok(());
+    }
+
+    let root = arguments.cache_root.unwrap_or_else(default_cache_root);
+    let cache = nix_seal_cache::Cache::open(root)?;
+    let mut artifacts = Vec::with_capacity(prepared.len());
+    for (secret, secret_policy, _, _) in prepared {
+        let (result, delivery) = create_target_artifact(
+            &cache,
+            &policy,
+            &target_policy_hash,
+            secret_policy,
+            &arguments.repository_root,
+            &arguments.target,
+            &secret,
+            identity.as_ref(),
+            arguments.generation,
+            issued_at,
+            arguments.expires_at,
+            &signing_key,
+        )?;
+        artifacts.push((secret, delivery, result));
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.provision.v1",
+                "executed":true,
+                "target":arguments.target,
+                "planHash":policy.plan_hash,
+                "generation":arguments.generation,
+                "artifacts":artifacts.iter().map(|(secret, delivery, result)| serde_json::json!({
+                    "secretId":secret,
+                    "delivery":delivery,
+                    "cacheKey":result.cache_key,
+                    "sourceCiphertextHash":result.source_ciphertext_hash,
+                    "artifactCiphertextHash":result.artifact_ciphertext_hash,
+                    "recipientFingerprint":result.recipient_fingerprint,
+                    "ciphertextPath":result.ciphertext_path,
+                    "reused":result.reused
+                })).collect::<Vec<_>>()
+            })
+        );
+    } else {
+        println!(
+            "provisioned {} target artifact(s) for {} generation {}",
+            artifacts.len(),
+            arguments.target,
+            arguments.generation
+        );
+        for (secret, delivery, result) in &artifacts {
+            println!("{}\t{}\t{}", secret, delivery, result.cache_key);
+        }
+    }
+    Ok(())
+}
+
+fn delivery_name(delivery: &nix_seal_core::DeliveryMode) -> &'static str {
+    match delivery {
+        nix_seal_core::DeliveryMode::Rekeyed => "rekeyed",
+        nix_seal_core::DeliveryMode::Direct => "direct",
+    }
 }
 
 fn verify_activation_projection(
@@ -5643,7 +5871,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn direct_delivery_rekey_stages_signed_target_artifacts_without_an_administrator_identity()
+    fn direct_delivery_rekey_and_provision_stage_without_an_administrator_identity()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let repository = temporary.path().join("repository");
@@ -5707,17 +5935,46 @@ mod tests {
         nix_seal_policy::validate(&plan)?;
         fs::write(&plan_path, nix_seal_policy::canonical_json(&plan)?)?;
 
+        run_provision(
+            ProvisionArgs {
+                plan: plan_path.clone(),
+                repository_root: repository.clone(),
+                identity: None,
+                target: target_id.clone(),
+                generation: 1,
+                signing_key: signing_path.clone(),
+                expires_at: None,
+                cache_root: Some(cache_root.clone()),
+                execute: false,
+            },
+            false,
+        )?;
+        assert!(!cache_root.exists());
         run_rekey(
             RekeyArgs {
+                plan: plan_path.clone(),
+                repository_root: repository.clone(),
+                identity: None,
+                target: target_id.clone(),
+                secret: secret_id.clone(),
+                generation: 1,
+                signing_key: signing_path.clone(),
+                expires_at: None,
+                cache_root: Some(cache_root.clone()),
+            },
+            false,
+        )?;
+        run_provision(
+            ProvisionArgs {
                 plan: plan_path,
                 repository_root: repository,
                 identity: None,
                 target: target_id,
-                secret: secret_id,
                 generation: 1,
                 signing_key: signing_path,
                 expires_at: None,
                 cache_root: Some(cache_root.clone()),
+                execute: true,
             },
             false,
         )?;

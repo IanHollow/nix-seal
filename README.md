@@ -52,6 +52,25 @@ This preserves masterless operation while retaining activation's manifest and
 approval verification; it does not reduce the documented
 historical-key-compromise risk.
 
+`nix-seal provision` applies that same policy to every secret authorized for one
+target. It is dry-run-first: without `--execute`, it validates the complete
+artifact set, signing authorization, source headers and hashes, recipient
+binding, and required administrator/recovery identity without opening or
+changing the cache. With `--execute`, it creates or verifies the signed
+ciphertext-only cache artifacts. A mixed target may supply `--identity` for its
+rekeyed secrets; direct secrets never receive or use that identity.
+
+```console
+nix-seal provision --plan plan.v1.json --target host.example --generation 4 \
+  --signing-key /private/release.signing-key --identity /private/admin.agekey
+nix-seal provision --plan plan.v1.json --target host.example --generation 4 \
+  --signing-key /private/release.signing-key --identity /private/admin.agekey \
+  --execute
+```
+
+Provisioning never transmits plaintext. Use the explicit ciphertext-only cache
+export/import flow or `nix copy` for a remote build or deployment transport.
+
 Deletion never unlinks canonical ciphertext directly. It requires `--yes` and
 atomically moves the ciphertext into a private, collision-safe
 `.nix-seal/trash/v1` tombstone containing its public secret ID, original source,
