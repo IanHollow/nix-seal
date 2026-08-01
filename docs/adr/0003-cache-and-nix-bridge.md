@@ -59,12 +59,12 @@ explicit allow-list before it can tighten this decision.
 
 The v1 cache exchange format is a directory containing only the verified
 `objects/` and `artifacts/` layouts. Export stages a new private directory and
-publishes it with one atomic no-replace rename, refusing to replace an existing destination. It
-does not copy identities, plaintext, locks, or transactions. Import is
-append-only and idempotent for byte-identical entries; a matching address with
-different ciphertext or envelope fails closed. Artifact authorization remains a
-policy/activation operation, so importing an artifact never by itself grants it
-runtime use.
+publishes it with one atomic no-replace rename, refusing to replace an existing
+destination. It does not copy identities, plaintext, locks, or transactions.
+Import is append-only and idempotent for byte-identical entries; a matching
+address with different ciphertext or envelope fails closed. Artifact
+authorization remains a policy/activation operation, so importing an artifact
+never by itself grants it runtime use.
 
 The public Nix library's `artifactBundle` helper consumes one exported target
 artifact directory and requires the exact two-member set
