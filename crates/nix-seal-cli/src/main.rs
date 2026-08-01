@@ -695,6 +695,32 @@ enum CacheCommand {
     },
 }
 
+#[derive(Args)]
+struct AgeTreeMigrationArgs {
+    /// Existing directory containing canonical `*.age` ciphertext files.
+    #[arg(long, default_value = "secrets")]
+    directory: PathBuf,
+    /// Repository root containing both the legacy and destination trees.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Repository-relative destination tree for a side-by-side import.
+    #[arg(long)]
+    destination: Option<PathBuf>,
+    /// Private identity authorized to decrypt every legacy ciphertext.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Explicit replacement recipient; repeat for each recipient.
+    #[arg(long = "recipient")]
+    recipients: Vec<String>,
+    /// Replace existing destination ciphertexts; omission is create-only.
+    #[arg(long)]
+    replace: bool,
+    /// Commit the complete preflighted migration. Without this flag the
+    /// command reports the mapping and never reads the private identity.
+    #[arg(long)]
+    execute: bool,
+}
+
 #[derive(Subcommand)]
 enum MigrateCommand {
     /// Inspect a public secretctl `secretIndex` JSON export and optionally write a new candidate plan.
@@ -712,18 +738,12 @@ enum MigrateCommand {
         #[arg(long = "signer", value_name = "ID=PUBLIC_KEY")]
         signers: Vec<String>,
     },
-    /// Inspect an agenix ciphertext tree without changing files or decrypting data.
-    Agenix {
-        /// Existing directory containing canonical `*.age` ciphertext files.
-        #[arg(long, default_value = "secrets")]
-        directory: PathBuf,
-    },
-    /// Inspect a ragenix ciphertext tree; its ciphertext layout is agenix-compatible.
-    Ragenix {
-        /// Existing directory containing canonical `*.age` ciphertext files.
-        #[arg(long, default_value = "secrets")]
-        directory: PathBuf,
-    },
+    /// Inspect or bulk-rekey an agenix ciphertext tree. The legacy tree is
+    /// never modified; import writes a side-by-side destination tree.
+    Agenix(AgeTreeMigrationArgs),
+    /// Inspect or bulk-rekey a ragenix ciphertext tree; its ciphertext layout
+    /// is agenix-compatible.
+    Ragenix(AgeTreeMigrationArgs),
     /// Inspect a strict public agenix-rekey configuration export without decrypting data.
     AgenixRekey {
         /// JSON produced by `nixSeal.lib.agenixRekeyMigrationExport`.
@@ -1503,8 +1523,8 @@ fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
             &signers,
             json,
         ),
-        MigrateCommand::Agenix { directory } => migrate_agenix_tree(&directory, "agenix", json),
-        MigrateCommand::Ragenix { directory } => migrate_agenix_tree(&directory, "ragenix", json),
+        MigrateCommand::Agenix(arguments) => migrate_agenix_tree(&arguments, "agenix", json),
+        MigrateCommand::Ragenix(arguments) => migrate_agenix_tree(&arguments, "ragenix", json),
         MigrateCommand::AgenixRekey { metadata } => migrate_agenix_rekey_export(&metadata, json),
         MigrateCommand::SopsJson { directory } => migrate_sops_json_tree(&directory, json),
         MigrateCommand::Sops {
@@ -1993,6 +2013,80 @@ fn terminate_child_process_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn resolve_migration_repository_root(path: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "could not inspect migration repository root {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        bail!("migration repository root must be a non-symlink directory");
+    }
+    path.canonicalize()
+        .context("could not canonicalize migration repository root")
+}
+
+fn validate_migration_relative_path(path: &Path, label: &str) -> Result<()> {
+    if path.is_absolute()
+        || path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("migration {label} must be a non-empty repository-relative normal path");
+    }
+    Ok(())
+}
+
+fn resolve_migration_directory(repository_root: &Path, relative: &Path) -> Result<PathBuf> {
+    let root = resolve_migration_repository_root(repository_root)?;
+    let directory = if relative.as_os_str().is_empty() || relative == Path::new(".") {
+        root.clone()
+    } else {
+        validate_migration_relative_path(relative, "directory")?;
+        let mut current = root.clone();
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                bail!("migration directory must be a normal repository-relative path");
+            };
+            current.push(name);
+            let metadata = fs::symlink_metadata(&current).with_context(|| {
+                format!(
+                    "could not inspect migration directory {}",
+                    current.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                bail!("migration directory contains a symlink or non-directory entry");
+            }
+        }
+        current
+    };
+    let canonical = directory
+        .canonicalize()
+        .context("could not canonicalize migration directory")?;
+    if !canonical.starts_with(&root) {
+        bail!("migration directory escaped the repository root");
+    }
+    Ok(canonical)
+}
+
+fn normalize_migration_recipients(recipients: &[String]) -> Result<Vec<String>> {
+    if recipients.is_empty() || recipients.len() > 256 {
+        bail!("bulk migration requires between one and 256 replacement recipients");
+    }
+    let mut normalized = BTreeSet::new();
+    for recipient in recipients {
+        let recipient = nix_seal_crypto::normalize_recipient(recipient)
+            .context("bulk migration recipient is invalid")?;
+        if !normalized.insert(recipient) {
+            bail!("bulk migration recipients must be distinct");
+        }
+    }
+    Ok(normalized.into_iter().collect())
+}
+
 fn resolve_migration_regular_file(repository_root: &Path, relative: &Path) -> Result<PathBuf> {
     if relative.is_absolute()
         || relative.as_os_str().is_empty()
@@ -2042,15 +2136,35 @@ fn resolve_external_executable(path: &Path) -> Result<PathBuf> {
         .context("could not canonicalize external migration executable")
 }
 
-fn migrate_agenix_tree(directory: &Path, source: &str, json: bool) -> Result<()> {
-    let supplied_metadata = fs::symlink_metadata(directory)
-        .with_context(|| format!("could not inspect {source} ciphertext directory"))?;
-    if supplied_metadata.file_type().is_symlink() || !supplied_metadata.file_type().is_dir() {
-        bail!("{source} ciphertext root must be a non-symlink directory");
-    }
-    let root = directory
-        .canonicalize()
-        .with_context(|| format!("could not resolve {source} ciphertext directory"))?;
+#[allow(clippy::too_many_lines)]
+fn migrate_agenix_tree(arguments: &AgeTreeMigrationArgs, source: &str, json: bool) -> Result<()> {
+    let directory = &arguments.directory;
+    let import_requested = arguments.destination.is_some()
+        || arguments.identity.is_some()
+        || !arguments.recipients.is_empty()
+        || arguments.replace
+        || arguments.execute;
+    let repository_root_for_import = if import_requested {
+        let repository_root = resolve_migration_repository_root(&arguments.repository_root)?;
+        if directory.is_absolute() {
+            bail!("bulk {source} migration requires --directory to be repository-relative");
+        }
+        Some(repository_root)
+    } else {
+        None
+    };
+    let root = if let Some(repository_root) = &repository_root_for_import {
+        resolve_migration_directory(repository_root, directory)?
+    } else {
+        let supplied_metadata = fs::symlink_metadata(directory)
+            .with_context(|| format!("could not inspect {source} ciphertext directory"))?;
+        if supplied_metadata.file_type().is_symlink() || !supplied_metadata.file_type().is_dir() {
+            bail!("{source} ciphertext root must be a non-symlink directory");
+        }
+        directory
+            .canonicalize()
+            .with_context(|| format!("could not resolve {source} ciphertext directory"))?
+    };
     let metadata = fs::symlink_metadata(&root)?;
     if !metadata.file_type().is_dir() {
         bail!("{source} ciphertext root is not a directory");
@@ -2060,43 +2174,148 @@ fn migrate_agenix_tree(directory: &Path, source: &str, json: bool) -> Result<()>
     if ciphertexts.is_empty() {
         bail!("{source} ciphertext directory contains no .age files");
     }
+    let (repository_root, source_relative_root, destination_root, replacement_recipients) =
+        if import_requested {
+            let repository_root = repository_root_for_import
+                .clone()
+                .context("bulk migration repository root was not initialized")?;
+            let source_relative_root = root
+                .strip_prefix(&repository_root)
+                .context("legacy ciphertext directory escaped repository root")?
+                .to_owned();
+            let destination = arguments
+                .destination
+                .as_deref()
+                .context("bulk migration requires --destination")?;
+            validate_migration_relative_path(destination, "destination")?;
+            let destination_root = destination.to_owned();
+            let destination_lexical = repository_root.join(&destination_root);
+            if destination_lexical.starts_with(&root) || root.starts_with(&destination_lexical) {
+                bail!("bulk migration destination must be side-by-side with the legacy tree");
+            }
+            let identity = arguments
+                .identity
+                .as_deref()
+                .context("bulk migration requires --identity")?;
+            if !identity.is_absolute() {
+                bail!("bulk migration identity must be an absolute private path");
+            }
+            let replacement_recipients = normalize_migration_recipients(&arguments.recipients)?;
+            (
+                repository_root,
+                source_relative_root,
+                destination_root,
+                replacement_recipients,
+            )
+        } else {
+            (PathBuf::new(), PathBuf::new(), PathBuf::new(), Vec::new())
+        };
+    let mut entries = Vec::with_capacity(ciphertexts.len());
     let mappings = ciphertexts
         .iter()
         .map(|path| {
             let relative = path
                 .strip_prefix(&root)
-                .context("agenix ciphertext escaped its canonical root")?;
+                .context("agenix ciphertext escaped its canonical root")?
+                .to_owned();
             let stem = relative.with_extension("");
             let legacy_id = stem
                 .to_str()
                 .context("agenix ciphertext path is not UTF-8")?;
-            Ok(serde_json::json!({
+            let nix_seal_id = migrated_id(&format!("{source}/{legacy_id}"))?;
+            let mut mapping = serde_json::json!({
                 "legacyId":legacy_id,
-                "nixSealId":migrated_id(&format!("{source}/{legacy_id}"))?,
+                "nixSealId":nix_seal_id,
                 "source":relative,
-            }))
+            });
+            if import_requested {
+                let source_relative = source_relative_root.join(&relative);
+                let destination = destination_root.join(&relative);
+                mapping["destination"] = serde_json::json!(destination);
+                entries.push((source_relative, destination));
+            }
+            Ok(mapping)
         })
         .collect::<Result<Vec<_>>>()?;
-    let warnings = vec![
-        "dry run only: no ciphertext, configuration, or source manager was changed",
-        "ciphertext headers were validated but recipient policy is not encoded in agenix ciphertext paths; supply an explicit nix-seal recipient and target mapping before import",
-        "only regular .age files were accepted; symlinks and non-regular entries are rejected",
-    ];
+    let warnings = if import_requested {
+        vec![
+            if arguments.execute {
+                "side-by-side migration committed only after every source was staged and round-trip verified"
+            } else {
+                "dry run only: no ciphertext, configuration, or source manager was changed"
+            },
+            "recipient policy is explicit for every migrated ciphertext; the legacy tree remains available for rollback and comparison",
+            "only regular .age files were accepted; symlinks and non-regular entries are rejected",
+        ]
+    } else {
+        vec![
+            "dry run only: no ciphertext, configuration, or source manager was changed",
+            "ciphertext headers were validated but recipient policy is not encoded in agenix ciphertext paths; provide an explicit nix-seal recipient and target mapping before import",
+            "only regular .age files were accepted; symlinks and non-regular entries are rejected",
+        ]
+    };
+    let mut mappings = mappings;
+    if import_requested && arguments.execute {
+        let identity_path = arguments
+            .identity
+            .as_deref()
+            .context("bulk migration identity was not provided")?;
+        let identity = read_identity(identity_path)?;
+        let writes = entries
+            .iter()
+            .map(
+                |(relative_source, destination)| nix_seal_authoring::BatchRekeyWrite {
+                    relative_source,
+                    relative_destination: destination,
+                    recipients: &replacement_recipients,
+                },
+            )
+            .collect::<Vec<_>>();
+        let results = nix_seal_authoring::rekey_secret_batch(
+            &repository_root,
+            &writes,
+            &identity,
+            if arguments.replace {
+                nix_seal_authoring::WriteMode::Replace
+            } else {
+                nix_seal_authoring::WriteMode::Create
+            },
+        )?;
+        for (mapping, result) in mappings.iter_mut().zip(results) {
+            mapping["ciphertextHash"] = serde_json::json!(result.ciphertext_hash);
+            mapping["plaintextBytes"] = serde_json::json!(result.plaintext_bytes);
+        }
+    }
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "schema":"nix-seal.migration-report.v1",
                 "source":source,
-                "dryRun":true,
+                "dryRun":!import_requested || !arguments.execute,
+                "recipientPolicy":if import_requested { serde_json::json!({"recipients":&replacement_recipients}) } else { serde_json::Value::Null },
                 "secrets":mappings,
                 "warnings":warnings
             })
         );
     } else {
-        println!("{source} dry-run: {} ciphertexts mapped", mappings.len());
+        println!(
+            "{source} {}: {} ciphertexts mapped",
+            if import_requested && arguments.execute {
+                "migration"
+            } else {
+                "dry-run"
+            },
+            mappings.len()
+        );
         for warning in warnings {
             eprintln!("warning: {warning}");
+        }
+        if import_requested {
+            eprintln!(
+                "replacement recipient policy: {} recipient(s)",
+                replacement_recipients.len()
+            );
         }
         for mapping in mappings {
             println!(
@@ -8414,6 +8633,56 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
     }
 
     #[test]
+    fn agenix_migration_bulk_rekeys_side_by_side_only_after_dry_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        let legacy = repository.join("legacy");
+        std::fs::create_dir_all(&legacy)?;
+        let (identity, administrator_recipient) = nix_seal_crypto::generate_x25519();
+        let (_, target_recipient) = nix_seal_crypto::generate_x25519();
+        let identity_path = temporary.path().join("administrator.agekey");
+        write_new_private(&identity_path, identity.expose_secret().as_bytes())?;
+        let source_recipients = vec![administrator_recipient.clone()];
+        for (name, value) in [
+            ("one", b"one-value".as_slice()),
+            ("two", b"two-value".as_slice()),
+        ] {
+            let path = legacy.join(format!("{name}.age"));
+            let mut output = std::fs::File::create(path)?;
+            nix_seal_crypto::encrypt(value, &mut output, &source_recipients)?;
+            output.sync_all()?;
+        }
+        let common = || AgeTreeMigrationArgs {
+            directory: PathBuf::from("legacy"),
+            repository_root: repository.clone(),
+            destination: Some(PathBuf::from("migrated")),
+            identity: Some(identity_path.clone()),
+            recipients: vec![administrator_recipient.clone(), target_recipient.clone()],
+            replace: false,
+            execute: false,
+        };
+        migrate_agenix_tree(&common(), "agenix", true)?;
+        assert!(!repository.join("migrated/one.age").exists());
+        assert!(!repository.join("migrated/two.age").exists());
+
+        let mut execute = common();
+        execute.execute = true;
+        migrate_agenix_tree(&execute, "agenix", true)?;
+        assert!(repository.join("migrated/one.age").is_file());
+        assert!(repository.join("migrated/two.age").is_file());
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(
+            std::fs::File::open(repository.join("migrated/one.age"))?,
+            &mut plaintext,
+            &identity,
+        )?;
+        assert_eq!(plaintext, b"one-value");
+        assert!(repository.join("legacy/one.age").is_file());
+        Ok(())
+    }
+
+    #[test]
     fn sops_json_migration_accepts_bounded_age_metadata() -> Result<(), Box<dyn std::error::Error>>
     {
         let temporary = tempfile::tempdir()?;
@@ -8483,7 +8752,22 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         let outside = tempfile::tempdir()?;
         let linked = temporary.path().join("secrets");
         symlink(outside.path(), &linked)?;
-        assert!(migrate_agenix_tree(&linked, "agenix", false).is_err());
+        assert!(
+            migrate_agenix_tree(
+                &AgeTreeMigrationArgs {
+                    directory: linked,
+                    repository_root: PathBuf::from("."),
+                    destination: None,
+                    identity: None,
+                    recipients: Vec::new(),
+                    replace: false,
+                    execute: false,
+                },
+                "agenix",
+                false,
+            )
+            .is_err()
+        );
         Ok(())
     }
 

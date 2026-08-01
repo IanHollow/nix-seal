@@ -43,6 +43,18 @@ pub struct BatchSecretWrite<'a> {
     pub recipients: &'a [String],
 }
 
+/// One legacy age ciphertext to stream into a new recipient set as part of an
+/// all-or-recover migration transaction.
+pub struct BatchRekeyWrite<'a> {
+    /// Repository-relative source ciphertext. It is opened with no-follow
+    /// semantics and is never modified or removed.
+    pub relative_source: &'a Path,
+    /// Repository-relative destination ciphertext.
+    pub relative_destination: &'a Path,
+    /// Explicit replacement recipients selected by the migration policy.
+    pub recipients: &'a [String],
+}
+
 /// One unencrypted public output staged as part of a mixed generation
 /// transaction. Public outputs are still written atomically and are never
 /// allowed to collide with canonical ciphertext destinations.
@@ -362,6 +374,124 @@ pub fn rekey_secret(
         ciphertext_hash,
         plaintext_bytes: verified.bytes,
     })
+}
+
+/// Streams and verifies a bounded set of legacy age ciphertexts into fresh
+/// recipients, then commits every destination as one recoverable transaction.
+///
+/// Sources are fully read and decrypted into staged ciphertext before any
+/// destination is changed. Existing destinations are moved to private
+/// same-directory backups and restored if any later commit fails. This keeps a
+/// partially completed migration from looking successful while preserving the
+/// legacy source manager for side-by-side rollback.
+pub fn rekey_secret_batch(
+    repository_root: &Path,
+    writes: &[BatchRekeyWrite<'_>],
+    verification_identity: &SecretString,
+    mode: WriteMode,
+) -> Result<Vec<AuthoringResult>, AuthoringError> {
+    if writes.is_empty() || writes.len() > 10_000 {
+        return Err(AuthoringError::UnsafePath);
+    }
+
+    let mut prepared = Vec::with_capacity(writes.len());
+    let mut sources = BTreeSet::new();
+    let mut destinations = BTreeSet::new();
+    let mut source_states = Vec::with_capacity(writes.len());
+    for write in writes {
+        if write.recipients.is_empty()
+            || !write.recipients.iter().any(|recipient| {
+                nix_seal_crypto::identity_matches_recipient(verification_identity, recipient)
+            })
+        {
+            return Err(AuthoringError::VerificationIdentity);
+        }
+        let source = resolve_existing(repository_root, write.relative_source)?;
+        let source_metadata = std::fs::symlink_metadata(&source).map_err(AuthoringError::Io)?;
+        let destination = resolve_destination(repository_root, write.relative_destination)?;
+        if !sources.insert(source.clone()) || !destinations.insert(destination.clone()) {
+            return Err(AuthoringError::DestinationState);
+        }
+        let previous = validate_destination(&destination, mode)?;
+        let parent = destination
+            .parent()
+            .ok_or(AuthoringError::UnsafePath)?
+            .to_owned();
+        let mut staged = NamedTempFile::new_in(&parent).map_err(AuthoringError::Io)?;
+        set_private(staged.path()).map_err(AuthoringError::Io)?;
+        nix_seal_crypto::rekey(
+            open_nofollow_regular(&source)?,
+            staged.as_file_mut(),
+            verification_identity,
+            write.recipients,
+        )?;
+        staged.as_file().sync_all().map_err(AuthoringError::Io)?;
+        staged.as_file_mut().rewind().map_err(AuthoringError::Io)?;
+        let mut verified = HashingWriter::default();
+        nix_seal_crypto::decrypt(staged.as_file_mut(), &mut verified, verification_identity)?;
+        staged.as_file_mut().rewind().map_err(AuthoringError::Io)?;
+        let ciphertext_hash = hash_file(staged.as_file_mut())?;
+        prepared.push(PreparedBatchWrite {
+            destination: destination.clone(),
+            parent,
+            previous,
+            staged: Some(staged),
+            result: AuthoringResult {
+                path: destination,
+                ciphertext_hash,
+                plaintext_bytes: verified.bytes,
+            },
+        });
+        source_states.push((source, source_metadata));
+    }
+
+    // Bulk migrations must be side-by-side. A destination that is also a
+    // source could make one staged mapping invalidate another legacy input;
+    // the single-file API remains available for an explicit in-place rekey.
+    if sources.intersection(&destinations).next().is_some() {
+        return Err(AuthoringError::UnsafePath);
+    }
+
+    // A source replacement racing the staging pass must never be silently
+    // accepted. The source manager remains authoritative until commit.
+    for (source, metadata) in &source_states {
+        ensure_unchanged(source, Some(metadata))?;
+    }
+    for item in &prepared {
+        match mode {
+            WriteMode::Create if item.destination.exists() => {
+                return Err(AuthoringError::DestinationState);
+            }
+            WriteMode::Replace => ensure_unchanged(&item.destination, item.previous.as_ref())?,
+            WriteMode::Create => {}
+        }
+    }
+
+    let mut backups = Vec::with_capacity(prepared.len());
+    for item in &prepared {
+        if mode == WriteMode::Create {
+            backups.push(None);
+            continue;
+        }
+        let backup = NamedTempFile::new_in(&item.parent).map_err(AuthoringError::Io)?;
+        set_private(backup.path()).map_err(AuthoringError::Io)?;
+        let backup = backup.into_temp_path();
+        if std::fs::rename(&item.destination, &backup).is_err() {
+            if restore_batch(&prepared, &mut backups, &[]) {
+                return Err(AuthoringError::BatchRolledBack);
+            }
+            return Err(AuthoringError::BatchRecoveryUnknown);
+        }
+        backups.push(Some(backup));
+    }
+    let results = commit_prepared_batch(&mut prepared, mode, &mut backups)?;
+    drop(backups);
+    for item in &prepared {
+        File::open(&item.parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| AuthoringError::DurabilityUnknown)?;
+    }
+    Ok(results)
 }
 
 /// Stages, verifies, and durably commits a group of ciphertext outputs.
@@ -1516,6 +1646,100 @@ mod tests {
             &administrator_identity,
         )?;
         assert_eq!(plaintext, b"streamed-migration-value");
+        Ok(())
+    }
+
+    #[test]
+    fn batch_rekey_commits_all_outputs_and_preserves_sources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let (administrator_identity, administrator_recipient) = nix_seal_crypto::generate_x25519();
+        let (_, target_recipient) = nix_seal_crypto::generate_x25519();
+        let source_recipients = vec![administrator_recipient.clone()];
+        for (name, value) in [
+            ("one", b"one-value".as_slice()),
+            ("two", b"two-value".as_slice()),
+        ] {
+            write_secret(
+                &root,
+                &PathBuf::from(format!("legacy/{name}.age")),
+                value,
+                &source_recipients,
+                &administrator_identity,
+                WriteMode::Create,
+            )?;
+        }
+        let destination_recipients = vec![administrator_recipient, target_recipient];
+        let writes = [
+            BatchRekeyWrite {
+                relative_source: Path::new("legacy/one.age"),
+                relative_destination: Path::new("nix-seal/one.age"),
+                recipients: &destination_recipients,
+            },
+            BatchRekeyWrite {
+                relative_source: Path::new("legacy/two.age"),
+                relative_destination: Path::new("nix-seal/two.age"),
+                recipients: &destination_recipients,
+            },
+        ];
+        let results =
+            rekey_secret_batch(&root, &writes, &administrator_identity, WriteMode::Create)?;
+        assert_eq!(results.len(), 2);
+        assert!(root.join("legacy/one.age").is_file());
+        assert!(root.join("legacy/two.age").is_file());
+        for (path, expected) in [
+            (root.join("nix-seal/one.age"), b"one-value".as_slice()),
+            (root.join("nix-seal/two.age"), b"two-value".as_slice()),
+        ] {
+            let mut plaintext = Vec::new();
+            nix_seal_crypto::decrypt(File::open(path)?, &mut plaintext, &administrator_identity)?;
+            assert_eq!(plaintext, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batch_rekey_rejects_destination_source_overlap_before_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        let recipients = vec![recipient];
+        write_secret(
+            &root,
+            Path::new("legacy/one.age"),
+            b"one".as_slice(),
+            &recipients,
+            &identity,
+            WriteMode::Create,
+        )?;
+        write_secret(
+            &root,
+            Path::new("legacy/two.age"),
+            b"two".as_slice(),
+            &recipients,
+            &identity,
+            WriteMode::Create,
+        )?;
+        let writes = [
+            BatchRekeyWrite {
+                relative_source: Path::new("legacy/one.age"),
+                relative_destination: Path::new("new/one.age"),
+                recipients: &recipients,
+            },
+            BatchRekeyWrite {
+                relative_source: Path::new("new/one.age"),
+                relative_destination: Path::new("new/two.age"),
+                recipients: &recipients,
+            },
+        ];
+        assert!(matches!(
+            rekey_secret_batch(&root, &writes, &identity, WriteMode::Create),
+            Err(AuthoringError::Io(_) | AuthoringError::UnsafePath)
+        ));
+        assert!(!root.join("new/one.age").exists());
+        assert!(root.join("legacy/one.age").exists());
         Ok(())
     }
 

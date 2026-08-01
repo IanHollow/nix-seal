@@ -519,6 +519,14 @@ nix-seal migrate secretctl --index /tmp/secretctl-index.json --json
 nix-seal migrate agenix --directory ./secrets --json
 # ragenix uses the same standard age ciphertext inventory format
 nix-seal migrate ragenix --directory ./secrets --json
+# bulk import is side-by-side and remains dry-run-first
+nix-seal migrate agenix --repository-root . --directory legacy/secrets \
+  --destination secrets/nix-seal --identity /absolute/private/admin.agekey \
+  --recipient age1admin... --recipient age1recovery... --json
+# add --execute only after reviewing every mapping and recipient
+nix-seal migrate agenix --repository-root . --directory legacy/secrets \
+  --destination secrets/nix-seal --identity /absolute/private/admin.agekey \
+  --recipient age1admin... --recipient age1recovery... --execute
 # inspect an evaluated agenix-rekey policy export without decrypting data
 nix eval --json .#agenixRekeyMigration > /tmp/agenix-rekey.json
 nix-seal migrate agenix-rekey --metadata /tmp/agenix-rekey.json --json
@@ -569,11 +577,17 @@ nix-seal migrate pgp --repository-root . --source legacy/service.pgp \
 The agenix/ragenix adapters recursively inventory only regular `*.age` files,
 validate their age headers, and reject symbolic links or unsafe nesting. Because
 recipient and Nix module policy are not recoverable from ciphertext paths, their
-reports require an explicit nix-seal target/recipient mapping before import. Use
-`migrate ciphertext --execute` only after reviewing that mapping. It streams one
-source ciphertext directly into replacement recipients, verifies the new
-ciphertext with the named identity, and atomically creates or replaces the
-destination. It never writes plaintext to the repository or Nix store.
+reports require an explicit nix-seal recipient mapping before import. Supplying
+`--destination`, `--identity`, and one or more `--recipient` values enables a
+bulk migration preflight; the identity is not opened until `--execute` is
+present. The destination must be a separate repository-relative tree. Every
+source is streamed and round-trip verified into a private staging file before
+any destination changes, then all destination files are committed with backup
+and rollback behavior. Existing legacy files and configuration are never
+rewritten, so the two managers can run side by side during activation and
+rollback verification. `--replace` is explicit and still preserves the legacy
+tree. The same flow is available for ragenix because its ciphertext layout is
+standard age-compatible.
 
 For agenix-rekey, expose one public evaluated configuration with
 `nixSeal.lib.agenixRekeyMigrationExport`. The target must declare `id`, `kind`
