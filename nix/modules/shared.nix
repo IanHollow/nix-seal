@@ -75,7 +75,7 @@ let
     ) (builtins.attrNames (configuredSecretsForPhase phase));
   serviceCredentialBindings = lib.concatMap serviceCredentialBindingsForPhase activationPhases;
   serviceCredentialKeys = map (binding: "${binding.unit}:${binding.name}") serviceCredentialBindings;
-  reloadUnitsForPhase = phase: explicitReloadUnitsForPhase phase;
+  reloadUnitsForPhase = explicitReloadUnitsForPhase;
   restartUnitsForPhase =
     phase:
     lib.unique (
@@ -83,7 +83,6 @@ let
       ++ map (binding: binding.unit) (serviceCredentialBindingsForPhase phase)
     );
   reloadUnits = lib.concatMap reloadUnitsForPhase activationPhases;
-  restartUnits = lib.concatMap restartUnitsForPhase activationPhases;
   activationDocumentFor =
     phase:
     let

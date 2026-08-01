@@ -22,20 +22,20 @@ decryption.
 
 ## Activation phases
 
-Each secret belongs to `partitioning`, `users`, `activation`, or `services`.
-The Rust activation document carries exactly one phase and rejects an artifact
-or template from another phase. Templates may reference only secrets from their
-own phase, so one phase cannot read a plaintext generation owned by another.
-The normal `activation` phase remains at `/run/nix-seal/current` on NixOS;
-other phases use isolated roots such as `/run/nix-seal/users/current`.
+Each secret belongs to `partitioning`, `users`, `activation`, or `services`. The
+Rust activation document carries exactly one phase and rejects an artifact or
+template from another phase. Templates may reference only secrets from their own
+phase, so one phase cannot read a plaintext generation owned by another. The
+normal `activation` phase remains at `/run/nix-seal/current` on NixOS; other
+phases use isolated roots such as `/run/nix-seal/users/current`.
 
 NixOS schedules `users` after `specialfs`, `activation` after account creation,
 and `services` after the normal nix-seal activation step. `users` outputs must
 remain `root:root` because user accounts may not exist yet. The generic module
 does not schedule `partitioning`: its public spec must be carried over a
-protected installer channel before the target filesystem is mounted.
-nix-darwin and Home Manager currently reject non-`activation` phases rather
-than silently running them at an unsafe point.
+protected installer channel before the target filesystem is mounted. nix-darwin
+and Home Manager currently reject non-`activation` phases rather than silently
+running them at an unsafe point.
 
 Start a repository with an empty, valid public plan; this does not generate keys
 or create secrets and refuses to overwrite an existing file:
