@@ -87,6 +87,7 @@ pkgs.testers.nixosTest {
         'owner = "root"' \
         'group = "root"' \
         'mode = "0400"' \
+        'restartUnits = ["nix-seal-test.service"]' \
         "" \
         '[templates."app/config"]' \
         'source = "template.txt"' \
