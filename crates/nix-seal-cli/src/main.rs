@@ -694,6 +694,36 @@ enum MigrateCommand {
         #[arg(long)]
         execute: bool,
     },
+    /// Stream-decrypt one legacy PGP file into a new native age ciphertext.
+    Pgp {
+        /// Existing repository root; source and destination must remain below it.
+        #[arg(long, default_value = ".")]
+        repository_root: PathBuf,
+        /// Repository-relative PGP-encrypted source document.
+        #[arg(long)]
+        source: PathBuf,
+        /// Repository-relative native nix-seal ciphertext destination.
+        #[arg(long)]
+        destination: PathBuf,
+        /// Absolute path to `GnuPG`, used only for this migration.
+        #[arg(long)]
+        gpg: PathBuf,
+        /// Private `GnuPG` home directory containing the migration identity.
+        #[arg(long)]
+        gnupg_home: PathBuf,
+        /// Private age identity authorized to verify the replacement ciphertext.
+        #[arg(long)]
+        identity: PathBuf,
+        /// Explicit canonical age recipient for the replacement; repeat as needed.
+        #[arg(long = "recipient", required = true)]
+        recipients: Vec<String>,
+        /// Replace an existing destination; omission is create-only.
+        #[arg(long)]
+        replace: bool,
+        /// Required acknowledgement that this performs the reported mutation.
+        #[arg(long)]
+        execute: bool,
+    },
     /// Inspect Clan Vars per-machine output leaves without reading their values.
     ClanVars {
         /// Clan's `vars/per-machine` directory.
@@ -1392,6 +1422,28 @@ fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
             execute,
             json,
         ),
+        MigrateCommand::Pgp {
+            repository_root,
+            source,
+            destination,
+            gpg,
+            gnupg_home,
+            identity,
+            recipients,
+            replace,
+            execute,
+        } => migrate_pgp_document(
+            &repository_root,
+            &source,
+            &destination,
+            &gpg,
+            &gnupg_home,
+            &identity,
+            &recipients,
+            replace,
+            execute,
+            json,
+        ),
         MigrateCommand::ClanVars { directory } => migrate_clan_vars_tree(&directory, json),
         MigrateCommand::ClanFacts { directory } => migrate_clan_facts_tree(&directory, json),
         MigrateCommand::Ciphertext {
@@ -1611,6 +1663,148 @@ fn migrate_sops_document(
         );
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn migrate_pgp_document(
+    repository_root: &Path,
+    source: &Path,
+    destination: &Path,
+    gpg: &Path,
+    gnupg_home: &Path,
+    identity_path: &Path,
+    recipients: &[String],
+    replace: bool,
+    execute: bool,
+    json: bool,
+) -> Result<()> {
+    if recipients.is_empty() {
+        bail!("PGP migration requires at least one replacement recipient");
+    }
+    if !execute {
+        let report = serde_json::json!({
+            "schema":"nix-seal.migration-pgp.v1",
+            "dryRun":true,
+            "source":source,
+            "destination":destination,
+            "gpg":gpg,
+            "gnupgHome":gnupg_home,
+            "recipientCount":recipients.len(),
+            "replace":replace,
+        });
+        if json {
+            println!("{report}");
+        } else {
+            println!(
+                "PGP migration dry-run: {} -> {}",
+                source.display(),
+                destination.display()
+            );
+            eprintln!(
+                "warning: rerun with --execute only after reviewing the source, recipients, destination, and private GnuPG home"
+            );
+        }
+        return Ok(());
+    }
+
+    let source = resolve_migration_regular_file(repository_root, source)?;
+    let gpg = resolve_external_executable(gpg)?;
+    let gnupg_home = resolve_private_gnupg_home(gnupg_home)?;
+    let identity = read_identity(identity_path)?;
+    let mode = if replace {
+        nix_seal_authoring::WriteMode::Replace
+    } else {
+        nix_seal_authoring::WriteMode::Create
+    };
+
+    let mut command = ProcessCommand::new(gpg);
+    command
+        .arg("--batch")
+        .arg("--quiet")
+        .arg("--no-tty")
+        .arg("--decrypt")
+        .arg(&source)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env_clear()
+        .env("GNUPGHOME", &gnupg_home)
+        .env("LC_ALL", "C");
+    let mut child = command
+        .spawn()
+        .context("could not start the explicit GnuPG migration executable")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("GnuPG migration stdout was unavailable")?;
+    let child = Arc::new(Mutex::new(child));
+    let (complete_tx, complete_rx) = mpsc::channel();
+    let watchdog_child = Arc::clone(&child);
+    let watchdog = thread::spawn(move || {
+        if complete_rx.recv_timeout(SOPS_MIGRATION_TIMEOUT).is_err()
+            && let Ok(mut child) = watchdog_child.lock()
+            && child.try_wait().ok().flatten().is_none()
+        {
+            let _ = child.kill();
+        }
+    });
+    let result = nix_seal_authoring::write_secret_checked(
+        repository_root,
+        destination,
+        BoundedReader::new(stdout, SOPS_MIGRATION_MAX_PLAINTEXT_BYTES),
+        recipients,
+        &identity,
+        mode,
+        || wait_for_external_migration(&child, SOPS_MIGRATION_TIMEOUT),
+    );
+    let _ = complete_tx.send(());
+    let _ = watchdog.join();
+    if result.is_err() {
+        terminate_external_migration(&child);
+    }
+    let result = result?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.migration-pgp.v1",
+                "dryRun":false,
+                "source":source,
+                "destination":result.path,
+                "ciphertextHash":result.ciphertext_hash,
+                "plaintextBytes":result.plaintext_bytes,
+            })
+        );
+    } else {
+        println!(
+            "PGP document migrated {} -> {}",
+            source.display(),
+            result.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn resolve_private_gnupg_home(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("GnuPG home must be an absolute private directory path");
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("could not inspect GnuPG home {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        bail!("GnuPG home must be a non-symlink directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            bail!("GnuPG home has unsafe ownership or permissions");
+        }
+    }
+    path.canonicalize()
+        .context("could not canonicalize private GnuPG home")
 }
 
 fn wait_for_external_migration(
@@ -6366,6 +6560,33 @@ mod tests {
             &identity,
         )?;
         assert!(plaintext.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn pgp_migration_is_dry_run_first_and_requires_a_private_home_for_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let home = root.join("gnupg");
+        fs::create_dir(&home)?;
+        #[cfg(unix)]
+        set_private_directory(&home)?;
+        migrate_pgp_document(
+            &root,
+            Path::new("legacy/source.pgp"),
+            Path::new("secrets/result.age"),
+            Path::new("/not/started/in-a-dry-run"),
+            &home,
+            Path::new("/not/read/in-a-dry-run"),
+            &["age1dryrunrecipient".to_owned()],
+            false,
+            false,
+            false,
+        )?;
+        assert!(!root.join("secrets/result.age").exists());
+        assert_eq!(resolve_private_gnupg_home(&home)?, home);
+        assert!(resolve_private_gnupg_home(&root.join("missing")).is_err());
         Ok(())
     }
 

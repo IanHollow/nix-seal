@@ -319,6 +319,23 @@ compatibility path; encrypted SSH private keys are deliberately rejected in
 non-interactive workflows, so convert them to a reviewed native-age or
 hardware-backed identity before automated import.
 
+PGP is migration-only and never a native nix-seal encryption backend. Its
+dry-run-first bridge requires an absolute GnuPG executable and private,
+owner-only `GNUPGHOME`; execution clears inherited environment variables,
+suppresses GnuPG diagnostics, bounds the plaintext stream, and encrypts directly
+into a new native age file:
+
+```console
+nix-seal migrate pgp --repository-root . --source legacy/service.pgp \
+  --destination secrets/service.age --gpg /absolute/path/to/gpg \
+  --gnupg-home /private/gnupg --identity /private/administrator.agekey \
+  --recipient age1example
+nix-seal migrate pgp --repository-root . --source legacy/service.pgp \
+  --destination secrets/service.age --gpg /absolute/path/to/gpg \
+  --gnupg-home /private/gnupg --identity /private/administrator.agekey \
+  --recipient age1example --execute
+```
+
 The agenix/ragenix adapters recursively inventory only regular `*.age` files,
 validate their age headers, and reject symbolic links or unsafe nesting. Because
 recipient and Nix module policy are not recoverable from ciphertext paths, their
