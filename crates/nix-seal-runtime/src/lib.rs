@@ -2371,4 +2371,23 @@ mod tests {
         ));
         Ok(())
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_secret_destination_ancestry() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let runtime = temporary.path().join("runtime");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&outside)?;
+        let generation = Generation::begin(&runtime)?;
+        symlink(&outside, generation.transaction.path().join("db"))?;
+        let secret = Id::parse("db/password")?;
+        assert!(matches!(
+            generation.create_file(&secret, 0o400),
+            Err(RuntimeError::InvalidDestination)
+        ));
+        Ok(())
+    }
 }
