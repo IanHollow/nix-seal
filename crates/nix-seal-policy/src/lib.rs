@@ -360,6 +360,7 @@ fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
                 )));
             }
         }
+        validate_repository_only_secret(id, secret)?;
         let administrator_leaves = expand_group_leaves(plan, &secret.administrators)?;
         if administrator_leaves.iter().any(|identity_id| {
             !plan.identities.get(identity_id).is_some_and(|identity| {
@@ -422,6 +423,23 @@ fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
             )));
         }
         validate_lifecycle(id, &secret.lifecycle)?;
+    }
+    Ok(())
+}
+
+fn validate_repository_only_secret(
+    id: &Id,
+    secret: &nix_seal_core::Secret,
+) -> Result<(), PolicyError> {
+    if secret.repository_only && !secret.consumers.is_empty() {
+        return Err(PolicyError::Violation(format!(
+            "repository-only secret {id} cannot declare target consumers"
+        )));
+    }
+    if secret.repository_only && matches!(secret.delivery, DeliveryMode::Direct) {
+        return Err(PolicyError::Violation(format!(
+            "repository-only secret {id} cannot use direct delivery"
+        )));
     }
     Ok(())
 }
@@ -1394,6 +1412,68 @@ mod tests {
     }
 
     #[test]
+    fn repository_only_secrets_cannot_be_target_delivered() -> Result<(), PolicyError> {
+        let mut plan = PlanV1::default();
+        let admin = Id::parse("administrator")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let target_identity = Id::parse("target-identity")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let target =
+            Id::parse("host").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let signer =
+            Id::parse("signer").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let secret_id = Id::parse("application/intermediary")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.identities.insert(
+            admin,
+            Identity {
+                kind: IdentityKind::Administrator,
+                public: RECIPIENT.to_owned(),
+            },
+        );
+        plan.identities.insert(
+            target_identity.clone(),
+            Identity {
+                kind: IdentityKind::Target,
+                public: RECIPIENT.to_owned(),
+            },
+        );
+        plan.identities.insert(
+            signer,
+            Identity {
+                kind: IdentityKind::Signer,
+                public: SIGNER.to_owned(),
+            },
+        );
+        plan.targets.insert(
+            target.clone(),
+            Target {
+                kind: TargetKind::NixOs,
+                system: "x86_64-linux".to_owned(),
+                identity: target_identity,
+                username: None,
+                tags: Vec::new(),
+            },
+        );
+        plan.secrets.insert(
+            secret_id,
+            Secret {
+                source: "secrets/intermediary.age".to_owned(),
+                delivery: DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: vec![target],
+                phase: ActivationPhase::Activation,
+                runtime: RuntimeSettings::default(),
+                lifecycle: Lifecycle::default(),
+                repository_only: true,
+                approval_policy: None,
+            },
+        );
+        assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
+        Ok(())
+    }
+
+    #[test]
     fn duplicate_signer_keys_are_rejected_before_threshold_evaluation() -> Result<(), PolicyError> {
         let mut plan = PlanV1::default();
         let first =
@@ -1454,6 +1534,7 @@ mod tests {
                     runtime: RuntimeSettings::default(),
                     lifecycle: Lifecycle::default(),
                     approval_policy: None,
+                    repository_only: false,
                 },
             );
         }
@@ -1623,6 +1704,7 @@ mod tests {
             runtime: RuntimeSettings::default(),
             lifecycle: Lifecycle::default(),
             approval_policy: None,
+            repository_only: false,
         };
         plan.secrets.insert(secret_id.clone(), secret.clone());
         let template_id = Id::parse("application/config")
@@ -1774,6 +1856,7 @@ mod tests {
             runtime: RuntimeSettings::default(),
             lifecycle: Lifecycle::default(),
             approval_policy: None,
+            repository_only: false,
         };
         plan.secrets
             .insert(authorized_id.clone(), secret("secrets/db.age", outer_group));
@@ -1914,6 +1997,7 @@ mod tests {
                 runtime: RuntimeSettings::default(),
                 lifecycle: Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         let recipients = secret_recipients(&plan, &secret)?;
@@ -1955,6 +2039,7 @@ mod tests {
             runtime: RuntimeSettings::default(),
             lifecycle,
             approval_policy: None,
+            repository_only: false,
         };
         plan.secrets.insert(
             rotating.clone(),

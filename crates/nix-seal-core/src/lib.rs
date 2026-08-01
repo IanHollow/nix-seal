@@ -207,6 +207,9 @@ pub struct Secret {
     /// Lifecycle metadata.
     #[serde(default)]
     pub lifecycle: Lifecycle,
+    /// Keep this secret in the repository/cache but never authorize a target consumer.
+    #[serde(default)]
+    pub repository_only: bool,
     /// Approval policy `ID`.
     pub approval_policy: Option<Id>,
 }

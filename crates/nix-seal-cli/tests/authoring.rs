@@ -231,6 +231,7 @@ fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
             runtime: RuntimeSettings::default(),
             lifecycle: Lifecycle::default(),
             approval_policy: None,
+            repository_only: false,
         },
     );
     nix_seal_policy::validate(&plan)?;

@@ -2792,6 +2792,7 @@ fn build_secretctl_candidate_plan(
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
     }
@@ -6410,6 +6411,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         plan.templates.insert(
@@ -6529,6 +6531,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         nix_seal_policy::validate(&plan)?;
@@ -6764,6 +6767,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         assert_eq!(
@@ -7165,6 +7169,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         let generator = nix_seal_core::Generator {
@@ -7337,6 +7342,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         nix_seal_crypto::encrypt(
@@ -7638,6 +7644,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         plan.secrets.insert(
@@ -7651,6 +7658,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         plan.generators.insert(
@@ -7815,6 +7823,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 runtime: runtime.clone(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         plan.templates.insert(
@@ -8016,6 +8025,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         nix_seal_policy::validate(&plan)?;

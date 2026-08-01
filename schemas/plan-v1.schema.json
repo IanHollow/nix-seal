@@ -496,6 +496,11 @@
           "$ref": "#/$defs/ActivationPhase",
           "default": "activation"
         },
+        "repositoryOnly": {
+          "description": "Keep this secret in the repository/cache but never authorize a target consumer.",
+          "type": "boolean",
+          "default": false
+        },
         "runtime": {
           "description": "Runtime delivery settings.",
           "$ref": "#/$defs/RuntimeSettings",

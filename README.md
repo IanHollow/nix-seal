@@ -388,6 +388,12 @@ succeeds or fails. If an input is itself produced by another generator, that
 producer must be a direct entry in `dependencies`, making generation order
 explicit and checkable.
 
+Set a secret's `repositoryOnly` policy bit for an intermediary output that must
+remain administrator/recovery-encrypted in the repository and cache but must
+never be delivered to a target. Policy validation rejects target consumers and
+advanced direct delivery for such secrets; this explicit bit avoids relying on
+an empty consumer list as a security signal.
+
 ## Migration inspection
 
 Migration begins with a deliberately non-destructive public inventory. Export
