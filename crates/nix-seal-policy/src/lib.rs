@@ -274,6 +274,13 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
                 "identity {id} has an invalid age recipient"
             )));
         }
+        if matches!(identity.kind, IdentityKind::Signer)
+            && nix_seal_manifest::validate_public_key(&identity.public).is_err()
+        {
+            return Err(PolicyError::Violation(format!(
+                "identity {id} has an invalid approval verification key"
+            )));
+        }
     }
     let mut signer_keys = BTreeMap::new();
     for (id, identity) in &plan.identities {
@@ -1201,6 +1208,7 @@ mod tests {
     };
     use std::collections::BTreeMap;
     const RECIPIENT: &str = "age1ml79lp4sk2gz59n3xux5xhasg7p5qa0pnm634rd8pnw80avag4js2etr0l";
+    const SIGNER: &str = "nix-seal-ed25519-v1:EcFcZVkcYsuXdMDG2JyOsyuoCExdGk0yUwLVriY0Vyw=";
     #[test]
     fn empty_plan_is_stable_and_valid() -> Result<(), PolicyError> {
         let plan = PlanV1::default();
@@ -1310,7 +1318,7 @@ mod tests {
                 id,
                 nix_seal_core::Identity {
                     kind: IdentityKind::Signer,
-                    public: "same-public-key".to_owned(),
+                    public: SIGNER.to_owned(),
                 },
             );
         }
@@ -1335,6 +1343,21 @@ mod tests {
     }
 
     #[test]
+    fn signer_identities_require_a_valid_approval_key() -> Result<(), PolicyError> {
+        let mut plan = PlanV1::default();
+        let id = Id::parse("signer").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.identities.insert(
+            id,
+            Identity {
+                kind: IdentityKind::Signer,
+                public: "not-an-approval-key".to_owned(),
+            },
+        );
+        assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
+        Ok(())
+    }
+
+    #[test]
     fn templates_require_valid_secret_bindings_and_noncolliding_outputs() -> Result<(), PolicyError>
     {
         let mut plan = PlanV1::default();
@@ -1343,7 +1366,7 @@ mod tests {
                 .map_err(|error| PolicyError::Violation(error.to_string()))?,
             Identity {
                 kind: IdentityKind::Signer,
-                public: "public-signer-fixture".to_owned(),
+                public: SIGNER.to_owned(),
             },
         );
         plan.identities.insert(
@@ -1457,7 +1480,7 @@ mod tests {
             signer_id.clone(),
             Identity {
                 kind: IdentityKind::Signer,
-                public: "signer-public".to_owned(),
+                public: SIGNER.to_owned(),
             },
         );
         plan.identities.insert(
@@ -1573,10 +1596,7 @@ mod tests {
             .ok_or_else(|| PolicyError::Violation("authorized secret missing".to_owned()))?
             .approval;
         assert_eq!(approval.threshold, 1);
-        assert_eq!(
-            approval.signers.get(&signer_id),
-            Some(&"signer-public".to_owned())
-        );
+        assert_eq!(approval.signers.get(&signer_id), Some(&SIGNER.to_owned()));
         assert_eq!(
             target_policy_hash(&projection)?,
             target_policy_hash(&projection)?
@@ -1621,7 +1641,7 @@ mod tests {
         for (id, kind, public) in [
             (&admin, IdentityKind::Administrator, RECIPIENT),
             (&recovery, IdentityKind::Recovery, RECIPIENT),
-            (&signer, IdentityKind::Signer, "signer-public"),
+            (&signer, IdentityKind::Signer, SIGNER),
             (&target_identity, IdentityKind::Target, RECIPIENT),
         ] {
             plan.identities.insert(
@@ -1679,7 +1699,7 @@ mod tests {
             signer,
             Identity {
                 kind: IdentityKind::Signer,
-                public: "signer-public".to_owned(),
+                public: SIGNER.to_owned(),
             },
         );
         plan.identities.insert(

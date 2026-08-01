@@ -256,6 +256,12 @@ fn parse_public_key(encoded: &str) -> Result<VerifyingKey, ManifestError> {
     VerifyingKey::from_bytes(&bytes).map_err(|_| ManifestError::PublicKeyFormat)
 }
 
+/// Validates one versioned public approval verification key without retaining it.
+pub fn validate_public_key(encoded: &str) -> Result<(), ManifestError> {
+    let _ = parse_public_key(encoded)?;
+    Ok(())
+}
+
 fn encode_public_key(key: &VerifyingKey) -> String {
     format!("{PUBLIC_KEY_PREFIX}{}", STANDARD.encode(key.as_bytes()))
 }

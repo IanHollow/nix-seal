@@ -10,7 +10,7 @@ public = "age1ml79lp4sk2gz59n3xux5xhasg7p5qa0pnm634rd8pnw80avag4js2etr0l"
 
 [identities.release]
 kind = "signer"
-public = "nix-seal-ed25519-v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+public = "nix-seal-ed25519-v1:EcFcZVkcYsuXdMDG2JyOsyuoCExdGk0yUwLVriY0Vyw="
 
 [targets.server]
 kind = "nixOs"
