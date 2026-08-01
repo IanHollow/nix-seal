@@ -779,11 +779,45 @@ enum SchemaKind {
 }
 
 fn main() {
+    if let Err(error) = harden_process() {
+        eprintln!("nix-seal: warning: could not fully disable process core dumps: {error}");
+    }
     let cli = Cli::parse();
     if let Err(error) = run(cli) {
         eprintln!("nix-seal: {error:#}");
         std::process::exit(exit_category(&error));
     }
+}
+
+/// Reduces process-level plaintext exposure before command-line parsing reads
+/// any private identity or prompt material. This is defense in depth only:
+/// operating-system policy and privileged debuggers remain outside its scope.
+#[cfg(unix)]
+fn harden_process() -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .map_err(std::io::Error::from)?;
+    let existing = rustix::process::getrlimit(rustix::process::Resource::Core);
+    rustix::process::setrlimit(
+        rustix::process::Resource::Core,
+        disabled_core_limit(existing),
+    )
+    .map_err(std::io::Error::from)
+}
+
+/// Preserves the administrator-controlled hard limit while disabling new core
+/// dumps for the current process.
+#[cfg(unix)]
+const fn disabled_core_limit(existing: rustix::process::Rlimit) -> rustix::process::Rlimit {
+    rustix::process::Rlimit {
+        current: Some(0),
+        maximum: existing.maximum,
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_process() -> std::io::Result<()> {
+    Ok(())
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -6003,6 +6037,17 @@ mod tests {
             6
         );
         assert_eq!(exit_category(&anyhow::anyhow!("operational failure")), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_hardening_disables_only_the_soft_core_limit() {
+        let hardened = disabled_core_limit(rustix::process::Rlimit {
+            current: Some(4_096),
+            maximum: Some(8_192),
+        });
+        assert_eq!(hardened.current, Some(0));
+        assert_eq!(hardened.maximum, Some(8_192));
     }
 
     #[test]

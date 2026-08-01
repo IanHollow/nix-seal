@@ -8,6 +8,10 @@ restricted runtime directories.
 The target decryption identity is always an absolute out-of-store runtime path;
 the Nix modules reject relative paths and `/nix/store` paths for it.
 
+Before parsing private command input, Unix clients disable new core dumps; Linux
+clients also mark the process non-dumpable. This is defense in depth, not a
+replacement for operating-system policy or the documented target-root boundary.
+
 The validated `plan.v1` is the single policy authority.
 `nix-seal plan --target <id>` emits a canonical target-specific projection.
 Rekey and activation derive recipients, hashes, authorized secret/template sets,
