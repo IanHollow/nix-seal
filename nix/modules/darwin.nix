@@ -1,4 +1,14 @@
-self: { config, lib, ... }: {
+self:
+{ config, lib, ... }:
+let
+  cfg = config.nixSeal;
+  activate = spec: ''
+    ${lib.getExe cfg.package} activate \
+      --spec ${spec} \
+      --identity ${lib.escapeShellArg cfg.identityFile}
+  '';
+in
+{
   imports = [
     ((import ./shared.nix) {
       inherit self;
@@ -10,26 +20,36 @@ self: { config, lib, ... }: {
       homeManagerRuntimeIdentity = false;
     })
   ];
-  config = lib.mkIf config.nixSeal.enable {
+  config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = lib.all (secret: secret.phase == "activation") (
-          builtins.attrValues config.nixSeal.secrets
-        );
-        message = "nixSeal activation phases other than activation are not yet scheduled on nix-darwin";
+        assertion = !(cfg.activationSpecs ? partitioning);
+        message = "nixSeal partitioning-phase secrets require installer provisioning and cannot run in nix-darwin activation";
       }
       {
-        assertion = lib.all (template: template.phase == "activation") (
-          builtins.attrValues config.nixSeal.templates
-        );
-        message = "nixSeal template activation phases other than activation are not yet scheduled on nix-darwin";
+        assertion =
+          !(cfg.activationSpecs ? users)
+          || lib.all (secret: secret.owner == "root" && secret.group == "root") (
+            builtins.attrValues (lib.filterAttrs (_: secret: secret.phase == "users") cfg.secrets)
+          );
+        message = "nixSeal users-phase secrets must be owned by root:root until macOS accounts exist";
+      }
+      {
+        assertion =
+          !(cfg.activationSpecs ? users)
+          || lib.all (template: template.owner == "root" && template.group == "root") (
+            builtins.attrValues (lib.filterAttrs (_: template: template.phase == "users") cfg.templates)
+          );
+        message = "nixSeal users-phase templates must be owned by root:root until macOS accounts exist";
       }
     ];
-    system.activationScripts.postActivation.text = lib.mkAfter ''
-      ${lib.getExe config.nixSeal.package} activate \
-        --spec ${config.nixSeal.activationSpec} \
-        --identity ${lib.escapeShellArg config.nixSeal.identityFile}
-    '';
+    system.activationScripts.extraActivation.text = lib.mkIf (cfg.activationSpecs ? users) (
+      lib.mkAfter (activate cfg.activationSpecs.users)
+    );
+    system.activationScripts.postActivation.text = lib.mkAfter (
+      lib.optionalString (cfg.activationSpecs ? activation) (activate cfg.activationSpecs.activation)
+      + lib.optionalString (cfg.activationSpecs ? services) (activate cfg.activationSpecs.services)
+    );
     warnings = [ "macOS runtime storage may not be memory-backed; inspect the selected volume" ];
   };
 }

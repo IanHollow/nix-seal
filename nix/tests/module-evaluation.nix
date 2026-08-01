@@ -402,6 +402,30 @@ in
       ];
     };
     darwinActivation = pkgs.writeText "nix-seal-darwin-activation" darwin.config.system.activationScripts.postActivation.text;
+    darwinPhased = inputs.nix-darwin.lib.darwinSystem {
+      modules = [
+        self.darwinModules.default
+        common
+        {
+          nixpkgs.hostPlatform = system;
+          system.stateVersion = 6;
+          nixSeal = {
+            secrets."bootstrap/token" = {
+              inherit ciphertext envelope;
+              sourceCiphertextHash = digest "b";
+              phase = "users";
+            };
+            secrets."service/token" = {
+              inherit ciphertext envelope;
+              sourceCiphertextHash = digest "c";
+              phase = "services";
+            };
+          };
+        }
+      ];
+    };
+    darwinUsersActivation = pkgs.writeText "nix-seal-darwin-users-activation" darwinPhased.config.system.activationScripts.extraActivation.text;
+    darwinServicesActivation = pkgs.writeText "nix-seal-darwin-services-activation" darwinPhased.config.system.activationScripts.postActivation.text;
     darwinUnsupported = inputs.nix-darwin.lib.darwinSystem {
       modules = [
         self.darwinModules.default
@@ -439,6 +463,31 @@ in
       assert hasFailedAssertion "nixSeal serviceCredentials require a systemd platform" darwinUnsupported;
       assert !(builtins.tryEval homeUnsupported.activationPackage).success;
       pkgs.runCommand "nix-seal-module-darwin-credential-policy" { } ''
+        touch "$out"
+      '';
+    module-darwin-phase-scheduling =
+      assert
+        darwinPhased.config.nixSeal.secrets."bootstrap/token".path
+        == "/var/run/nix-seal/users/current/bootstrap/token";
+      assert
+        darwinPhased.config.nixSeal.secrets."service/token".path
+        == "/var/run/nix-seal/services/current/service/token";
+      pkgs.runCommand "nix-seal-module-darwin-phase-scheduling" { nativeBuildInputs = [ pkgs.jq ]; } ''
+        jq -e '
+          .phase == "users" and
+          .runtimeRoot == "/var/run/nix-seal/users" and
+          (.artifacts | length) == 1 and
+          .artifacts[0].secretId == "bootstrap/token"
+        ' ${darwinPhased.config.nixSeal.activationSpecs.users} >/dev/null
+        jq -e '
+          .phase == "services" and
+          .runtimeRoot == "/var/run/nix-seal/services" and
+          (.artifacts | length) == 1 and
+          .artifacts[0].secretId == "service/token"
+        ' ${darwinPhased.config.nixSeal.activationSpecs.services} >/dev/null
+        grep -F -- "--spec ${darwinPhased.config.nixSeal.activationSpecs.users}" ${darwinUsersActivation} >/dev/null
+        grep -F -- "--spec ${darwinPhased.config.nixSeal.activationSpecs.activation}" ${darwinServicesActivation} >/dev/null
+        grep -F -- "--spec ${darwinPhased.config.nixSeal.activationSpecs.services}" ${darwinServicesActivation} >/dev/null
         touch "$out"
       '';
   }
