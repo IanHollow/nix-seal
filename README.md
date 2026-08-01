@@ -258,8 +258,8 @@ explicit later migration step. YAML, dotenv, INI, and binary SOPS inputs are not
 silently treated as JSON.
 
 `migrate sops` is the separate mutation path for a single reviewed SOPS
-document. It invokes only an absolute, non-symlink SOPS executable with an
-empty environment, optionally passing a private `SOPS_AGE_KEY_FILE` path. Its
+document. It invokes only an absolute, non-symlink SOPS executable with an empty
+environment, optionally passing a private `SOPS_AGE_KEY_FILE` path. Its
 plaintext stdout is bounded to 64 MiB and streamed directly into a staged native
 age ciphertext; no plaintext file is created. The staged result is round-trip
 verified and is committed only after SOPS exits successfully. SOPS diagnostics
