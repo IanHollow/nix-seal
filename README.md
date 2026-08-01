@@ -124,6 +124,14 @@ secret splitting: each canonical source remains one independent standard age
 file. Keep any plaintext input file private and remove it according to your
 local storage policy.
 
+Generate a native recovery identity with `nix-seal key generate`. For a
+human-held recovery copy, `nix-seal key generate --passphrase` writes a
+standard age scrypt-encrypted identity file after two hidden terminal prompts.
+The passphrase is never accepted from argv, stdin, or the environment and is
+subject to a minimum length check. Do not use passphrase-protected identity
+files for unattended activation; use an age plugin, agent, or hardware-backed
+identity instead.
+
 The plan determines canonical administrator/recovery recipients. Direct mode
 additionally includes authorized target recipients and emits a history-exposure
 warning. Canonical create, import, edit, rotation, and rekey operations require

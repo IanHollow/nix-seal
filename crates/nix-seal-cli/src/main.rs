@@ -236,6 +236,10 @@ enum KeyCommand {
     Generate {
         #[arg(long)]
         identity_out: PathBuf,
+        /// Protect the recovery identity with an interactive age scrypt
+        /// passphrase. Never use this mode for unattended automation.
+        #[arg(long)]
+        passphrase: bool,
     },
     /// Print the public recipient for an age `X25519` identity file.
     Inspect {
@@ -3962,17 +3966,36 @@ fn run_key(command: KeyCommand, json: bool) -> Result<()> {
                 }
             }
         }
-        KeyCommand::Generate { identity_out } => {
+        KeyCommand::Generate {
+            identity_out,
+            passphrase,
+        } => {
             let (identity, recipient) = nix_seal_crypto::generate_x25519();
-            write_new_private(&identity_out, identity.expose_secret().as_bytes())?;
+            let private = if passphrase {
+                let passphrase = read_identity_passphrase(true)?;
+                nix_seal_crypto::encrypt_passphrase_identity(&identity, &passphrase)?
+            } else {
+                let mut private = identity.expose_secret().as_bytes().to_vec();
+                private.push(b'\n');
+                private
+            };
+            write_new_private(&identity_out, &private)?;
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"schema":"nix-seal.output.v1","recipient":recipient,"identityPath":identity_out})
+                    serde_json::json!({"schema":"nix-seal.output.v1","recipient":recipient,"identityPath":identity_out,"passphraseProtected":passphrase})
                 );
             } else {
                 println!("{recipient}");
-                eprintln!("private identity written to {}", identity_out.display());
+                eprintln!(
+                    "{} identity written to {}",
+                    if passphrase {
+                        "passphrase-protected private"
+                    } else {
+                        "private"
+                    },
+                    identity_out.display()
+                );
             }
         }
         KeyCommand::Inspect { identity } => {
@@ -7393,8 +7416,45 @@ fn read_identity(path: &Path) -> Result<SecretString> {
     if bytes.len() > 1024 * 1024 {
         bail!("identity exceeds the 1 MiB safety limit");
     }
+    if bytes.starts_with(b"age-encryption.org/v1") {
+        let passphrase = read_identity_passphrase(false)?;
+        return nix_seal_crypto::decrypt_passphrase_identity(bytes.as_slice(), &passphrase)
+            .context("could not decrypt passphrase-protected identity");
+    }
     Ok(SecretString::from(
         String::from_utf8(bytes).context("identity is not UTF-8")?,
+    ))
+}
+
+/// Reads a human recovery passphrase only from the controlling terminal. The
+/// passphrase is never accepted through argv, stdin, or environment variables.
+/// New passphrases are confirmed and must meet a conservative length floor;
+/// existing encrypted identities still prompt without requiring confirmation.
+fn read_identity_passphrase(confirm: bool) -> Result<SecretString> {
+    let prompt = nix_seal_core::GeneratorPrompt {
+        id: nix_seal_core::Id::parse("identity/passphrase")
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+        mode: nix_seal_core::GeneratorPromptMode::Hidden,
+        message: "Recovery identity passphrase".to_owned(),
+        multiline: false,
+        persistent: false,
+    };
+    let mut first = read_tty_prompt(&prompt)?;
+    if first.expose_secret().len() < 16 {
+        bail!("recovery identity passphrase must be at least 16 bytes");
+    }
+    if confirm {
+        let confirmation = read_tty_prompt(&nix_seal_core::GeneratorPrompt {
+            message: "Confirm recovery identity passphrase".to_owned(),
+            ..prompt
+        })?;
+        if first.expose_secret() != confirmation.expose_secret() {
+            bail!("recovery identity passphrase confirmation did not match");
+        }
+    }
+    let bytes = std::mem::take(first.expose_secret_mut());
+    Ok(SecretString::from(
+        String::from_utf8(bytes).context("recovery identity passphrase is not UTF-8")?,
     ))
 }
 

@@ -16,6 +16,7 @@ use std::{
 use thiserror::Error;
 
 const MAX_SECRET_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_IDENTITY_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_AGE_HEADER_BYTES: usize = 1024 * 1024;
 const MAX_PLUGIN_FIELD_BYTES: usize = 64 * 1024;
 const MAX_PLUGIN_RECIPIENTS: usize = 256;
@@ -72,6 +73,61 @@ pub fn generate_x25519() -> (secrecy::SecretString, String) {
     let identity = age::x25519::Identity::generate();
     let private = secrecy::SecretString::from(identity.to_string().expose_secret().to_owned());
     (private, identity.to_public().to_string())
+}
+
+/// Encrypts a native age identity file with age's standard scrypt recipient.
+///
+/// This is intended for human-held recovery identities only. Callers must
+/// obtain the passphrase through an interactive protected channel; automation
+/// should use a hardware-backed or agent identity instead. The returned bytes
+/// are an ordinary age ciphertext and contain no plaintext identity material.
+pub fn encrypt_passphrase_identity(
+    identity: &secrecy::SecretString,
+    passphrase: &secrecy::SecretString,
+) -> Result<Vec<u8>, CryptoError> {
+    let passphrase = age::secrecy::SecretString::from(passphrase.expose_secret().to_owned());
+    let encryptor = Encryptor::with_user_passphrase(passphrase);
+    let mut ciphertext = Vec::new();
+    let mut writer = encryptor
+        .wrap_output(&mut ciphertext)
+        .map_err(|_| CryptoError::Encrypt)?;
+    writer
+        .write_all(identity.expose_secret().as_bytes())
+        .map_err(|_| CryptoError::Io)?;
+    writer.write_all(b"\n").map_err(|_| CryptoError::Io)?;
+    writer.finish().map_err(|_| CryptoError::Encrypt)?;
+    Ok(ciphertext)
+}
+
+/// Decrypts an age scrypt-protected identity file after the CLI has obtained
+/// its passphrase from a protected interactive channel. This helper accepts
+/// only passphrase-encrypted age files and bounds the decrypted identity
+/// payload before converting it to a zeroizing string.
+pub fn decrypt_passphrase_identity<R: Read>(
+    input: R,
+    passphrase: &secrecy::SecretString,
+) -> Result<secrecy::SecretString, CryptoError> {
+    let decryptor = Decryptor::new(input).map_err(|_| CryptoError::Decrypt)?;
+    if !decryptor.is_scrypt() {
+        return Err(CryptoError::Identity);
+    }
+    let passphrase = age::secrecy::SecretString::from(passphrase.expose_secret().to_owned());
+    let identity = age::scrypt::Identity::new(passphrase);
+    let mut reader = decryptor
+        .decrypt(std::iter::once(&identity as &dyn Identity))
+        .map_err(|_| CryptoError::Decrypt)?;
+    let mut plaintext = Vec::new();
+    reader
+        .by_ref()
+        .take(MAX_IDENTITY_FILE_BYTES + 1)
+        .read_to_end(&mut plaintext)
+        .map_err(|_| CryptoError::Io)?;
+    if plaintext.len() as u64 > MAX_IDENTITY_FILE_BYTES {
+        return Err(CryptoError::InputTooLarge);
+    }
+    String::from_utf8(plaintext)
+        .map(secrecy::SecretString::from)
+        .map_err(|_| CryptoError::Identity)
 }
 
 /// Derives the normalized public recipient from a native X25519 or unencrypted
@@ -1014,6 +1070,31 @@ body\n\
         )?;
         assert_eq!(target_plaintext, b"canary");
         assert_eq!(recipient_fingerprint(&target_recipient)?.len(), 64);
+        Ok(())
+    }
+
+    #[test]
+    fn passphrase_identity_round_trip_is_standard_age_ciphertext() -> Result<(), CryptoError> {
+        let (identity, recipient) = generate_x25519();
+        let passphrase =
+            secrecy::SecretString::from("a sufficiently long recovery passphrase".to_owned());
+        let ciphertext = encrypt_passphrase_identity(&identity, &passphrase)?;
+        assert!(ciphertext.starts_with(b"age-encryption.org/v1"));
+        assert!(
+            !ciphertext
+                .windows(16)
+                .any(|window| window == identity.expose_secret().as_bytes())
+        );
+        let decrypted = decrypt_passphrase_identity(ciphertext.as_slice(), &passphrase)?;
+        assert_eq!(decrypted.expose_secret().trim(), identity.expose_secret());
+        assert_eq!(recipient_from_identity(&decrypted)?, recipient);
+        assert!(
+            decrypt_passphrase_identity(
+                ciphertext.as_slice(),
+                &secrecy::SecretString::from("incorrect passphrase".to_owned())
+            )
+            .is_err()
+        );
         Ok(())
     }
 

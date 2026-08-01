@@ -44,6 +44,9 @@ Compile, inspect, validate, and diagnose public policy.
 .TP
 .B key, identity, group
 Manage identities and public policy metadata.
+The optional Bkey generate --passphraseR mode writes a standard age
+scrypt-encrypted human recovery identity after protected terminal prompts;
+passphrases are never read from argv, stdin, or the environment.
 .TP
 .B secret, rotate
 Create, import, edit, reveal, inspect, delete, recipient-rekey, and rotate
