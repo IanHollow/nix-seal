@@ -1205,14 +1205,14 @@ fn run_template_render(
 
     let identity = read_identity(identity_path)?;
     let public = nix_seal_crypto::recipient_from_identity(&identity)?;
+    let public_fingerprint = nix_seal_crypto::recipient_fingerprint(&public)?;
     let mut secret_paths = BTreeMap::new();
     for placeholder in template.placeholders.values() {
         let recipients = nix_seal_policy::secret_recipients(&plan, &placeholder.secret)?;
-        if !recipients
-            .recipients
-            .values()
-            .any(|recipient| recipient == &public)
-        {
+        if !recipients.recipients.values().any(|recipient| {
+            nix_seal_crypto::recipient_fingerprint(recipient)
+                .is_ok_and(|fingerprint| fingerprint == public_fingerprint)
+        }) {
             bail!(
                 "render identity is not authorized by canonical recipient policy for {}",
                 placeholder.secret
@@ -5284,7 +5284,11 @@ fn run_secret(command: SecretCommand, json: bool) -> Result<()> {
             let recipients = nix_seal_policy::secret_recipients(&plan, &arguments.policy.secret)?;
             let identity = read_identity(&arguments.identity)?;
             let public = nix_seal_crypto::recipient_from_identity(&identity)?;
-            if !recipients.recipients.values().any(|value| value == &public) {
+            let public_fingerprint = nix_seal_crypto::recipient_fingerprint(&public)?;
+            if !recipients.recipients.values().any(|value| {
+                nix_seal_crypto::recipient_fingerprint(value)
+                    .is_ok_and(|fingerprint| fingerprint == public_fingerprint)
+            }) {
                 bail!("reveal identity is not authorized by canonical recipient policy");
             }
             let secret = plan
