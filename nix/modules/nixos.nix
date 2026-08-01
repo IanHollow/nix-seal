@@ -76,6 +76,7 @@ in
     ];
     system.activationScripts = lib.mkMerge [
       (lib.mkIf (cfg.activationSpecs ? users) {
+        users.deps = lib.mkAfter [ "nixSealUsers" ];
         nixSealUsers = {
           deps = [ "specialfs" ];
           text = activate cfg.activationSpecs.users;

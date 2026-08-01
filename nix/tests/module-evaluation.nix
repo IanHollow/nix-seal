@@ -285,6 +285,7 @@ in
     assert
       nixosPhased.config.nixSeal.secrets."bootstrap/token".path
       == "/run/nix-seal/users/current/bootstrap/token";
+    assert lib.elem "nixSealUsers" nixosPhased.config.system.activationScripts.users.deps;
     assert hasFailedAssertion
       "nixSeal partitioning-phase secrets are not scheduled by generic NixOS activation; provision config.nixSeal.activationSpecs.partitioning over a protected installation channel"
       partitioningPhase;
