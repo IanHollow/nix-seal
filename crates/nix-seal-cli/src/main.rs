@@ -488,6 +488,12 @@ enum MigrateCommand {
         #[arg(long, default_value = "vars/per-machine")]
         directory: PathBuf,
     },
+    /// Inspect Clan Facts public leaves without reading their values.
+    ClanFacts {
+        /// Clan `machines` directory containing per-machine `facts` directories.
+        #[arg(long, default_value = "machines")]
+        directory: PathBuf,
+    },
     /// Stream one legacy age ciphertext into explicit new recipients.
     Ciphertext {
         /// Existing repository root; source and destination must remain below it.
@@ -930,6 +936,7 @@ fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
             json,
         ),
         MigrateCommand::ClanVars { directory } => migrate_clan_vars_tree(&directory, json),
+        MigrateCommand::ClanFacts { directory } => migrate_clan_facts_tree(&directory, json),
         MigrateCommand::Ciphertext {
             repository_root,
             source,
@@ -1797,6 +1804,89 @@ fn inspect_clan_var_value(path: &Path, relative: &Path) -> Result<ClanVarInvento
         output: output.clone(),
         bytes,
     })
+}
+
+/// Inventories Clan Facts' documented `machines/<machine>/facts/<fact>` public
+/// leaves without opening their contents. Secret facts deliberately have a
+/// configurable store/path function and cannot be inferred safely from disk.
+fn migrate_clan_facts_tree(directory: &Path, json: bool) -> Result<()> {
+    let metadata = fs::symlink_metadata(directory).context("could not inspect Clan Facts root")?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        bail!("Clan Facts root must be a non-symlink directory");
+    }
+    let root = directory
+        .canonicalize()
+        .context("could not resolve Clan Facts root")?;
+    let mut entries = fs::read_dir(&root)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    let mut facts = Vec::new();
+    for machine in entries {
+        let machine_path = machine.path();
+        let machine_metadata = fs::symlink_metadata(&machine_path)?;
+        if machine_metadata.file_type().is_symlink() {
+            bail!("Clan Facts root contains a symbolic link");
+        }
+        if !machine_metadata.file_type().is_dir() {
+            continue;
+        }
+        let machine_name = machine
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("Clan Facts machine path is not UTF-8"))?;
+        let facts_root = machine_path.join("facts");
+        if !facts_root.exists() {
+            continue;
+        }
+        let facts_metadata = fs::symlink_metadata(&facts_root)?;
+        if facts_metadata.file_type().is_symlink() || !facts_metadata.file_type().is_dir() {
+            bail!("Clan Facts machine facts path must be a non-symlink directory");
+        }
+        let mut leaves = fs::read_dir(&facts_root)?.collect::<Result<Vec<_>, _>>()?;
+        leaves.sort_by_key(fs::DirEntry::file_name);
+        for leaf in leaves {
+            if facts.len() >= 10_000 {
+                bail!("Clan Facts tree exceeds the 10000-file safety limit");
+            }
+            let path = leaf.path();
+            let leaf_metadata = fs::symlink_metadata(&path)?;
+            if leaf_metadata.file_type().is_symlink() || !leaf_metadata.file_type().is_file() {
+                bail!("Clan Facts public leaves must be non-symlink regular files");
+            }
+            let name = leaf
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("Clan Facts leaf path is not UTF-8"))?;
+            if name.is_empty() || leaf_metadata.len() > 64 * 1024 * 1024 {
+                bail!("Clan Facts public leaf has an invalid name or exceeds 64 MiB");
+            }
+            facts.push((machine_name.clone(), name, leaf_metadata.len(), path));
+        }
+    }
+    if facts.is_empty() {
+        bail!("Clan Facts root contains no documented public fact leaves");
+    }
+    let mut seen = BTreeSet::new();
+    let mappings = facts.iter().map(|(machine, name, bytes, path)| {
+        let id = migrated_id(&format!("clan-facts/{machine}/{name}"))?;
+        if !seen.insert(id.clone()) { bail!("Clan Facts paths collide after nix-seal ID normalization"); }
+        Ok(serde_json::json!({"legacyId":format!("{machine}/{name}"),"nixSealId":id,"source":path.strip_prefix(&root)?,"valueBytes":bytes}))
+    }).collect::<Result<Vec<_>>>()?;
+    let warnings = vec![
+        "dry run only: no value, configuration, or source manager was changed",
+        "only documented public facts were inventoried without reading them; secret facts use configurable stores and require an explicit reviewed export",
+    ];
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"schema":"nix-seal.migration-report.v1","source":"clan-facts","dryRun":true,"facts":mappings,"warnings":warnings})
+        );
+    } else {
+        println!("clan-facts dry-run: {} public facts mapped", mappings.len());
+        for warning in warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+    Ok(())
 }
 
 fn migrate_secretctl(
@@ -4205,6 +4295,19 @@ mod tests {
         )?;
         migrate_agenix_rekey_export(&metadata, true)?;
         assert!(validate_agenix_rekey_source("../unsafe.age").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn clan_facts_inventory_accepts_documented_public_leaves()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let machines = temporary.path().join("machines");
+        fs::create_dir(&machines)?;
+        fs::create_dir(machines.join("desktop"))?;
+        fs::create_dir(machines.join("desktop/facts"))?;
+        fs::write(machines.join("desktop/facts/public-key"), b"public value")?;
+        migrate_clan_facts_tree(&machines, false)?;
         Ok(())
     }
 
