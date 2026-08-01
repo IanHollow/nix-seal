@@ -2,11 +2,11 @@
 
 ## Reporting a vulnerability
 
-Do not open a public issue. Use GitHub's private vulnerability reporting for
-`IanHollow/nix-seal`. If that is unavailable, contact the maintainer through the
-private address listed on the GitHub profile and request an encrypted channel.
-Do not include live secrets, private identities, or exploit output in ordinary
-email.
+Do not open a public issue. Submit a report through
+[GitHub's private vulnerability-report form for nix-seal](https://github.com/IanHollow/nix-seal/security/advisories/new).
+If that is unavailable, contact the maintainer through the private address
+listed on the GitHub profile and request an encrypted channel. Do not include
+live secrets, private identities, or exploit output in ordinary email.
 
 We aim to acknowledge reports within 3 business days, provide an initial
 assessment within 7 business days, and publish a remediation timeline after

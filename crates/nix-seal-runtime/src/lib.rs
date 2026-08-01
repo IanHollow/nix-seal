@@ -1671,7 +1671,7 @@ mod tests {
         let signed = nix_seal_manifest::sign_manifest(&manifest, &signing_key)?;
         std::fs::write(&envelope, serde_json::to_vec(&signed)?)?;
         let approval_signers =
-            BTreeMap::from([(Id::parse("release-signer")?, signing_key.encode_public())]);
+            BTreeMap::from([(Id::parse("release-signer")?, signing_key.encode_public()?)]);
         let owner = uzers::get_user_by_uid(uzers::get_current_uid())
             .ok_or("current user is not resolvable")?
             .name()

@@ -307,7 +307,8 @@ fn authenticate_record(
     let envelope: SignedEnvelopeV1 =
         serde_json::from_slice(&record.envelope).map_err(|_| RekeyError::Envelope)?;
     let mut trusted = TrustedKeys::new();
-    trusted.insert_encoded(&request.signing_key.encode_public())?;
+    let signing_public = request.signing_key.encode_public()?;
+    trusted.insert_encoded(&signing_public)?;
     let expected = ExpectedBinding {
         tool_version: request.tool_version,
         plan_hash: request.plan_hash,
@@ -345,7 +346,8 @@ fn authenticate_direct_record(
     let envelope: SignedEnvelopeV1 =
         serde_json::from_slice(&record.envelope).map_err(|_| RekeyError::Envelope)?;
     let mut trusted = TrustedKeys::new();
-    trusted.insert_encoded(&request.signing_key.encode_public())?;
+    let signing_public = request.signing_key.encode_public()?;
+    trusted.insert_encoded(&signing_public)?;
     let expected = ExpectedBinding {
         tool_version: request.tool_version,
         plan_hash: request.plan_hash,

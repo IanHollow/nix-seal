@@ -302,6 +302,16 @@ Age-plugin identities are deliberately rejected until the Rust sandbox client
 can enforce its descriptor, environment, timeout, and error-redaction contract.
 They are not silently run through `PATH` or accepted as deferred recipients.
 
+Approval signer identities may use either the native `nix-seal-ed25519-v1:`
+public-key format or a standard `ssh-ed25519` public key. The corresponding
+`--signing-key` file may be a native key or an unencrypted OpenSSH Ed25519
+private key. SSH approvals use a standard PEM `sshsig`, bound to a dedicated
+nix-seal namespace and the same DSSE payload as native approvals; public-key
+comments do not affect authorization. The client does not call `ssh-keygen` or
+`ssh-agent`, and deliberately rejects SSH RSA, ECDSA, FIDO/U2F, agent-backed,
+and encrypted OpenSSH signing keys until those paths have their own hardened
+protocol design.
+
 For TOML-managed plans, `nix-seal identity add|remove|rotate` updates only the
 public TOML source in a same-directory atomic transaction. It validates the
 merged Nix/TOML policy before committing and refuses to remove referenced IDs.

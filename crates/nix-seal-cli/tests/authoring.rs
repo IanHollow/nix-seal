@@ -217,7 +217,7 @@ fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
         Id::parse("signer")?,
         Identity {
             kind: IdentityKind::Signer,
-            public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public(),
+            public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public()?,
         },
     );
     plan.secrets.insert(

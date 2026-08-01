@@ -17,6 +17,7 @@ pkgs.testers.nixosTest {
     environment.systemPackages = [
       nixSeal
       pkgs.coreutils
+      pkgs.findutils
       pkgs.gnugrep
       pkgs.jq
     ];
@@ -153,10 +154,15 @@ pkgs.testers.nixosTest {
       # The random plaintext must not have escaped into the host-visible Nix
       # store. -f reads the candidate from the activated private file rather
       # than exposing it through argv or an environment variable.
-      if grep -R --binary-files=without-match -F -f /run/nix-seal/current/app/token /nix/store; then
+      # Nix store paths may contain dangling symlinks after GC. Restrict the
+      # scan to regular files rather than treating an unreadable dangling target
+      # as a plaintext-leak failure. `find` batches its regular-file arguments
+      # for grep, which emits only matching public paths; the canary itself
+      # stays in the private `-f` file rather than argv.
+      if find /nix/store -type f \
+        -exec grep -l --binary-files=without-match -F -f /run/nix-seal/current/app/token {} + \
+        2>/dev/null | grep -q .; then
         exit 1
-      else
-        test "$?" -eq 1
       fi
 
       # A tampered artifact must fail before a generation switch and preserve

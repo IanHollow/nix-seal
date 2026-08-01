@@ -3145,13 +3145,13 @@ fn run_key(command: KeyCommand, json: bool) -> Result<()> {
         }
         KeyCommand::GenerateSigning { key_out } => {
             let key = nix_seal_manifest::ApprovalSigningKey::generate()?;
-            let private = key.encode_private();
+            let private = key.encode_private()?;
             write_new_private(&key_out, private.as_bytes())?;
-            print_signing_key(&key, &key_out, json);
+            print_signing_key(&key, &key_out, json)?;
         }
         KeyCommand::InspectSigning { key } => {
             let signing_key = read_signing_key(&key)?;
-            print_signing_key(&signing_key, &key, json);
+            print_signing_key(&signing_key, &key, json)?;
         }
     }
     Ok(())
@@ -3494,21 +3494,28 @@ fn identity_kind_name(kind: &nix_seal_core::IdentityKind) -> &'static str {
     }
 }
 
-fn print_signing_key(key: &nix_seal_manifest::ApprovalSigningKey, path: &Path, json: bool) {
+fn print_signing_key(
+    key: &nix_seal_manifest::ApprovalSigningKey,
+    path: &Path,
+    json: bool,
+) -> Result<()> {
+    let public = key.encode_public()?;
+    let key_id = key.key_id()?;
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "schema":"nix-seal.output.v1",
-                "publicKey":key.encode_public(),
-                "keyId":key.key_id(),
+                "publicKey":public,
+                "keyId":key_id,
                 "keyPath":path
             })
         );
     } else {
-        println!("{}", key.encode_public());
-        eprintln!("key ID: {}", key.key_id());
+        println!("{public}");
+        eprintln!("key ID: {key_id}");
     }
+    Ok(())
 }
 
 fn run_artifact(command: ArtifactCommand, json: bool) -> Result<()> {
@@ -3737,12 +3744,11 @@ fn ensure_signing_key_authorized(
     signing_key: &nix_seal_manifest::ApprovalSigningKey,
     secret: &nix_seal_core::Id,
 ) -> Result<()> {
-    let signing_public = signing_key.encode_public();
     if !secret_policy
         .approval
         .signers
         .values()
-        .any(|public| public == &signing_public)
+        .any(|public| signing_key.matches_public_key(public))
     {
         bail!("signing key is not authorized by the approval policy for secret {secret}");
     }
@@ -6191,6 +6197,35 @@ mod tests {
     }
 
     #[test]
+    fn ssh_signing_key_authorization_ignores_public_key_comments()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let private = "-----BEGIN_OPENSSH_PRIVATE_KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+QyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYgAAAJgAIAxdACAM\n\
+XQAAAAtzc2gtZWQyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYg\n\
+AAAEC2BsIi0QwW2uFscKTUUXNHLsYX4FxlaSDSblbAj7WR7bM+rvN+ot98qgEN796jTiQf\n\
+ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
+-----END_OPENSSH_PRIVATE_KEY-----\n";
+        let signing_key = nix_seal_manifest::ApprovalSigningKey::parse(&private.replace('_', " "))?;
+        let secret = nix_seal_core::Id::parse("application/token")?;
+        let policy = nix_seal_policy::TargetSecretPolicyV1 {
+            source: "secrets/token.age".to_owned(),
+            delivery: nix_seal_core::DeliveryMode::Rekeyed,
+            phase: nix_seal_core::ActivationPhase::Activation,
+            runtime: nix_seal_core::RuntimeSettings::default(),
+            approval: nix_seal_policy::TargetApprovalPolicyV1 {
+                threshold: 1,
+                signers: BTreeMap::from([(
+                    nix_seal_core::Id::parse("release")?,
+                    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti release@example.com".to_owned(),
+                )]),
+            },
+        };
+        ensure_signing_key_authorized(&policy, &signing_key, &secret)?;
+        Ok(())
+    }
+
+    #[test]
     fn dotenv_validation_rejects_duplicate_and_unsafe_keys() {
         assert!(validate_dotenv("TOKEN=value\nexport PORT=443\n").is_ok());
         assert!(validate_dotenv("TOKEN=one\nTOKEN=two\n").is_err());
@@ -6272,7 +6307,7 @@ mod tests {
             nix_seal_core::Id::parse("signer.release")?,
             nix_seal_core::Identity {
                 kind: nix_seal_core::IdentityKind::Signer,
-                public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public(),
+                public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public()?,
             },
         );
         plan.secrets.insert(
@@ -6360,7 +6395,7 @@ mod tests {
         let secret_id = nix_seal_core::Id::parse("application/token")?;
         let signer_id = nix_seal_core::Id::parse("signer.release")?;
         let signing_key = nix_seal_manifest::ApprovalSigningKey::generate()?;
-        write_new_private(&signing_path, signing_key.encode_private().as_bytes())?;
+        write_new_private(&signing_path, signing_key.encode_private()?.as_bytes())?;
         let mut ciphertext = fs::File::create(secrets.join("token.age"))?;
         nix_seal_crypto::encrypt(
             b"direct-cli-canary".as_slice(),
@@ -6381,7 +6416,7 @@ mod tests {
             signer_id.clone(),
             nix_seal_core::Identity {
                 kind: nix_seal_core::IdentityKind::Signer,
-                public: signing_key.encode_public(),
+                public: signing_key.encode_public()?,
             },
         );
         plan.targets.insert(
@@ -6712,6 +6747,8 @@ mod tests {
     #[test]
     fn sops_migration_commits_only_after_external_success() -> Result<(), Box<dyn std::error::Error>>
     {
+        use std::os::unix::fs::PermissionsExt;
+
         let temporary = tempfile::tempdir()?;
         let root = temporary.path().canonicalize()?;
         fs::create_dir(root.join("legacy"))?;
@@ -6720,11 +6757,23 @@ mod tests {
         let (identity, recipient) = nix_seal_crypto::generate_x25519();
         let identity_path = root.join("identity.age");
         write_private_bytes(&identity_path, identity.expose_secret().as_bytes())?;
+        // Nix sandbox builders do not provide /usr/bin/true, and the PATH
+        // entry is commonly a multicall coreutils symlink. Use an ephemeral,
+        // regular executable so this continues to exercise the production
+        // absolute, non-symlink check on every supported test platform.
+        let shell = std::env::split_paths(&std::env::var_os("PATH").ok_or("PATH is absent")?)
+            .map(|directory| directory.join("sh"))
+            .find(|candidate| candidate.is_file())
+            .ok_or("sh is absent from PATH")?
+            .canonicalize()?;
+        let producer = root.join("successful-sops-producer");
+        fs::write(&producer, format!("#!{}\nexit 0\n", shell.display()))?;
+        fs::set_permissions(&producer, fs::Permissions::from_mode(0o700))?;
         migrate_sops_document(
             &root,
             Path::new("legacy/source.yaml"),
             Path::new("secrets/result.age"),
-            Path::new("/usr/bin/true"),
+            &producer,
             None,
             &identity_path,
             &[recipient],
@@ -7226,7 +7275,7 @@ mod tests {
                 "home:ianmh@desktop=x86_64-linux".to_owned(),
                 "host:nixos:desktop=x86_64-linux".to_owned(),
             ],
-            &[format!("release={}", signer.encode_public())],
+            &[format!("release={}", signer.encode_public()?)],
         )?;
         assert_eq!(plan.targets.len(), 2);
         assert_eq!(plan.groups.len(), 1);
@@ -7379,7 +7428,7 @@ mod tests {
             nix_seal_core::Id::parse("signer.release")?,
             nix_seal_core::Identity {
                 kind: nix_seal_core::IdentityKind::Signer,
-                public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public(),
+                public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public()?,
             },
         );
         plan.secrets.insert(
@@ -7538,7 +7587,7 @@ mod tests {
             signer_id,
             nix_seal_core::Identity {
                 kind: nix_seal_core::IdentityKind::Signer,
-                public: signer.encode_public(),
+                public: signer.encode_public()?,
             },
         );
         plan.identities.insert(
@@ -7746,7 +7795,7 @@ mod tests {
             signer_id,
             nix_seal_core::Identity {
                 kind: nix_seal_core::IdentityKind::Signer,
-                public: signer.encode_public(),
+                public: signer.encode_public()?,
             },
         );
         plan.targets.insert(
