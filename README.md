@@ -42,6 +42,16 @@ committed. Editor execution uses no shell, inherits no environment, and runs in
 a private ephemeral workspace. `rekey` changes encryption recipients; `rotate`
 changes the application credential.
 
+For the default `rekeyed` delivery, `nix-seal rekey` decrypts canonical
+ciphertext with `--identity` and produces a separately target-encrypted,
+signed cache artifact. For the explicitly advanced `direct` delivery, the same
+command deliberately rejects `--identity`: it validates and copies the
+already target-addressed canonical age ciphertext into a signed cache artifact
+without decrypting or re-encrypting it. Its source and artifact hashes are
+identical. This preserves masterless operation while retaining activation's
+manifest and approval verification; it does not reduce the documented
+historical-key-compromise risk.
+
 Deletion never unlinks canonical ciphertext directly. It requires `--yes` and
 atomically moves the ciphertext into a private, collision-safe
 `.nix-seal/trash/v1` tombstone containing its public secret ID, original source,

@@ -46,6 +46,34 @@ pub struct RekeyRequest<'a> {
     pub signing_key: &'a ApprovalSigningKey,
 }
 
+/// Inputs for staging a canonical direct-delivery ciphertext as a signed
+/// target artifact. This intentionally does not decrypt or re-encrypt the
+/// source: direct mode already addresses its canonical age file to the target.
+pub struct DirectRequest<'a> {
+    /// Canonical direct-delivery age ciphertext.
+    pub source: &'a Path,
+    /// Exact target recipient bound into the artifact address and manifest.
+    pub target_recipient: &'a str,
+    /// Canonical plan hash.
+    pub plan_hash: &'a str,
+    /// Hash of the deterministic target policy derived from the plan.
+    pub target_policy_hash: &'a str,
+    /// Bound target ID.
+    pub target_id: &'a Id,
+    /// Bound secret ID.
+    pub secret_id: &'a Id,
+    /// Monotonic artifact generation selected by policy.
+    pub artifact_generation: u64,
+    /// Issue time in Unix seconds.
+    pub issued_at: u64,
+    /// Optional approval expiry in Unix seconds.
+    pub expires_at: Option<u64>,
+    /// Producer tool version.
+    pub tool_version: &'a str,
+    /// Initial approval signer, kept separate from any age identity.
+    pub signing_key: &'a ApprovalSigningKey,
+}
+
 /// Metadata returned without plaintext or private key material.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RekeyResult {
@@ -192,6 +220,83 @@ pub fn rekey(cache: &Cache, request: &RekeyRequest<'_>) -> Result<RekeyResult, R
     )
 }
 
+/// Copies a direct-delivery canonical ciphertext into the target-artifact
+/// cache, signs its exact binding, and verifies the stored result. The source
+/// and artifact hashes must be identical: any re-encryption here would defeat
+/// the explicit direct-delivery model.
+pub fn stage_direct(cache: &Cache, request: &DirectRequest<'_>) -> Result<RekeyResult, RekeyError> {
+    let transactions = cache.root().join("transactions");
+    std::fs::create_dir_all(&transactions).map_err(RekeyError::Io)?;
+    set_private_permissions(&transactions, true).map_err(RekeyError::Io)?;
+
+    let mut canonical = NamedTempFile::new_in(&transactions).map_err(RekeyError::Io)?;
+    set_private_permissions(canonical.path(), false).map_err(RekeyError::Io)?;
+    let source = open_regular_nofollow(request.source)?;
+    let source_ciphertext_hash =
+        copy_and_hash_bounded(source, canonical.as_file_mut(), MAX_CIPHERTEXT_BYTES)?;
+    canonical.as_file().sync_all().map_err(RekeyError::Io)?;
+    canonical
+        .as_file_mut()
+        .seek(SeekFrom::Start(0))
+        .map_err(RekeyError::Io)?;
+    nix_seal_crypto::validate_ciphertext_header(canonical.as_file_mut())?;
+
+    let recipient_fingerprint = nix_seal_crypto::recipient_fingerprint(request.target_recipient)?;
+    let address = ArtifactAddress::new(
+        request.plan_hash,
+        request.target_policy_hash,
+        &source_ciphertext_hash,
+        &recipient_fingerprint,
+        request.target_id.as_str(),
+        request.secret_id.as_str(),
+        request.artifact_generation,
+    )?;
+    if let Some(record) = cache.load_artifact(&address)? {
+        return authenticate_direct_record(
+            record,
+            request,
+            source_ciphertext_hash,
+            recipient_fingerprint,
+            true,
+        );
+    }
+
+    let manifest = TargetManifestV2 {
+        schema: ARTIFACT_SCHEMA.to_owned(),
+        tool_version: request.tool_version.to_owned(),
+        plan_hash: request.plan_hash.to_owned(),
+        target_policy_hash: request.target_policy_hash.to_owned(),
+        source_ciphertext_hash: source_ciphertext_hash.clone(),
+        artifact_ciphertext_hash: source_ciphertext_hash.clone(),
+        target_id: request.target_id.clone(),
+        secret_id: request.secret_id.clone(),
+        recipient_fingerprint: recipient_fingerprint.clone(),
+        artifact_generation: request.artifact_generation,
+        issued_at: request.issued_at,
+        expires_at: request.expires_at,
+    };
+    let envelope = nix_seal_manifest::sign_manifest(&manifest, request.signing_key)?;
+    let envelope_bytes = serde_json::to_vec(&envelope).map_err(|_| RekeyError::Envelope)?;
+    canonical
+        .as_file_mut()
+        .seek(SeekFrom::Start(0))
+        .map_err(RekeyError::Io)?;
+    let record = match cache.put_artifact(&address, canonical.as_file_mut(), &envelope_bytes) {
+        Ok(record) => record,
+        Err(CacheError::ArtifactExists) => cache
+            .load_artifact(&address)?
+            .ok_or(CacheError::ArtifactExists)?,
+        Err(error) => return Err(error.into()),
+    };
+    authenticate_direct_record(
+        record,
+        request,
+        source_ciphertext_hash,
+        recipient_fingerprint,
+        false,
+    )
+}
+
 fn authenticate_record(
     record: ArtifactRecord,
     request: &RekeyRequest<'_>,
@@ -199,6 +304,44 @@ fn authenticate_record(
     recipient_fingerprint: String,
     reused: bool,
 ) -> Result<RekeyResult, RekeyError> {
+    let envelope: SignedEnvelopeV1 =
+        serde_json::from_slice(&record.envelope).map_err(|_| RekeyError::Envelope)?;
+    let mut trusted = TrustedKeys::new();
+    trusted.insert_encoded(&request.signing_key.encode_public())?;
+    let expected = ExpectedBinding {
+        tool_version: request.tool_version,
+        plan_hash: request.plan_hash,
+        target_policy_hash: request.target_policy_hash,
+        source_ciphertext_hash: &source_ciphertext_hash,
+        artifact_ciphertext_hash: &record.artifact_ciphertext_hash,
+        target_id: request.target_id,
+        secret_id: request.secret_id,
+        recipient_fingerprint: &recipient_fingerprint,
+        artifact_generation: request.artifact_generation,
+        now: request.issued_at,
+        allowed_clock_skew: 0,
+    };
+    nix_seal_manifest::verify(&envelope, &trusted, 1, &expected)?;
+    Ok(RekeyResult {
+        cache_key: record.key,
+        source_ciphertext_hash,
+        artifact_ciphertext_hash: record.artifact_ciphertext_hash,
+        recipient_fingerprint,
+        ciphertext_path: record.ciphertext_path,
+        reused,
+    })
+}
+
+fn authenticate_direct_record(
+    record: ArtifactRecord,
+    request: &DirectRequest<'_>,
+    source_ciphertext_hash: String,
+    recipient_fingerprint: String,
+    reused: bool,
+) -> Result<RekeyResult, RekeyError> {
+    if record.artifact_ciphertext_hash != source_ciphertext_hash {
+        return Err(RekeyError::Manifest(ManifestError::Binding));
+    }
     let envelope: SignedEnvelopeV1 =
         serde_json::from_slice(&record.envelope).map_err(|_| RekeyError::Envelope)?;
     let mut trusted = TrustedKeys::new();
@@ -337,6 +480,28 @@ mod tests {
         }
     }
 
+    fn direct_request<'a>(
+        source: &'a Path,
+        target_recipient: &'a str,
+        target_id: &'a Id,
+        secret_id: &'a Id,
+        signing_key: &'a ApprovalSigningKey,
+    ) -> DirectRequest<'a> {
+        DirectRequest {
+            source,
+            target_recipient,
+            plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
+            target_id,
+            secret_id,
+            artifact_generation: 1,
+            issued_at: 100,
+            expires_at: Some(200),
+            tool_version: "0.1.0-alpha.1",
+            signing_key,
+        }
+    }
+
     #[test]
     fn rekeys_reuses_and_detects_cache_tampering() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
@@ -395,6 +560,50 @@ mod tests {
             rekey(&cache, &request),
             Err(RekeyError::Manifest(ManifestError::Binding))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_staging_never_decrypts_or_reencrypts_canonical_ciphertext()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("direct.age");
+        let (target_identity, target_recipient) = nix_seal_crypto::generate_x25519();
+        let mut source_file = File::create(&source)?;
+        nix_seal_crypto::encrypt(
+            b"direct-canary".as_slice(),
+            &mut source_file,
+            std::slice::from_ref(&target_recipient),
+        )?;
+        source_file.sync_all()?;
+        let source_bytes = std::fs::read(&source)?;
+        let cache = Cache::open(temporary.path().join("cache"))?;
+        let target_id = Id::parse("host.direct")?;
+        let secret_id = Id::parse("db/direct-password")?;
+        let signing_key = ApprovalSigningKey::generate()?;
+        let request = direct_request(
+            &source,
+            &target_recipient,
+            &target_id,
+            &secret_id,
+            &signing_key,
+        );
+
+        let created = stage_direct(&cache, &request)?;
+        assert!(!created.reused);
+        assert_eq!(std::fs::read(&created.ciphertext_path)?, source_bytes);
+        assert_eq!(
+            created.source_ciphertext_hash,
+            created.artifact_ciphertext_hash
+        );
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(
+            File::open(&created.ciphertext_path)?,
+            &mut plaintext,
+            &target_identity,
+        )?;
+        assert_eq!(plaintext, b"direct-canary");
+        assert!(stage_direct(&cache, &request)?.reused);
         Ok(())
     }
 
