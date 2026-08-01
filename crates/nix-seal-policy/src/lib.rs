@@ -290,7 +290,14 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
     let mut signer_keys = BTreeMap::new();
     for (id, identity) in &plan.identities {
         if matches!(identity.kind, IdentityKind::Signer)
-            && let Some(previous) = signer_keys.insert(&identity.public, id)
+            && let Some(previous) = signer_keys.insert(
+                nix_seal_manifest::public_key_id(&identity.public).map_err(|_| {
+                    PolicyError::Violation(format!(
+                        "identity {id} has an invalid approval verification key"
+                    ))
+                })?,
+                id,
+            )
         {
             return Err(PolicyError::Violation(format!(
                 "signer identities {previous} and {id} reuse one public verification key"
@@ -1214,6 +1221,7 @@ mod tests {
     use std::collections::BTreeMap;
     const RECIPIENT: &str = "age1ml79lp4sk2gz59n3xux5xhasg7p5qa0pnm634rd8pnw80avag4js2etr0l";
     const SIGNER: &str = "nix-seal-ed25519-v1:EcFcZVkcYsuXdMDG2JyOsyuoCExdGk0yUwLVriY0Vyw=";
+    const SSH_SIGNER: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti release@example.com";
     #[test]
     fn empty_plan_is_stable_and_valid() -> Result<(), PolicyError> {
         let plan = PlanV1::default();
@@ -1332,6 +1340,31 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_openssh_signer_keys_ignore_public_comments() -> Result<(), PolicyError> {
+        let mut plan = PlanV1::default();
+        let first =
+            Id::parse("signer-a").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let second =
+            Id::parse("signer-b").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.identities.insert(
+            first,
+            nix_seal_core::Identity {
+                kind: IdentityKind::Signer,
+                public: SSH_SIGNER.to_owned(),
+            },
+        );
+        plan.identities.insert(
+            second,
+            nix_seal_core::Identity {
+                kind: IdentityKind::Signer,
+                public: SSH_SIGNER.replace("release@example.com", "incident@example.com"),
+            },
+        );
+        assert!(validate(&plan).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn encryption_identities_require_a_valid_age_recipient() -> Result<(), PolicyError> {
         let mut plan = PlanV1::default();
         let id = Id::parse("administrator")
@@ -1360,6 +1393,21 @@ mod tests {
         );
         assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
         Ok(())
+    }
+
+    #[test]
+    fn signer_identities_accept_openssh_ed25519_approval_keys() -> Result<(), PolicyError> {
+        let mut plan = PlanV1::default();
+        let id =
+            Id::parse("ssh-signer").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.identities.insert(
+            id,
+            Identity {
+                kind: IdentityKind::Signer,
+                public: SSH_SIGNER.to_owned(),
+            },
+        );
+        validate(&plan)
     }
 
     #[test]
@@ -1771,6 +1819,16 @@ mod tests {
         assert_eq!(report[0].state, LifecycleStateV1::Expired);
         assert_eq!(report[1].secret_id, rotating);
         assert_eq!(report[1].state, LifecycleStateV1::RotationDue);
+        Ok(())
+    }
+
+    #[test]
+    fn checked_in_plan_schema_matches_the_released_schema_generator()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let generated: serde_json::Value = serde_json::from_str(&json_schema()?)?;
+        let checked_in: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/plan-v1.schema.json"))?;
+        assert_eq!(generated, checked_in);
         Ok(())
     }
 }

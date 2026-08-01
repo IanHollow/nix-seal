@@ -470,15 +470,10 @@ pub fn edit_secret_checked<F>(
 where
     F: FnOnce(&mut File) -> Result<(), AuthoringError>,
 {
-    if !request.editor.is_absolute() || !request.workspace_root.is_absolute() {
-        return Err(AuthoringError::Editor);
-    }
+    let editor = resolve_editor_executable(request.editor)?;
     let destination = resolve_destination(request.repository_root, request.relative_destination)?;
     validate_destination(&destination, WriteMode::Replace)?;
-    let workspace_root = request
-        .workspace_root
-        .canonicalize()
-        .map_err(AuthoringError::Io)?;
+    let workspace_root = resolve_editor_workspace_root(request.workspace_root)?;
     let workspace = tempfile::Builder::new()
         .prefix("nix-seal-edit-")
         .tempdir_in(workspace_root)
@@ -499,7 +494,7 @@ where
     plaintext.sync_all().map_err(AuthoringError::Io)?;
     drop(plaintext);
 
-    let status = Command::new(request.editor)
+    let status = Command::new(editor)
         .args(request.editor_arguments)
         .arg(&plaintext_path)
         .env_clear()
@@ -521,6 +516,64 @@ where
         request.identity,
         WriteMode::Replace,
     )
+}
+
+/// Validates that an explicit editor resolves to a regular executable.
+///
+/// The editor is intentionally user-selected and therefore remains part of the
+/// authoring workstation's trusted computing base. This type check does not
+/// reduce that trust boundary; it rejects accidental non-executable targets.
+fn resolve_editor_executable(path: &Path) -> Result<PathBuf, AuthoringError> {
+    if !path.is_absolute() {
+        return Err(AuthoringError::Editor);
+    }
+    let canonical = path.canonicalize().map_err(|_| AuthoringError::Editor)?;
+    let canonical_metadata =
+        std::fs::symlink_metadata(&canonical).map_err(|_| AuthoringError::Editor)?;
+    if canonical_metadata.file_type().is_symlink()
+        || !is_executable_regular_file(&canonical_metadata)
+    {
+        return Err(AuthoringError::Editor);
+    }
+    // Retain the supplied path for execution. Some Nix tools are applet
+    // symlinks (for example `cp` -> `coreutils`), where invoking the resolved
+    // multicall binary would change the selected program. The editor remains
+    // an explicit user-trusted executable; this validation only prevents an
+    // accidental non-executable target.
+    Ok(path.to_owned())
+}
+
+#[cfg(unix)]
+fn is_executable_regular_file(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable_regular_file(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_file()
+}
+
+/// Resolves a private-workspace parent without following a user-supplied link.
+fn resolve_editor_workspace_root(path: &Path) -> Result<PathBuf, AuthoringError> {
+    if !path.is_absolute() {
+        return Err(AuthoringError::Editor);
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| AuthoringError::Editor)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(AuthoringError::Editor);
+    }
+    let canonical = path.canonicalize().map_err(|_| AuthoringError::Editor)?;
+    let canonical_metadata =
+        std::fs::symlink_metadata(&canonical).map_err(|_| AuthoringError::Editor)?;
+    if canonical_metadata.file_type().is_symlink()
+        || !canonical_metadata.file_type().is_dir()
+        || !same_file(&metadata, &canonical_metadata)
+    {
+        return Err(AuthoringError::Editor);
+    }
+    Ok(canonical)
 }
 
 /// Atomically moves canonical ciphertext into a private, collision-safe quarantine tombstone.
@@ -1139,6 +1192,37 @@ mod tests {
             .map(|directory| directory.join(name))
             .find(|candidate| candidate.is_file())
             .ok_or_else(|| format!("test executable {name} is absent from PATH").into())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_inputs_refuse_nonexecutable_and_symlinked_workspace_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let non_executable = root.join("non-executable-editor");
+        std::fs::write(&non_executable, b"not an executable")?;
+        std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o600))?;
+        assert!(matches!(
+            resolve_editor_executable(&non_executable),
+            Err(AuthoringError::Editor)
+        ));
+
+        let executable = find_test_executable("cp")?.canonicalize()?;
+        let linked_editor = root.join("linked-editor");
+        symlink(&executable, &linked_editor)?;
+        assert_eq!(resolve_editor_executable(&linked_editor)?, linked_editor);
+
+        let linked_workspace = root.join("linked-workspace");
+        symlink(&root, &linked_workspace)?;
+        assert!(matches!(
+            resolve_editor_workspace_root(&linked_workspace),
+            Err(AuthoringError::Editor)
+        ));
+        assert_eq!(resolve_editor_workspace_root(&root)?, root);
+        Ok(())
     }
 
     #[test]

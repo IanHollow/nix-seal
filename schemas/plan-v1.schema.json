@@ -172,6 +172,14 @@
       "description": "Generator declaration.",
       "type": "object",
       "properties": {
+        "arguments": {
+          "description": "Literal public arguments passed directly to an external executable.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "dependencies": {
           "description": "Generator dependencies.",
           "type": "array",
@@ -184,12 +192,51 @@
           "description": "Built-in name or direct executable store path.",
           "type": "string"
         },
+        "maxOutputBytes": {
+          "description": "Maximum plaintext bytes accepted from each external output file.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 67108864,
+          "minimum": 0
+        },
         "outputs": {
           "description": "Declared outputs.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/Id"
           }
+        },
+        "parameters": {
+          "description": "Strict public generator parameters, such as a random-byte length.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "prompts": {
+          "description": "Explicit prompt declarations. Prompt values never enter the public plan.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GeneratorPrompt"
+          }
+        },
+        "runtimeInputs": {
+          "description": "Nix-store package roots whose `bin` directories form the generator `PATH`.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "timeoutSeconds": {
+          "description": "Maximum external-generator execution time in seconds.",
+          "type": "integer",
+          "format": "uint16",
+          "default": 30,
+          "maximum": 65535,
+          "minimum": 0
         },
         "validation": {
           "description": "Public validation fingerprint.",
@@ -198,6 +245,51 @@
       },
       "additionalProperties": false,
       "required": ["executable", "outputs"]
+    },
+    "GeneratorPrompt": {
+      "description": "One declared external-generator prompt.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "Stable prompt identifier, used to bind a private response file.",
+          "$ref": "#/$defs/Id"
+        },
+        "message": {
+          "description": "Public operator-facing prompt text.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "Whether interactive frontends should mask the response.",
+          "$ref": "#/$defs/GeneratorPromptMode"
+        },
+        "multiline": {
+          "description": "Whether the response may contain multiple lines.",
+          "type": "boolean",
+          "default": false
+        },
+        "persistent": {
+          "description": "Whether a later persistent-prompt backend may retain the response.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": ["id", "mode", "message"]
+    },
+    "GeneratorPromptMode": {
+      "description": "Display behavior for an external-generator prompt.",
+      "oneOf": [
+        {
+          "description": "Input should not be echoed by an interactive frontend.",
+          "type": "string",
+          "const": "hidden"
+        },
+        {
+          "description": "Input may be displayed by an interactive frontend.",
+          "type": "string",
+          "const": "visible"
+        }
+      ]
     },
     "Group": {
       "description": "Named group of `IDs`.",

@@ -22,13 +22,16 @@ directory-fsync failure is reported as durability-unknown because the atomic
 change may already be visible.
 
 Edit decrypts into a mode-0600 file inside a private ephemeral workspace. The
-editor executable must be an explicit absolute path; no shell is invoked and the
-environment is cleared. After a successful exit, the edited path is reopened
-without following links and must remain a single-link regular file owned by the
-current user with no group/other permissions. The normal verified replacement
-transaction then re-encrypts it. The workspace is removed on every return path.
-Editors remain in the threat model: a malicious editor can read plaintext and
-may deliberately copy it elsewhere.
+editor executable must be an explicit absolute path that resolves to a regular
+executable; no shell is invoked and the environment is cleared. The workspace
+parent itself must be a non-symlink directory, so an attacker cannot redirect
+the private temporary directory through a supplied path. After a successful
+exit, the edited path is reopened without following links and must remain a
+single-link regular file owned by the current user with no group/other
+permissions. The normal verified replacement transaction then re-encrypts it.
+The workspace is removed on every return path. Editors remain in the threat
+model: a malicious editor can read plaintext and may deliberately copy it
+elsewhere.
 
 When the caller declares a JSON, TOML, or strict dotenv collection format, the
 private edited file is bounded and validated before it is encrypted; validation
