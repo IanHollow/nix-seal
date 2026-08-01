@@ -35,7 +35,9 @@ descriptor creation, so a substituted lock or symlink cannot redirect a write.
 Cache paths are canonicalized through existing directory ancestry before
 creation, rejecting a symlink at the configured root while resolving normal
 platform aliases such as macOS `/var`; export destinations apply the same rule
-to their parent and never replace an existing leaf. This prevents a symlinked
+to their parent and publish with an atomic no-replace rename. Artifact bundle
+publication uses the same primitive, so a destination substituted after the
+initial existence check cannot be overwritten. This prevents a symlinked
 spelling from silently redirecting cache state while preserving portable cache
 locations. Inventory validates each content hash, artifact bundle name, exact
 bundle member set, byte bound, and private metadata before reporting aggregate
@@ -57,7 +59,7 @@ explicit allow-list before it can tighten this decision.
 
 The v1 cache exchange format is a directory containing only the verified
 `objects/` and `artifacts/` layouts. Export stages a new private directory and
-publishes it with one rename, refusing to replace an existing destination. It
+publishes it with one atomic no-replace rename, refusing to replace an existing destination. It
 does not copy identities, plaintext, locks, or transactions. Import is
 append-only and idempotent for byte-identical entries; a matching address with
 different ciphertext or envelope fails closed. Artifact authorization remains a

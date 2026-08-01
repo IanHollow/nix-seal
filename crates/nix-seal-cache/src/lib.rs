@@ -332,7 +332,7 @@ impl Cache {
         File::open(&staged)?.sync_all()?;
         let staged = transaction.keep();
         let published = staged.join("cache");
-        std::fs::rename(&published, &destination)?;
+        rename_noreplace(&published, &destination)?;
         File::open(&parent)?.sync_all()?;
         std::fs::remove_dir(staged)?;
         Ok(report)
@@ -386,9 +386,9 @@ impl Cache {
         File::open(transaction.path())?.sync_all()?;
 
         let staged = transaction.keep();
-        if let Err(error) = std::fs::rename(&staged, &destination) {
+        if let Err(error) = rename_noreplace(&staged, &destination) {
             let _ = std::fs::remove_dir_all(&staged);
-            return Err(error.into());
+            return Err(error);
         }
         File::open(&artifacts)?.sync_all()?;
         FileExt::unlock(&lock)?;
@@ -760,6 +760,52 @@ fn checked_transfer_bytes(total: u64, additional: u64) -> Result<u64, CacheError
     total.checked_add(additional).ok_or(CacheError::Limit)
 }
 
+/// Publishes a newly-created cache entry without ever replacing an existing
+/// destination. The initial `symlink_metadata` checks remain useful for
+/// diagnostics, but this operation is the security boundary: concurrent
+/// writers and same-user filesystem races cannot turn publication into an
+/// overwrite.
+fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), CacheError> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{RenameFlags, renameat_with};
+
+        let source_parent = source.parent().ok_or(CacheError::UnsafeMetadata)?;
+        let source_name = source.file_name().ok_or(CacheError::UnsafeMetadata)?;
+        let destination_parent = destination.parent().ok_or(CacheError::UnsafeMetadata)?;
+        let destination_name = destination.file_name().ok_or(CacheError::UnsafeMetadata)?;
+        let source_directory = open_directory_nofollow(source_parent)?;
+        let destination_directory = open_directory_nofollow(destination_parent)?;
+        renameat_with(
+            &source_directory,
+            source_name,
+            &destination_directory,
+            destination_name,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| {
+            if error == rustix::io::Errno::EXIST {
+                CacheError::DestinationExists
+            } else {
+                CacheError::Io(error.into())
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        // nix-seal's supported runtime platforms are Unix. Keep a safe
+        // fallback for compilation on other targets; there is no supported
+        // atomic no-replace rename primitive in the standard library there.
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) => Err(CacheError::DestinationExists),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::rename(source, destination).map_err(CacheError::Io)
+            }
+            Err(error) => Err(CacheError::Io(error)),
+        }
+    }
+}
+
 fn read_directory_if_present(path: &Path) -> Result<Option<std::fs::ReadDir>, CacheError> {
     match std::fs::read_dir(path) {
         Ok(entries) => Ok(Some(entries)),
@@ -858,6 +904,31 @@ fn read_bounded(file: &mut File, limit: u64) -> Result<Vec<u8>, CacheError> {
         return Err(CacheError::Limit);
     }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_directory_nofollow(path: &Path) -> Result<File, CacheError> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
+        return Err(CacheError::UnsafeMetadata);
+    }
+    Ok(File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn open_directory_nofollow(path: &Path) -> Result<File, CacheError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(CacheError::UnsafeMetadata);
+    }
+    File::open(path).map_err(CacheError::from)
 }
 
 #[cfg(unix)]
@@ -1367,6 +1438,25 @@ mod tests {
             conflicting.import_from(&exchange),
             Err(CacheError::Conflict)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn no_replace_publication_never_overwrites_existing_destination() -> Result<(), CacheError> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        std::fs::create_dir(&source)?;
+        std::fs::create_dir(&destination)?;
+        std::fs::write(source.join("new"), b"new")?;
+        std::fs::write(destination.join("old"), b"old")?;
+
+        assert!(matches!(
+            rename_noreplace(&source, &destination),
+            Err(CacheError::DestinationExists)
+        ));
+        assert_eq!(std::fs::read(destination.join("old"))?, b"old");
+        assert_eq!(std::fs::read(source.join("new"))?, b"new");
         Ok(())
     }
 
