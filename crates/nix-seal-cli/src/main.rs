@@ -760,6 +760,7 @@ fn run_plan(
 ) -> Result<()> {
     let plan = load_plan(toml, nix_plan)?;
     nix_seal_policy::validate(&plan)?;
+    validate_plan_identity_material(&plan, false)?;
     let plan_hash = nix_seal_policy::plan_hash(&plan)?;
     if let Some(target) = target {
         let policy = nix_seal_policy::target_policy(&plan, &target)?;
@@ -817,6 +818,7 @@ fn run_check(
 ) -> Result<()> {
     let plan = load_plan(toml, nix_plan)?;
     nix_seal_policy::validate(&plan)?;
+    validate_plan_identity_material(&plan, false)?;
     let hash = nix_seal_policy::plan_hash(&plan)?;
     if deep {
         deep_check_plan(&plan, repository_root)?;
@@ -3816,25 +3818,7 @@ fn read_plan_bounded(path: &Path) -> Result<nix_seal_core::PlanV1> {
 }
 
 fn deep_check_plan(plan: &nix_seal_core::PlanV1, repository_root: &Path) -> Result<()> {
-    let mut trusted = nix_seal_manifest::TrustedKeys::new();
-    for (id, identity) in &plan.identities {
-        match identity.kind {
-            nix_seal_core::IdentityKind::Signer => {
-                trusted
-                    .insert_encoded(&identity.public)
-                    .with_context(|| format!("signer identity {id} is malformed or duplicated"))?;
-            }
-            nix_seal_core::IdentityKind::Plugin => {
-                bail!("identity {id} uses a plugin that this release cannot deeply validate");
-            }
-            nix_seal_core::IdentityKind::Administrator
-            | nix_seal_core::IdentityKind::Target
-            | nix_seal_core::IdentityKind::Recovery => {
-                nix_seal_crypto::recipient_fingerprint(&identity.public)
-                    .with_context(|| format!("recipient identity {id} is malformed"))?;
-            }
-        }
-    }
+    validate_plan_identity_material(plan, true)?;
     for (secret_id, secret) in &plan.secrets {
         let recipients = nix_seal_policy::secret_recipients(plan, secret_id)?;
         for recipient in recipients.recipients.values() {
@@ -3853,6 +3837,31 @@ fn deep_check_plan(plan: &nix_seal_core::PlanV1, repository_root: &Path) -> Resu
         let policy = nix_seal_policy::target_policy(plan, target_id)?;
         nix_seal_crypto::recipient_fingerprint(&policy.recipient)
             .with_context(|| format!("target {target_id} recipient is malformed"))?;
+    }
+    Ok(())
+}
+
+fn validate_plan_identity_material(plan: &nix_seal_core::PlanV1, deep: bool) -> Result<()> {
+    let mut trusted = nix_seal_manifest::TrustedKeys::new();
+    for (id, identity) in &plan.identities {
+        match identity.kind {
+            nix_seal_core::IdentityKind::Signer => {
+                trusted
+                    .insert_encoded(&identity.public)
+                    .with_context(|| format!("signer identity {id} is malformed or duplicated"))?;
+            }
+            nix_seal_core::IdentityKind::Plugin => {
+                if deep {
+                    bail!("identity {id} uses a plugin that this release cannot deeply validate");
+                }
+            }
+            nix_seal_core::IdentityKind::Administrator
+            | nix_seal_core::IdentityKind::Target
+            | nix_seal_core::IdentityKind::Recovery => {
+                nix_seal_crypto::recipient_fingerprint(&identity.public)
+                    .with_context(|| format!("recipient identity {id} is malformed"))?;
+            }
+        }
     }
     Ok(())
 }
@@ -4736,6 +4745,22 @@ mod tests {
             serde_json::to_value(&identities)?[0]["kind"],
             serde_json::Value::String("administrator".to_owned())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn routine_validation_rejects_malformed_identity_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.identities.insert(
+            nix_seal_core::Id::parse("administrator")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: "not-an-age-recipient".to_owned(),
+            },
+        );
+        nix_seal_policy::validate(&plan)?;
+        assert!(validate_plan_identity_material(&plan, false).is_err());
         Ok(())
     }
 
