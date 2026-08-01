@@ -332,7 +332,7 @@ fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
             || secret
                 .source
                 .split('/')
-                .any(|part| part == ".." || part.is_empty())
+                .any(|part| part == "." || part == ".." || part.is_empty())
         {
             return Err(PolicyError::Violation(format!(
                 "secret {id} source must be a normalized repository-relative path"
@@ -1558,6 +1558,49 @@ mod tests {
         assert!(!valid_store_executable(
             "/nix/store/abc123:unsafe/bin/generate"
         ));
+    }
+
+    #[test]
+    fn canonical_secret_sources_reject_dot_segments() -> Result<(), PolicyError> {
+        assert!(!valid_repository_relative_path("secrets/./database.age"));
+
+        let mut plan = PlanV1::default();
+        plan.identities.insert(
+            Id::parse("administrator")
+                .map_err(|error| PolicyError::Violation(error.to_string()))?,
+            Identity {
+                kind: IdentityKind::Administrator,
+                public: RECIPIENT.to_owned(),
+            },
+        );
+        plan.identities.insert(
+            Id::parse("signer").map_err(|error| PolicyError::Violation(error.to_string()))?,
+            Identity {
+                kind: IdentityKind::Signer,
+                public: SIGNER.to_owned(),
+            },
+        );
+        plan.secrets.insert(
+            Id::parse("database/password")
+                .map_err(|error| PolicyError::Violation(error.to_string()))?,
+            Secret {
+                source: "secrets/./database.age".to_owned(),
+                delivery: DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: Vec::new(),
+                selectors: nix_seal_core::TargetSelectors::default(),
+                phase: ActivationPhase::Activation,
+                runtime: RuntimeSettings::default(),
+                lifecycle: Lifecycle::default(),
+                approval_policy: None,
+                repository_only: false,
+            },
+        );
+        assert!(matches!(
+            validate(&plan),
+            Err(PolicyError::Violation(message)) if message.contains("normalized repository-relative")
+        ));
+        Ok(())
     }
 
     #[test]
