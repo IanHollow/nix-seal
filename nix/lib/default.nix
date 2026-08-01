@@ -23,4 +23,18 @@
 
   validId =
     value: builtins.match "[a-z0-9._-]+(/[a-z0-9._-]+)*" value != null && !(lib.hasInfix ".." value);
+
+  # Public, evaluated bridge for agenix-rekey migration. `rekeyFile` values must
+  # be repository-relative strings (not Nix path values, which coerce to store
+  # paths). Call `nix-seal migrate agenix-rekey --metadata` on the JSON output.
+  agenixRekeyMigrationExport =
+    {
+      target,
+      masterRecipients,
+      secrets,
+    }:
+    builtins.toJSON {
+      schema = "nix-seal.agenix-rekey-export.v1";
+      inherit target masterRecipients secrets;
+    };
 }
