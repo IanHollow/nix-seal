@@ -264,6 +264,17 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
             "identity public values must be nonempty and bounded".to_owned(),
         ));
     }
+    for (id, identity) in &plan.identities {
+        if matches!(
+            identity.kind,
+            IdentityKind::Administrator | IdentityKind::Target | IdentityKind::Recovery
+        ) && nix_seal_crypto::normalize_recipient(&identity.public).is_err()
+        {
+            return Err(PolicyError::Violation(format!(
+                "identity {id} has an invalid age recipient"
+            )));
+        }
+    }
     let mut signer_keys = BTreeMap::new();
     for (id, identity) in &plan.identities {
         if matches!(identity.kind, IdentityKind::Signer)
@@ -1189,6 +1200,7 @@ mod tests {
         TargetKind, Template, TemplateEncoding, TemplatePlaceholder,
     };
     use std::collections::BTreeMap;
+    const RECIPIENT: &str = "age1ml79lp4sk2gz59n3xux5xhasg7p5qa0pnm634rd8pnw80avag4js2etr0l";
     #[test]
     fn empty_plan_is_stable_and_valid() -> Result<(), PolicyError> {
         let plan = PlanV1::default();
@@ -1307,6 +1319,22 @@ mod tests {
     }
 
     #[test]
+    fn encryption_identities_require_a_valid_age_recipient() -> Result<(), PolicyError> {
+        let mut plan = PlanV1::default();
+        let id = Id::parse("administrator")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.identities.insert(
+            id,
+            Identity {
+                kind: IdentityKind::Administrator,
+                public: "not-an-age-recipient".to_owned(),
+            },
+        );
+        assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
+        Ok(())
+    }
+
+    #[test]
     fn templates_require_valid_secret_bindings_and_noncolliding_outputs() -> Result<(), PolicyError>
     {
         let mut plan = PlanV1::default();
@@ -1323,7 +1351,7 @@ mod tests {
                 .map_err(|error| PolicyError::Violation(error.to_string()))?,
             Identity {
                 kind: IdentityKind::Administrator,
-                public: "age1administrator".to_owned(),
+                public: RECIPIENT.to_owned(),
             },
         );
         let secret_id =
@@ -1437,14 +1465,14 @@ mod tests {
                 .map_err(|error| PolicyError::Violation(error.to_string()))?,
             Identity {
                 kind: IdentityKind::Administrator,
-                public: "age1administrator".to_owned(),
+                public: RECIPIENT.to_owned(),
             },
         );
         plan.identities.insert(
             recipient_id.clone(),
             Identity {
                 kind: IdentityKind::Target,
-                public: "age1target-recipient".to_owned(),
+                public: RECIPIENT.to_owned(),
             },
         );
         for id in [&target_id, &other_target_id] {
@@ -1591,10 +1619,10 @@ mod tests {
         let group = Id::parse("hosts")?;
         let secret = Id::parse("db/password")?;
         for (id, kind, public) in [
-            (&admin, IdentityKind::Administrator, "age1admin"),
-            (&recovery, IdentityKind::Recovery, "age1recovery"),
+            (&admin, IdentityKind::Administrator, RECIPIENT),
+            (&recovery, IdentityKind::Recovery, RECIPIENT),
             (&signer, IdentityKind::Signer, "signer-public"),
-            (&target_identity, IdentityKind::Target, "age1target"),
+            (&target_identity, IdentityKind::Target, RECIPIENT),
         ] {
             plan.identities.insert(
                 id.clone(),
@@ -1658,7 +1686,7 @@ mod tests {
             admin,
             Identity {
                 kind: IdentityKind::Administrator,
-                public: "age1admin".to_owned(),
+                public: RECIPIENT.to_owned(),
             },
         );
         let rotating = Id::parse("rotating")?;

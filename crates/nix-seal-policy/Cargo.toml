@@ -10,6 +10,7 @@ repository.workspace = true
 blake3.workspace = true
 jiff.workspace = true
 nix-seal-core.workspace = true
+nix-seal-crypto.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

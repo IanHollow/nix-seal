@@ -6103,8 +6103,7 @@ mod tests {
                 public: "not-an-age-recipient".to_owned(),
             },
         );
-        nix_seal_policy::validate(&plan)?;
-        assert!(validate_plan_identity_material(&plan, false).is_err());
+        assert!(nix_seal_policy::validate(&plan).is_err());
         Ok(())
     }
 

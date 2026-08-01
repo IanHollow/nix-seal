@@ -1367,6 +1367,7 @@ dependencies = [
  "blake3",
  "jiff",
  "nix-seal-core",
+ "nix-seal-crypto",
  "schemars",
  "serde",
  "serde_jcs",

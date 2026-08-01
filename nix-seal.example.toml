@@ -2,11 +2,11 @@ schema = "nix-seal.plan.v1"
 
 [identities.admin]
 kind = "administrator"
-public = "age1replace-with-a-public-recipient"
+public = "age1ml79lp4sk2gz59n3xux5xhasg7p5qa0pnm634rd8pnw80avag4js2etr0l"
 
 [identities.server]
 kind = "target"
-public = "age1replace-with-a-public-recipient"
+public = "age1ml79lp4sk2gz59n3xux5xhasg7p5qa0pnm634rd8pnw80avag4js2etr0l"
 
 [identities.release]
 kind = "signer"
