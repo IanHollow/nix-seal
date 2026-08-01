@@ -242,7 +242,11 @@ fn validate_age_header_structure(ciphertext: &[u8]) -> Result<(), CryptoError> {
         if expects_body
             && !(grease_stanza && (line.starts_with(b"-> ") || line.starts_with(b"--- ")))
         {
-            if line.is_empty()
+            // A GREASE stanza may have an empty body, including the empty
+            // terminating line required for a body whose encoded length is a
+            // multiple of 64. Treating that line as malformed made otherwise
+            // valid age output fail nondeterministically.
+            if (line.is_empty() && !grease_stanza)
                 || line.starts_with(b"->")
                 || line.starts_with(b"---")
                 || (!long_body_stanza && line.len() >= 64)
@@ -347,6 +351,21 @@ agAAAAtzc2gtZWQyNTUxOQAAACB7Ci6nqZYaVvrjm8+XbzII89TsXzP111AflR7WeorBjQ\n\
 AAAEADBJvjZT8X6JRJI8xVq/1aU8nMVgOtVnmdwqWwrSlXG3sKLqeplhpW+uObz5dvMgjz\n\
 1OxfM/XXUB+VHtZ6isGNAAAADHN0cjRkQGNhcmJvbgE=\n\
 -----END_OPENSSH_PRIVATE_KEY-----\n";
+
+    #[test]
+    fn accepts_an_empty_grease_stanza_body() {
+        // The age format permits a GREASE stanza with an empty body. The
+        // Rust age implementation emits these at random, so rejecting one
+        // makes otherwise-valid encryption and rekey operations flaky.
+        let header = b"age-encryption.org/v1\n\
+-> X25519 recipient\n\
+body\n\
+-> test-grease\n\
+\n\
+--- mac\n";
+
+        assert!(validate_age_header_structure(header).is_ok());
+    }
 
     #[test]
     fn x25519_round_trip() -> Result<(), CryptoError> {
