@@ -21,8 +21,7 @@ let
   idIsValid =
     value: builtins.match "[a-z0-9._-]+(/[a-z0-9._-]+)*" value != null && !lib.hasInfix ".." value;
   idType = types.addCheck types.str idIsValid;
-  privateIdentityPathIsSafe =
-    value: lib.hasPrefix "/" value && !(lib.hasPrefix "/nix/store/" value);
+  privateIdentityPathIsSafe = value: lib.hasPrefix "/" value && !(lib.hasPrefix "/nix/store/" value);
   unitType = types.strMatching "[A-Za-z0-9_.@:-]{1,256}";
   serviceUnitType = types.strMatching "[A-Za-z0-9_.@:-]{1,247}\\.service";
   credentialNameType = types.addCheck (types.strMatching "[A-Za-z0-9_.@-]{1,255}") (

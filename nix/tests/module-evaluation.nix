@@ -226,8 +226,7 @@ in
       touch "$out"
     '';
   module-identity-policy =
-    assert hasFailedAssertion
-      "nixSeal.identityFile must be an absolute path outside /nix/store"
+    assert hasFailedAssertion "nixSeal.identityFile must be an absolute path outside /nix/store"
       unsafeIdentityPath;
     pkgs.runCommand "nix-seal-module-identity-policy" { } ''
       touch "$out"
