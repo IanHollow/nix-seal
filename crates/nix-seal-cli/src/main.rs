@@ -3814,6 +3814,7 @@ fn read_plan_bounded(path: &Path) -> Result<nix_seal_core::PlanV1> {
     let plan: nix_seal_core::PlanV1 =
         serde_json::from_slice(&bytes).context("invalid strict plan.v1 JSON")?;
     nix_seal_policy::validate(&plan)?;
+    validate_plan_identity_material(&plan, false)?;
     Ok(plan)
 }
 
