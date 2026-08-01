@@ -4047,6 +4047,39 @@ mod tests {
     }
 
     #[test]
+    fn sops_migration_commits_only_after_external_success() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        fs::create_dir(root.join("legacy"))?;
+        fs::create_dir(root.join("secrets"))?;
+        fs::write(root.join("legacy/source.yaml"), b"ignored by test producer")?;
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        let identity_path = root.join("identity.age");
+        write_private_bytes(&identity_path, identity.expose_secret().as_bytes())?;
+        migrate_sops_document(
+            &root,
+            Path::new("legacy/source.yaml"),
+            Path::new("secrets/result.age"),
+            Path::new("/usr/bin/true"),
+            None,
+            &identity_path,
+            &[recipient],
+            false,
+            true,
+            false,
+        )?;
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(
+            fs::File::open(root.join("secrets/result.age"))?,
+            &mut plaintext,
+            &identity,
+        )?;
+        assert!(plaintext.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn built_in_generators_are_bounded_and_format_safe() -> Result<(), Box<dyn std::error::Error>> {
         let output = nix_seal_core::Id::parse("application/token")?;
         let random = nix_seal_core::Generator {
