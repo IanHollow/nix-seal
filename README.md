@@ -10,6 +10,9 @@ The scale benchmark and its reporting protocol are documented in
 benchmark output with runner metadata; timing numbers are never presented as
 environment-independent claims.
 
+Release build, SBOM, checksum, and OIDC attestation controls are documented in
+[`docs/release.md`](docs/release.md).
+
 The target decryption identity is always an absolute out-of-store runtime path;
 the Nix modules reject relative paths and `/nix/store` paths for it.
 

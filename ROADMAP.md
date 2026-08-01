@@ -14,8 +14,8 @@
   starting with a synthetic low-risk secret.
 - Phase 5: attack-path review, sustained fuzz/mutation/platform/performance work
   (the reproducible scale benchmark protocol and scheduled Miri, sanitizer, and
-  mutation jobs are now published), release candidate, independent audit and
-  remediation, then 1.0.
+  mutation jobs are now published), release build/SBOM/attestation scaffolding,
+  release candidate, independent audit and remediation, then 1.0.
 
 ## Verified supply-chain follow-ups
 
