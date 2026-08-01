@@ -328,12 +328,7 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
 fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
     let mut sources = BTreeSet::new();
     for (id, secret) in &plan.secrets {
-        if secret.source.starts_with('/')
-            || secret
-                .source
-                .split('/')
-                .any(|part| part == "." || part == ".." || part.is_empty())
-        {
+        if !valid_repository_relative_path(&secret.source) {
             return Err(PolicyError::Violation(format!(
                 "secret {id} source must be a normalized repository-relative path"
             )));
@@ -1563,6 +1558,7 @@ mod tests {
     #[test]
     fn canonical_secret_sources_reject_dot_segments() -> Result<(), PolicyError> {
         assert!(!valid_repository_relative_path("secrets/./database.age"));
+        assert!(!valid_repository_relative_path("secrets/\n-database.age"));
 
         let mut plan = PlanV1::default();
         plan.identities.insert(
