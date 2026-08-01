@@ -595,8 +595,13 @@ For agenix-rekey, expose one public evaluated configuration with
 (`local` or `derivation`); `masterRecipients` contains only public master
 recipients. Each secret maps to a repository-relative string `rekeyFile` and may
 set `intermediary = true`. The inventory validates all of those public values,
-normalizes recipients, and preserves intermediary secrets as repository-only. It
-does not infer private runtime configuration or rewrite ciphertext.
+normalizes recipients, and preserves intermediary secrets as repository-only.
+Supplying `--destination`, `--identity`, and one or more `--recipient` values
+enables the same dry-run-first, side-by-side bulk rekey flow as agenix/ragenix;
+`--execute` is required before the private identity is opened. Every source is
+staged and round-trip verified before any destination changes, while the legacy
+tree remains intact for rollback. It does not infer private runtime
+configuration or rewrite the legacy ciphertext.
 
 ```nix
 nixSeal.lib.agenixRekeyMigrationExport {

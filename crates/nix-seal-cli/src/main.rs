@@ -721,6 +721,32 @@ struct AgeTreeMigrationArgs {
     execute: bool,
 }
 
+#[derive(Args)]
+struct AgenixRekeyMigrationArgs {
+    /// Public agenix-rekey export produced by `nixSeal.lib.agenixRekeyMigrationExport`.
+    #[arg(long)]
+    metadata: PathBuf,
+    /// Repository root containing the legacy rekey files and destination tree.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Repository-relative destination tree for a side-by-side import.
+    #[arg(long)]
+    destination: Option<PathBuf>,
+    /// Private administrator/recovery identity that can decrypt every source file.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Explicit replacement recipient; repeat for each recipient.
+    #[arg(long = "recipient")]
+    recipients: Vec<String>,
+    /// Replace existing destination ciphertexts; omission is create-only.
+    #[arg(long)]
+    replace: bool,
+    /// Commit the complete preflighted migration. Without this flag the command
+    /// reports the mapping and never reads the private identity.
+    #[arg(long)]
+    execute: bool,
+}
+
 #[derive(Subcommand)]
 enum MigrateCommand {
     /// Inspect a public secretctl `secretIndex` JSON export and optionally write a new candidate plan.
@@ -744,12 +770,8 @@ enum MigrateCommand {
     /// Inspect or bulk-rekey a ragenix ciphertext tree; its ciphertext layout
     /// is agenix-compatible.
     Ragenix(AgeTreeMigrationArgs),
-    /// Inspect a strict public agenix-rekey configuration export without decrypting data.
-    AgenixRekey {
-        /// JSON produced by `nixSeal.lib.agenixRekeyMigrationExport`.
-        #[arg(long)]
-        metadata: PathBuf,
-    },
+    /// Inspect or bulk-rekey a strict public agenix-rekey configuration export.
+    AgenixRekey(AgenixRekeyMigrationArgs),
     /// Inspect structured SOPS JSON files without decrypting values or invoking SOPS.
     SopsJson {
         /// Existing directory containing SOPS-encrypted `*.json` files.
@@ -1525,7 +1547,7 @@ fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
         ),
         MigrateCommand::Agenix(arguments) => migrate_agenix_tree(&arguments, "agenix", json),
         MigrateCommand::Ragenix(arguments) => migrate_agenix_tree(&arguments, "ragenix", json),
-        MigrateCommand::AgenixRekey { metadata } => migrate_agenix_rekey_export(&metadata, json),
+        MigrateCommand::AgenixRekey(arguments) => migrate_agenix_rekey_export(&arguments, json),
         MigrateCommand::SopsJson { directory } => migrate_sops_json_tree(&directory, json),
         MigrateCommand::Sops {
             repository_root,
@@ -2329,8 +2351,9 @@ fn migrate_agenix_tree(arguments: &AgeTreeMigrationArgs, source: &str, json: boo
     Ok(())
 }
 
-fn migrate_agenix_rekey_export(metadata: &Path, json: bool) -> Result<()> {
-    let input = open_public_ciphertext(metadata)
+#[allow(clippy::too_many_lines)]
+fn migrate_agenix_rekey_export(arguments: &AgenixRekeyMigrationArgs, json: bool) -> Result<()> {
+    let input = open_public_ciphertext(&arguments.metadata)
         .context("agenix-rekey metadata must be a regular non-symlink file")?;
     let export: AgenixRekeyExportV1 = serde_json::from_reader(input)
         .context("agenix-rekey metadata is not a valid strict JSON export")?;
@@ -2366,26 +2389,111 @@ fn migrate_agenix_rekey_export(metadata: &Path, json: bool) -> Result<()> {
     if masters.len() != export.master_recipients.len() {
         bail!("agenix-rekey metadata contains duplicate master recipients");
     }
+    let import_requested = arguments.destination.is_some()
+        || arguments.identity.is_some()
+        || !arguments.recipients.is_empty()
+        || arguments.replace
+        || arguments.execute;
     let mut mappings = Vec::with_capacity(export.secrets.len());
-    for (legacy_id, secret) in export.secrets {
-        let source = validate_agenix_rekey_source(&secret.rekey_file)?;
-        mappings.push(serde_json::json!({
-            "legacyId":legacy_id,
-            "nixSealId":migrated_id(&legacy_id)?,
-            "source":source,
-            "consumers":if secret.intermediary { Vec::<String>::new() } else { vec![target_id.to_string()] },
-            "repositoryOnly":secret.intermediary,
-        }));
+    let mut entries = Vec::with_capacity(export.secrets.len());
+    let mut replacement_recipients = Vec::new();
+    if import_requested {
+        let repository_root = resolve_migration_repository_root(&arguments.repository_root)?;
+        let destination = arguments
+            .destination
+            .as_deref()
+            .context("bulk agenix-rekey migration requires --destination")?;
+        validate_migration_relative_path(destination, "destination")?;
+        if destination == Path::new(".") {
+            bail!("bulk agenix-rekey destination must be a separate repository tree");
+        }
+        replacement_recipients = normalize_migration_recipients(&arguments.recipients)?;
+        let identity_path = arguments
+            .identity
+            .as_deref()
+            .context("bulk agenix-rekey migration requires --identity")?;
+        if !identity_path.is_absolute() {
+            bail!("bulk agenix-rekey migration identity must be an absolute private path");
+        }
+        let destination_root = repository_root.join(destination);
+        for (legacy_id, secret) in &export.secrets {
+            let relative_source = PathBuf::from(validate_agenix_rekey_source(&secret.rekey_file)?);
+            let source = resolve_migration_regular_file(&repository_root, &relative_source)?;
+            if destination_root.starts_with(&source) || source.starts_with(&destination_root) {
+                bail!("bulk agenix-rekey destination must not overlap a legacy source");
+            }
+            let relative_destination = destination.join(&relative_source);
+            let nix_id = migrated_id(legacy_id)?;
+            mappings.push(serde_json::json!({
+                "legacyId":legacy_id,
+                "nixSealId":nix_id,
+                "source":relative_source,
+                "destination":relative_destination,
+                "consumers":if secret.intermediary { Vec::<String>::new() } else { vec![target_id.to_string()] },
+                "repositoryOnly":secret.intermediary,
+            }));
+            entries.push((relative_source, relative_destination));
+        }
+        if arguments.execute {
+            let identity = read_identity(identity_path)?;
+            let writes = entries
+                .iter()
+                .map(|(relative_source, relative_destination)| {
+                    nix_seal_authoring::BatchRekeyWrite {
+                        relative_source,
+                        relative_destination,
+                        recipients: &replacement_recipients,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let results = nix_seal_authoring::rekey_secret_batch(
+                &repository_root,
+                &writes,
+                &identity,
+                if arguments.replace {
+                    nix_seal_authoring::WriteMode::Replace
+                } else {
+                    nix_seal_authoring::WriteMode::Create
+                },
+            )?;
+            for (mapping, result) in mappings.iter_mut().zip(results) {
+                mapping["ciphertextHash"] = serde_json::json!(result.ciphertext_hash);
+                mapping["plaintextBytes"] = serde_json::json!(result.plaintext_bytes);
+            }
+        }
+    } else {
+        for (legacy_id, secret) in export.secrets {
+            let source = validate_agenix_rekey_source(&secret.rekey_file)?;
+            mappings.push(serde_json::json!({
+                "legacyId":legacy_id,
+                "nixSealId":migrated_id(&legacy_id)?,
+                "source":source,
+                "consumers":if secret.intermediary { Vec::<String>::new() } else { vec![target_id.to_string()] },
+                "repositoryOnly":secret.intermediary,
+            }));
+        }
     }
-    let warnings = vec![
-        "dry run only: no ciphertext, configuration, cache, or source manager was changed",
-        "the export establishes rekeyed administrator-to-target semantics, but runtime ownership, lifecycle, templates, and approval policy require reviewed nix-seal mappings",
-        "intermediary secrets are repository-only and must not be given target consumers without an explicit policy decision",
-    ];
+    let warnings = if import_requested {
+        vec![
+            if arguments.execute {
+                "side-by-side migration committed only after every source was staged and round-trip verified"
+            } else {
+                "dry run only: no ciphertext, configuration, or source manager was changed"
+            },
+            "the export establishes rekeyed administrator-to-target semantics; runtime ownership, lifecycle, templates, and approval policy still require reviewed nix-seal mappings",
+            "intermediary secrets remain repository-only in the mapping and require an explicit policy decision before delivery",
+        ]
+    } else {
+        vec![
+            "dry run only: no ciphertext, configuration, cache, or source manager was changed",
+            "the export establishes rekeyed administrator-to-target semantics, but runtime ownership, lifecycle, templates, and approval policy require reviewed nix-seal mappings",
+            "intermediary secrets are repository-only and must not be given target consumers without an explicit policy decision",
+        ]
+    };
     let report = serde_json::json!({
         "schema":"nix-seal.migration-report.v1",
         "source":"agenix-rekey",
-        "dryRun":true,
+        "dryRun":!import_requested || !arguments.execute,
         "target":{
             "legacyId":export.target.id,
             "nixSealId":target_id,
@@ -2395,6 +2503,7 @@ fn migrate_agenix_rekey_export(metadata: &Path, json: bool) -> Result<()> {
             "storageMode":export.target.storage_mode,
         },
         "masterRecipientCount":masters.len(),
+        "recipientPolicy":if import_requested { serde_json::json!({"recipients":&replacement_recipients}) } else { serde_json::Value::Null },
         "secrets":mappings,
         "warnings":warnings,
     });
@@ -2402,11 +2511,30 @@ fn migrate_agenix_rekey_export(metadata: &Path, json: bool) -> Result<()> {
         println!("{report}");
     } else {
         println!(
-            "agenix-rekey dry-run: {} secrets mapped",
+            "agenix-rekey {}: {} secrets mapped",
+            if import_requested && arguments.execute {
+                "migration"
+            } else {
+                "dry-run"
+            },
             report["secrets"].as_array().map_or(0, Vec::len)
         );
         for warning in warnings {
             eprintln!("warning: {warning}");
+        }
+        if import_requested {
+            eprintln!(
+                "replacement recipient policy: {} recipient(s)",
+                replacement_recipients.len()
+            );
+        }
+        for mapping in report["secrets"].as_array().into_iter().flatten() {
+            println!(
+                "{} -> {} ({})",
+                mapping["legacyId"].as_str().unwrap_or("unknown"),
+                mapping["nixSealId"].as_str().unwrap_or("unknown"),
+                mapping["source"].as_str().unwrap_or("unknown"),
+            );
         }
     }
     Ok(())
@@ -7803,8 +7931,79 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             })
             .to_string(),
         )?;
-        migrate_agenix_rekey_export(&metadata, true)?;
+        migrate_agenix_rekey_export(
+            &AgenixRekeyMigrationArgs {
+                metadata,
+                repository_root: PathBuf::from("."),
+                destination: None,
+                identity: None,
+                recipients: Vec::new(),
+                replace: false,
+                execute: false,
+            },
+            true,
+        )?;
         assert!(validate_agenix_rekey_source("../unsafe.age").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn agenix_rekey_export_bulk_import_is_side_by_side_and_dry_run_first()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(repository.join("legacy"))?;
+        let (identity, master_recipient) = nix_seal_crypto::generate_x25519();
+        let (_, target_recipient) = nix_seal_crypto::generate_x25519();
+        let source = repository.join("legacy/service.age");
+        let mut output = fs::File::create(&source)?;
+        nix_seal_crypto::encrypt(
+            &b"agenix-rekey-canary"[..],
+            &mut output,
+            std::slice::from_ref(&master_recipient),
+        )?;
+        output.sync_all()?;
+        let identity_path = temporary.path().join("administrator.agekey");
+        write_new_private(&identity_path, identity.expose_secret().as_bytes())?;
+        let metadata = temporary.path().join("agenix-rekey.json");
+        fs::write(
+            &metadata,
+            serde_json::json!({
+                "schema":"nix-seal.agenix-rekey-export.v1",
+                "target":{
+                    "id":"desktop",
+                    "kind":"nixos",
+                    "system":"x86_64-linux",
+                    "recipient":target_recipient,
+                    "storageMode":"derivation"
+                },
+                "masterRecipients":[master_recipient.clone()],
+                "secrets":{"service-token":{"rekeyFile":"legacy/service.age"}}
+            })
+            .to_string(),
+        )?;
+        let common = || AgenixRekeyMigrationArgs {
+            metadata: metadata.clone(),
+            repository_root: repository.clone(),
+            destination: Some(PathBuf::from("migrated")),
+            identity: Some(identity_path.clone()),
+            recipients: vec![master_recipient.clone()],
+            replace: false,
+            execute: false,
+        };
+        migrate_agenix_rekey_export(&common(), true)?;
+        assert!(!repository.join("migrated/legacy/service.age").exists());
+        let mut execute = common();
+        execute.execute = true;
+        migrate_agenix_rekey_export(&execute, true)?;
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(
+            fs::File::open(repository.join("migrated/legacy/service.age"))?,
+            &mut plaintext,
+            &identity,
+        )?;
+        assert_eq!(plaintext, b"agenix-rekey-canary");
+        assert!(source.is_file());
         Ok(())
     }
 
