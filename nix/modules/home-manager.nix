@@ -6,6 +6,7 @@ self:
   ...
 }:
 let
+  cfg = config.nixSeal;
   credentialId = value: builtins.head (lib.splitString ":" (toString value));
   groupCredentials = lib.foldl' (
     grouped: binding:
@@ -14,6 +15,21 @@ let
     in
     grouped // { ${unit} = (grouped.${unit} or [ ]) ++ [ "${binding.name}:${binding.path}" ]; }
   ) { };
+  activate =
+    phase: spec:
+    let
+      runtimeSuffix = if phase == "activation" then "" else "/${phase}";
+    in
+    ''
+      if [ -z "''${XDG_RUNTIME_DIR:-}" ]; then
+        echo "nix-seal: XDG_RUNTIME_DIR is required for Home Manager activation" >&2
+        exit 1
+      fi
+      ${lib.getExe cfg.package} activate \
+        --spec ${spec} \
+        --identity ${lib.escapeShellArg cfg.identityFile} \
+        --runtime-root "$XDG_RUNTIME_DIR/nix-seal${runtimeSuffix}"
+    '';
 in
 {
   imports = [
@@ -43,7 +59,7 @@ in
       };
     })
   ];
-  config = lib.mkIf config.nixSeal.enable {
+  config = lib.mkIf cfg.enable {
     assertions = [
       {
         assertion =
@@ -52,28 +68,32 @@ in
         message = "Home Manager nixSeal serviceCredentials require Linux systemd user services";
       }
       {
-        assertion = lib.all (secret: secret.phase == "activation") (
-          builtins.attrValues config.nixSeal.secrets
-        );
-        message = "nixSeal activation phases other than activation are not yet scheduled by Home Manager";
-      }
-      {
-        assertion = lib.all (template: template.phase == "activation") (
-          builtins.attrValues config.nixSeal.templates
-        );
-        message = "nixSeal template activation phases other than activation are not yet scheduled by Home Manager";
+        assertion = !(cfg.activationSpecs ? partitioning);
+        message = "nixSeal partitioning-phase secrets require installer provisioning and cannot run in Home Manager";
       }
     ];
-    home.activation.nixSeal = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-      if [ -z "''${XDG_RUNTIME_DIR:-}" ]; then
-        echo "nix-seal: XDG_RUNTIME_DIR is required for Home Manager activation" >&2
-        exit 1
-      fi
-      ${lib.getExe config.nixSeal.package} activate \
-        --spec ${config.nixSeal.activationSpec} \
-        --identity ${lib.escapeShellArg config.nixSeal.identityFile} \
-        --runtime-root "$XDG_RUNTIME_DIR/nix-seal"
-    '';
+    home.activation = lib.mkMerge [
+      (lib.mkIf (cfg.activationSpecs ? users) {
+        nixSealUsers = lib.hm.dag.entryAfter [ "writeBoundary" ] (
+          activate "users" cfg.activationSpecs.users
+        );
+      })
+      (lib.mkIf (cfg.activationSpecs ? activation) {
+        nixSeal = lib.hm.dag.entryAfter (
+          if cfg.activationSpecs ? users then [ "nixSealUsers" ] else [ "writeBoundary" ]
+        ) (activate "activation" cfg.activationSpecs.activation);
+      })
+      (lib.mkIf (cfg.activationSpecs ? services) {
+        nixSealServices = lib.hm.dag.entryAfter (
+          if cfg.activationSpecs ? activation then
+            [ "nixSeal" ]
+          else if cfg.activationSpecs ? users then
+            [ "nixSealUsers" ]
+          else
+            [ "writeBoundary" ]
+        ) (activate "services" cfg.activationSpecs.services);
+      })
+    ];
     warnings = [
       "Home Manager stores runtime plaintext under XDG_RUNTIME_DIR; macOS may not provide memory-backed storage"
     ];

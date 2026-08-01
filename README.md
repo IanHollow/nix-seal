@@ -34,8 +34,10 @@ NixOS schedules `users` after `specialfs` and before account creation,
 activation step. `users` outputs must remain `root:root` because user accounts
 may not exist yet. The generic module does not schedule `partitioning`: its
 public spec must be carried over a protected installer channel before the target
-filesystem is mounted. nix-darwin and Home Manager currently reject
-non-`activation` phases rather than silently running them at an unsafe point.
+filesystem is mounted. nix-darwin currently rejects non-`activation` phases
+rather than silently running them at an unsafe point. Home Manager orders
+`users`, `activation`, and `services` in its activation DAG with separate
+`$XDG_RUNTIME_DIR/nix-seal` roots; it rejects installer-only `partitioning`.
 
 Start a repository with an empty, valid public plan; this does not generate keys
 or create secrets and refuses to overwrite an existing file:

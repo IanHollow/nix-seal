@@ -176,6 +176,32 @@ let
       }
     ];
   };
+  homePhased = inputs.home-manager.lib.homeManagerConfiguration {
+    inherit pkgs;
+    modules = [
+      self.homeManagerModules.default
+      common
+      {
+        home = {
+          username = "test";
+          homeDirectory = "/home/test";
+          stateVersion = "26.05";
+        };
+        nixSeal = {
+          secrets."bootstrap/token" = {
+            inherit ciphertext envelope;
+            sourceCiphertextHash = digest "9";
+            phase = "users";
+          };
+          secrets."service/token" = {
+            inherit ciphertext envelope;
+            sourceCiphertextHash = digest "a";
+            phase = "services";
+          };
+        };
+      }
+    ];
+  };
   checkDocument =
     name: manager: owner: group: spec: activationText: credentialSpec:
     pkgs.runCommand name { nativeBuildInputs = [ pkgs.jq ]; } ''
@@ -219,6 +245,8 @@ let
   nixosActivation = pkgs.writeText "nix-seal-nixos-activation" nixos.config.system.activationScripts.nixSeal.text;
   nixosUsersActivation = pkgs.writeText "nix-seal-nixos-users-activation" nixosPhased.config.system.activationScripts.nixSealUsers.text;
   homeActivation = pkgs.writeText "nix-seal-home-activation" home.config.home.activation.nixSeal.data;
+  homeUsersActivation = pkgs.writeText "nix-seal-home-users-activation" homePhased.config.home.activation.nixSealUsers.data;
+  homeServicesActivation = pkgs.writeText "nix-seal-home-services-activation" homePhased.config.home.activation.nixSealServices.data;
   nixosCredentialSpec = pkgs.writeText "nix-seal-nixos-credential.json" (
     builtins.toJSON {
       loadCredential = nixos.config.systemd.services.example.serviceConfig.LoadCredential;
@@ -302,6 +330,32 @@ in
         (.templates | length) == 0
       ' ${nixosPhased.config.nixSeal.activationSpecs.users} >/dev/null
       grep -F -- "--identity /run/keys/nix-seal-target" ${nixosUsersActivation} >/dev/null
+      touch "$out"
+    '';
+  module-home-phase-scheduling =
+    assert
+      homePhased.config.nixSeal.secrets."bootstrap/token".path
+      == "%t/nix-seal/users/current/bootstrap/token";
+    assert
+      homePhased.config.nixSeal.secrets."service/token".path
+      == "%t/nix-seal/services/current/service/token";
+    assert lib.elem "nixSealUsers" homePhased.config.home.activation.nixSeal.after;
+    assert lib.elem "nixSeal" homePhased.config.home.activation.nixSealServices.after;
+    pkgs.runCommand "nix-seal-module-home-phase-scheduling" { nativeBuildInputs = [ pkgs.jq ]; } ''
+      jq -e '
+        .phase == "users" and
+        .runtimeRoot == "%t/nix-seal/users" and
+        (.artifacts | length) == 1 and
+        .artifacts[0].secretId == "bootstrap/token"
+      ' ${homePhased.config.nixSeal.activationSpecs.users} >/dev/null
+      jq -e '
+        .phase == "services" and
+        .runtimeRoot == "%t/nix-seal/services" and
+        (.artifacts | length) == 1 and
+        .artifacts[0].secretId == "service/token"
+      ' ${homePhased.config.nixSeal.activationSpecs.services} >/dev/null
+      grep -F -- '"$XDG_RUNTIME_DIR/nix-seal/users"' ${homeUsersActivation} >/dev/null
+      grep -F -- '"$XDG_RUNTIME_DIR/nix-seal/services"' ${homeServicesActivation} >/dev/null
       touch "$out"
     '';
 }
