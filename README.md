@@ -152,6 +152,11 @@ generation changes, activation-time secret templates, post-switch service
 coordination, JSON Schema output, and NixOS/nix-darwin/Home Manager modules. See
 [SPEC.md](SPEC.md) and [ROADMAP.md](ROADMAP.md) before relying on it.
 
+The Nix package check requires round-trip interoperability with both the
+reference `age` executable and `rage`, in both encryption directions. They are
+test-only dependencies; the shipped runtime remains Rust and uses its isolated
+age adapter.
+
 ## Installed documentation
 
 The flake's `packages.<system>.documentation` output installs the versioned

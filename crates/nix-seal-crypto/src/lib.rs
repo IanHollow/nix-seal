@@ -241,6 +241,10 @@ pub fn rekey<R: Read, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        os::unix::fs::PermissionsExt,
+        process::{Command, Stdio},
+    };
 
     const SSH_ED25519_RECIPIENT: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHsKLqeplhpW+uObz5dvMgjz1OxfM/XXUB+VHtZ6isGN alice@rust";
     const SSH_ED25519_IDENTITY_ARMOR: &str = "-----BEGIN_OPENSSH_PRIVATE_KEY-----\n\
@@ -299,5 +303,96 @@ AAAEADBJvjZT8X6JRJI8xVq/1aU8nMVgOtVnmdwqWwrSlXG3sKLqeplhpW+uObz5dvMgjz\n\
             recipient_fingerprint(&recipient_from_identity(&identity)?)?
         );
         Ok(())
+    }
+
+    #[test]
+    fn interoperates_with_age_and_rage_when_nix_checks_require_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let required = std::env::var_os("NIX_SEAL_REQUIRE_INTEROP").is_some();
+        let mut available = Vec::new();
+        for binary in ["age", "rage"] {
+            if let Some(binary) = command_available(binary, required)? {
+                available.push(binary);
+            }
+        }
+        if available.is_empty() {
+            return Ok(());
+        }
+
+        let temporary = tempfile::tempdir()?;
+        let identity_path = temporary.path().join("identity.txt");
+        let (identity, recipient) = generate_x25519();
+        std::fs::write(&identity_path, identity.expose_secret())?;
+        let private_permissions = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&identity_path, private_permissions)?;
+        let plaintext = b"nix-seal-age-interop-canary";
+
+        for binary in available {
+            let mut ciphertext = Vec::new();
+            encrypt(
+                plaintext.as_slice(),
+                &mut ciphertext,
+                std::slice::from_ref(&recipient),
+            )?;
+            assert_eq!(
+                invoke(
+                    binary,
+                    &["-d", "-i"],
+                    &[identity_path.as_os_str()],
+                    &ciphertext
+                )?,
+                plaintext
+            );
+
+            let externally_encrypted = invoke(binary, &["-r"], &[recipient.as_ref()], plaintext)?;
+            let mut decrypted = Vec::new();
+            decrypt(externally_encrypted.as_slice(), &mut decrypted, &identity)?;
+            assert_eq!(decrypted, plaintext);
+        }
+        Ok(())
+    }
+
+    fn command_available(
+        binary: &'static str,
+        required: bool,
+    ) -> Result<Option<&'static str>, Box<dyn std::error::Error>> {
+        match Command::new(binary)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => Ok(Some(binary)),
+            Ok(_) | Err(_) if required => {
+                Err(format!("required interoperability binary unavailable: {binary}").into())
+            }
+            Ok(_) | Err(_) => Ok(None),
+        }
+    }
+
+    fn invoke(
+        binary: &str,
+        arguments: &[&str],
+        trailing_arguments: &[&std::ffi::OsStr],
+        input: &[u8],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut child = Command::new(binary)
+            .args(arguments)
+            .args(trailing_arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or("could not open interoperability command standard input")?
+            .write_all(input)?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(format!("interoperability command failed: {binary}").into());
+        }
+        Ok(output.stdout)
     }
 }

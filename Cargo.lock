@@ -1341,6 +1341,7 @@ dependencies = [
  "blake3",
  "getrandom 0.4.3",
  "secrecy",
+ "tempfile",
  "thiserror 2.0.19",
 ]
 

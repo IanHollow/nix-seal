@@ -35,6 +35,13 @@
           src = lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
           buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
+          nativeCheckInputs = [
+            pkgs.age
+            pkgs.rage
+          ];
+          preCheck = ''
+            export NIX_SEAL_REQUIRE_INTEROP=1
+          '';
           cargoBuildFlags = [
             "--package"
             "nix-seal"
@@ -104,6 +111,8 @@
                 cargo-deny
                 cargo-audit
                 cargo-vet
+                age
+                rage
                 nixfmt-rfc-style
               ]
               ++ lib.optionals stdenv.hostPlatform.isDarwin [ libiconv ];

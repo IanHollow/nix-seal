@@ -13,3 +13,8 @@ accepted only to migrate established deployments. Their parser is contained
 inside the adapter, OpenSSH comments are excluded from policy comparison, and
 encrypted private keys are rejected by non-interactive commands. New
 configuration must prefer native age or reviewed hardware-backed age plugins.
+
+The Nix package check requires bidirectional X25519 round trips with the
+reference `age` executable and `rage`. These command-line tools are test-only
+inputs and never shipped or invoked by the nix-seal runtime. This differential
+check complements, but does not replace, the planned official age-vector suite.
