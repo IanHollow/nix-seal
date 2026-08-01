@@ -167,12 +167,12 @@ nix build github:IanHollow/nix-seal#documentation
 
 The checked-in `fuzz` workspace exercises strict public `plan.v1`,
 `activation.v2`, template-parser, signed-artifact-envelope, age
-recipient/identity-parser, and ciphertext-cache state boundaries. It deserializes
-untrusted bytes, validates successful documents, checks their public JSON
-serialization round trips, renders accepted templates through a bounded writer,
-and exercises cache import/export and garbage-collection reachability; the plan
-target also derives each target projection. Run the short sanitizer campaigns
-locally with a nightly Rust toolchain:
+recipient/identity-parser, and ciphertext-cache state boundaries. It
+deserializes untrusted bytes, validates successful documents, checks their
+public JSON serialization round trips, renders accepted templates through a
+bounded writer, and exercises cache import/export and garbage-collection
+reachability; the plan target also derives each target projection. Run the short
+sanitizer campaigns locally with a nightly Rust toolchain:
 
 ```console
 cd fuzz
