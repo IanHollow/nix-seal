@@ -570,6 +570,8 @@ enum SecretCommand {
     Import(SecretWriteArgs),
     /// Edit through an explicit executable in a private ephemeral workspace.
     Edit(SecretEditArgs),
+    /// Re-encrypt canonical ciphertext to the current recipient policy without changing its value.
+    Rekey(SecretRekeyArgs),
     /// Move canonical ciphertext into a private recoverable quarantine.
     Delete(SecretDeleteArgs),
     /// Decrypt to stdout. This is the only command that emits plaintext.
@@ -621,6 +623,22 @@ struct SecretWriteArgs {
     /// Optional logical collection format to validate before encryption.
     #[arg(long, value_enum)]
     format: Option<SecretFormat>,
+}
+
+#[derive(Args)]
+struct SecretRekeyArgs {
+    #[command(flatten)]
+    policy: SecretPlanArgs,
+    /// Repository root used to resolve the plan's canonical ciphertext source.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Administrator/recovery identity used to decrypt and verify the replacement.
+    /// It is read only when --yes is supplied.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Required non-interactive acknowledgement for in-place canonical replacement.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Args)]
@@ -6748,6 +6766,7 @@ fn run_secret(command: SecretCommand, json: bool) -> Result<()> {
             "imported",
         )?,
         SecretCommand::Edit(arguments) => run_secret_edit(arguments, json)?,
+        SecretCommand::Rekey(arguments) => run_secret_rekey(&arguments, json)?,
         SecretCommand::Delete(arguments) => run_secret_delete(&arguments, json)?,
         SecretCommand::Reveal(arguments) => {
             if json {
@@ -6937,6 +6956,98 @@ fn run_secret_write(
         if let Some(rotated_at) = rotated_at {
             eprintln!("record lifecycle.rotatedAt = {rotated_at} in the authoritative plan source");
         }
+    }
+    Ok(())
+}
+
+fn run_secret_rekey(arguments: &SecretRekeyArgs, json: bool) -> Result<()> {
+    let plan = read_plan_bounded(&arguments.policy.plan)?;
+    let secret = plan
+        .secrets
+        .get(&arguments.policy.secret)
+        .context("secret is absent from plan")?;
+    let recipient_policy = nix_seal_policy::secret_recipients(&plan, &arguments.policy.secret)?;
+    let recipients: Vec<_> = recipient_policy
+        .recipients
+        .values()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let root = arguments
+        .repository_root
+        .canonicalize()
+        .context("repository root must exist")?;
+    let source = existing_secret_path(&root, &secret.source)?;
+
+    if !arguments.yes {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema":"nix-seal.output.v1",
+                    "operation":"rekey-dry-run",
+                    "secretId":arguments.policy.secret,
+                    "ciphertextPath":source,
+                    "recipientCount":recipients.len(),
+                    "replace":true
+                })
+            );
+        } else {
+            println!(
+                "canonical rekey dry-run for {} ({} recipient(s))",
+                arguments.policy.secret,
+                recipients.len()
+            );
+            eprintln!(
+                "review the recipient policy, then rerun with --identity <private-key> --yes"
+            );
+        }
+        return Ok(());
+    }
+
+    let identity_path = arguments
+        .identity
+        .as_deref()
+        .context("canonical rekey requires --identity when --yes is supplied")?;
+    let identity = read_identity(identity_path)?;
+    if !recipients
+        .iter()
+        .any(|recipient| nix_seal_crypto::identity_matches_recipient(&identity, recipient))
+    {
+        bail!("rekey identity is not authorized by canonical recipient policy");
+    }
+    if matches!(secret.delivery, nix_seal_core::DeliveryMode::Direct) {
+        eprintln!(
+            "warning: direct mode allows matching target keys to decrypt current and historical Git ciphertext"
+        );
+    }
+    let result = nix_seal_authoring::rekey_secret(
+        &root,
+        Path::new(&secret.source),
+        Path::new(&secret.source),
+        &recipients,
+        &identity,
+        nix_seal_authoring::WriteMode::Replace,
+    )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.output.v1",
+                "operation":"rekeyed",
+                "secretId":arguments.policy.secret,
+                "ciphertextPath":result.path,
+                "ciphertextHash":result.ciphertext_hash,
+                "recipientCount":recipients.len()
+            })
+        );
+    } else {
+        println!("{}", result.path.display());
+        eprintln!(
+            "re-encrypted canonical ciphertext for {} without changing the application credential",
+            arguments.policy.secret
+        );
     }
     Ok(())
 }
@@ -7824,6 +7935,110 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             validate_structured_secret_bytes(b"token: value\n", Some(SecretFormat::Yaml)).is_ok()
         );
         assert!(validate_structured_secret_bytes(b"token: [", Some(SecretFormat::Yaml)).is_err());
+    }
+
+    #[test]
+    fn canonical_secret_rekey_is_dry_run_first_and_replaces_recipients_atomically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        let secrets = repository.join("secrets");
+        fs::create_dir_all(&secrets)?;
+        let plan_path = temporary.path().join("plan.v1.json");
+        let old_identity_path = temporary.path().join("old.identity");
+        let new_identity_path = temporary.path().join("new.identity");
+        let (old_identity, old_recipient) = nix_seal_crypto::generate_x25519();
+        let (new_identity, new_recipient) = nix_seal_crypto::generate_x25519();
+        write_new_private(&old_identity_path, old_identity.expose_secret().as_bytes())?;
+        write_new_private(&new_identity_path, new_identity.expose_secret().as_bytes())?;
+
+        let secret_id = nix_seal_core::Id::parse("application/password")?;
+        let mut ciphertext = fs::File::create(secrets.join("password.age"))?;
+        nix_seal_crypto::encrypt(
+            b"canonical-rekey-canary".as_slice(),
+            &mut ciphertext,
+            &[old_recipient.clone(), new_recipient.clone()],
+        )?;
+        ciphertext.sync_all()?;
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.identities.insert(
+            nix_seal_core::Id::parse("administrator")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: new_recipient,
+            },
+        );
+        plan.identities.insert(
+            nix_seal_core::Id::parse("signer.release")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Signer,
+                public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public()?,
+            },
+        );
+        plan.secrets.insert(
+            secret_id.clone(),
+            nix_seal_core::Secret {
+                source: "secrets/password.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: Vec::new(),
+                selectors: nix_seal_core::TargetSelectors::default(),
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: None,
+                repository_only: false,
+            },
+        );
+        nix_seal_policy::validate(&plan)?;
+        fs::write(&plan_path, nix_seal_policy::canonical_json(&plan)?)?;
+        let source = secrets.join("password.age");
+        let before = fs::read(&source)?;
+
+        run_secret_rekey(
+            &SecretRekeyArgs {
+                policy: SecretPlanArgs {
+                    plan: plan_path.clone(),
+                    secret: secret_id.clone(),
+                },
+                repository_root: repository.clone(),
+                identity: None,
+                yes: false,
+            },
+            true,
+        )?;
+        assert_eq!(fs::read(&source)?, before);
+
+        run_secret_rekey(
+            &SecretRekeyArgs {
+                policy: SecretPlanArgs {
+                    plan: plan_path,
+                    secret: secret_id,
+                },
+                repository_root: repository,
+                identity: Some(new_identity_path),
+                yes: true,
+            },
+            true,
+        )?;
+
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(
+            open_public_ciphertext(&source)?,
+            &mut plaintext,
+            &new_identity,
+        )?;
+        assert_eq!(plaintext, b"canonical-rekey-canary");
+        let mut old_plaintext = Vec::new();
+        assert!(
+            nix_seal_crypto::decrypt(
+                open_public_ciphertext(&source)?,
+                &mut old_plaintext,
+                &old_identity,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

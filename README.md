@@ -102,6 +102,10 @@ nix-seal secret create --plan plan.v1.json --secret db/password \
   --identity ~/.config/age/keys.txt < password.txt
 nix-seal secret edit --plan plan.v1.json --secret db/password \
   --identity ~/.config/age/keys.txt --editor /absolute/path/to/editor
+nix-seal secret rekey --plan plan.v1.json --secret db/password \
+  --identity ~/.config/age/keys.txt --json
+nix-seal secret rekey --plan plan.v1.json --secret db/password \
+  --identity ~/.config/age/keys.txt --yes
 nix-seal secret delete --plan plan.v1.json --secret db/password --yes
 nix-seal rotate --plan plan.v1.json --secret db/password \
   --identity ~/.config/age/keys.txt < replacement.txt
@@ -125,8 +129,11 @@ additionally includes authorized target recipients and emits a history-exposure
 warning. Every create, import, edit, and rotation is encrypted into a private
 same-directory transaction, round-trip decrypted and hashed, then atomically
 committed. Editor execution uses no shell, inherits no environment, and runs in
-a private ephemeral workspace. `rekey` changes encryption recipients; `rotate`
-changes the application credential.
+a private ephemeral workspace. `secret rekey` changes canonical encryption
+recipients without changing the application credential; `rotate` changes the
+application credential. `secret rekey` is dry-run by default and requires
+`--yes` for its atomic same-source replacement. The top-level `rekey` command
+is separate: it creates signed target artifacts in the ciphertext-only cache.
 
 For the default `rekeyed` delivery, `nix-seal rekey` decrypts canonical
 ciphertext with `--identity` and produces a separately target-encrypted, signed

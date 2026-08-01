@@ -46,10 +46,22 @@ does not change the credential used by the service.
    nix-seal doctor --plan plan.v1.json --repository-root .
    ```
 
-4. For each canonical ciphertext whose recipients changed, use the reviewed
-   `migrate ciphertext` dry run to a new side-by-side path, with an
-   uncompromised administrator/recovery identity used only for this approved
-   conversion:
+4. For each canonical ciphertext whose recipients changed, keep at least one
+   uncompromised administrator/recovery identity authorized long enough to
+   perform the conversion. Review the recipient-only canonical rekey first;
+   it changes encryption recipients without changing the application value:
+
+   ```console
+   nix-seal secret rekey --plan plan.v1.json --secret <id> \
+     --repository-root . --identity /private/uncompromised-recovery.age --json
+   ```
+
+   After reviewing the public report, repeat the command with `--yes`. The
+   operation stages a fresh standard age ciphertext, verifies it by round-trip
+   decryption, and atomically replaces the same canonical source. If no
+   authorized old identity remains, or if a path change is required for
+   side-by-side rollback, use the migration adapter instead with an
+   uncompromised identity used only for this approved conversion:
 
    ```console
    nix-seal migrate ciphertext --repository-root . \
@@ -58,9 +70,9 @@ does not change the credential used by the service.
    ```
 
    Review the mapping and then add `--execute`. Update the plan's `source` field
-   in the same reviewed change; never overwrite the old source in place until
-   the new ciphertext has passed an independent round-trip check. Repeat for
-   every affected source or use an explicitly reviewed bulk adapter.
+   in the same reviewed change; never delete the old source until the new
+   ciphertext has passed an independent round-trip check. Repeat for every
+   affected source or use an explicitly reviewed bulk adapter.
 
 5. Rebuild target artifacts from the new plan. `provision` is dry-run-first;
    only add `--execute` after reviewing every target and generation. Export the

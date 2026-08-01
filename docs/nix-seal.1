@@ -46,7 +46,9 @@ Compile, inspect, validate, and diagnose public policy.
 Manage identities and public policy metadata.
 .TP
 .B secret, rotate
-Create, import, edit, reveal, inspect, delete, and rotate canonical secrets.
+Create, import, edit, reveal, inspect, delete, recipient-rekey, and rotate
+canonical secrets. Recipient rekey is dry-run by default and requires an
+explicit \fB--yes\fR for atomic replacement; it does not rotate the value.
 .TP
 .B rekey, artifact, provision, cache
 Create, verify, exchange, and garbage-collect signed ciphertext-only artifacts.
