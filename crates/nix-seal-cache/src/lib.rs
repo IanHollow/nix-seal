@@ -979,6 +979,7 @@ fn set_private_permissions(_path: &Path, _directory: bool) -> Result<(), std::io
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Barrier};
     #[test]
     fn stores_and_verifies_content() -> Result<(), CacheError> {
@@ -1184,6 +1185,100 @@ mod tests {
             conflicting.import_from(&exchange),
             Err(CacheError::Conflict)
         ));
+        Ok(())
+    }
+
+    fn state_machine_address(step: usize) -> Result<ArtifactAddress, CacheError> {
+        ArtifactAddress::new(
+            format!("{:064x}", step + 1),
+            format!("{:064x}", step + 2),
+            format!("{:064x}", step + 3),
+            format!("{:064x}", step + 4),
+            format!("host.{step}"),
+            format!("state/secret-{step}"),
+            u64::try_from(step + 1).map_err(|_| CacheError::Limit)?,
+        )
+    }
+
+    #[test]
+    fn deterministic_state_machine_preserves_cache_model() -> Result<(), CacheError> {
+        let temporary = tempfile::tempdir()?;
+        let cache = Cache::open(temporary.path().join("cache"))?;
+        let mut objects = BTreeSet::new();
+        let mut artifacts = BTreeMap::new();
+        let mut state = 0x9e37_79b9_u64;
+
+        for step in 0..128_usize {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            match step % 4 {
+                0 => {
+                    let slot = usize::try_from(state % 16).map_err(|_| CacheError::Limit)?;
+                    let bytes = format!("ciphertext-state-{slot}").into_bytes();
+                    let digest = cache.put(&bytes)?;
+                    assert_eq!(cache.get(&digest)?, bytes);
+                    objects.insert(digest);
+                }
+                1 => {
+                    let slot = usize::try_from(state % 8).map_err(|_| CacheError::Limit)?;
+                    let address = state_machine_address(slot)?;
+                    let ciphertext = format!("target-state-{slot}").into_bytes();
+                    let envelope = format!("public-envelope-{slot}").into_bytes();
+                    let key = address.key()?;
+                    if artifacts.contains_key(&key) {
+                        assert!(matches!(
+                            cache.put_artifact(&address, ciphertext.as_slice(), &envelope),
+                            Err(CacheError::ArtifactExists)
+                        ));
+                        let record = cache
+                            .load_artifact(&address)?
+                            .ok_or(CacheError::HashMismatch)?;
+                        assert_eq!(record.envelope, envelope);
+                        assert_eq!(record.artifact_ciphertext_hash, Cache::digest(&ciphertext));
+                    } else {
+                        let record =
+                            cache.put_artifact(&address, ciphertext.as_slice(), &envelope)?;
+                        assert_eq!(record.key, key);
+                        artifacts.insert(record.key.clone(), (address, ciphertext, envelope));
+                    }
+                }
+                2 => {
+                    if let Some((address, ciphertext, envelope)) = artifacts.values().next() {
+                        let record = cache
+                            .load_artifact(address)?
+                            .ok_or(CacheError::HashMismatch)?;
+                        assert_eq!(record.envelope, *envelope);
+                        assert_eq!(record.artifact_ciphertext_hash, Cache::digest(ciphertext));
+                    }
+                }
+                _ => {
+                    let inventory = cache.inventory()?;
+                    assert_eq!(
+                        inventory.object_count,
+                        u64::try_from(objects.len()).map_err(|_| CacheError::Limit)?
+                    );
+                    assert_eq!(
+                        inventory.artifact_count,
+                        u64::try_from(artifacts.len()).map_err(|_| CacheError::Limit)?
+                    );
+                    let retained = artifacts.keys().cloned().collect();
+                    let report = cache.garbage_collect(&GcRequest {
+                        retained_artifacts: retained,
+                        retained_objects: objects.clone(),
+                        execute: false,
+                    })?;
+                    assert_eq!(report.candidate_artifacts, 0);
+                    assert_eq!(report.candidate_objects, 0);
+                }
+            }
+        }
+
+        let exchange = temporary.path().join("exchange");
+        let exported = cache.export_to(&exchange)?;
+        let imported = Cache::open(temporary.path().join("imported"))?;
+        assert_eq!(imported.import_from(&exchange)?, exported);
+        assert_eq!(imported.inventory()?, cache.inventory()?);
         Ok(())
     }
 }

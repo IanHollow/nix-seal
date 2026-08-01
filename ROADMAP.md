@@ -8,7 +8,10 @@
   selector monotonicity; and fuzz foundations.
 - Phase 2: administrator-to-target rekey, deterministic Nix bridge,
   transactional cache, verified activation/switch/rollback, systemd credentials,
-  and full platform modules.
+  and full platform modules. Deterministic cache state-machine coverage now
+  exercises repeated object/artifact writes, inventory/retention checks, and
+  export/import equivalence; interrupted-operation and activation state-machine
+  coverage remain required.
 - Phase 3: authoring and lifecycle commands, identity/value rotation,
   generators, prompts, templates, and provisioning phases.
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
