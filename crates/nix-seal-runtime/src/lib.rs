@@ -9,7 +9,7 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -853,10 +853,7 @@ fn write_pending(root: &Path, generation: &Path, plan_hash: &str) -> Result<(), 
         let _ = open_regular_nofollow(&next)?;
         std::fs::remove_file(&next)?;
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&next)?;
+    let mut file = create_exclusive_secret_file(&next)?;
     set_file_mode(&file, 0o600)?;
     file.write_all(pending_payload(generation, plan_hash)?.as_bytes())?;
     file.sync_all()?;
@@ -1513,6 +1510,7 @@ fn create_exclusive_secret_file(path: &Path) -> Result<File, RuntimeError> {
 
 #[cfg(not(unix))]
 fn create_exclusive_secret_file(path: &Path) -> Result<File, RuntimeError> {
+    use std::fs::OpenOptions;
     Ok(OpenOptions::new().write(true).create_new(true).open(path)?)
 }
 
@@ -1543,6 +1541,7 @@ fn open_activation_lock(path: &Path) -> Result<File, RuntimeError> {
 
 #[cfg(not(unix))]
 fn open_activation_lock(path: &Path) -> Result<File, RuntimeError> {
+    use std::fs::OpenOptions;
     let metadata = std::fs::symlink_metadata(path);
     if metadata.is_ok_and(|value| !value.file_type().is_file()) {
         return Err(RuntimeError::UnsafeSource);
@@ -2416,6 +2415,22 @@ mod tests {
             generation.create_file(&secret, 0o400),
             Err(RuntimeError::InvalidDestination)
         ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_pending_transaction() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("runtime");
+        std::fs::create_dir(&root)?;
+        let outside = temporary.path().join("outside");
+        std::fs::write(&outside, b"must remain unchanged")?;
+        symlink(&outside, root.join(".post-switch-next"))?;
+        assert!(write_pending(&root, &root.join("generation-1"), PLAN_HASH).is_err());
+        assert_eq!(std::fs::read(&outside)?, b"must remain unchanged");
         Ok(())
     }
 
