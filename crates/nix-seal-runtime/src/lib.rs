@@ -1121,7 +1121,8 @@ where
     Ok(())
 }
 
-fn validate_template_source(
+/// Validates strict public template syntax without reading or rendering secrets.
+pub fn validate_template_source(
     source: &[u8],
     placeholders: &BTreeMap<String, TemplatePlaceholderSpecV1>,
 ) -> Result<(), RuntimeError> {

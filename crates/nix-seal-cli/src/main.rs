@@ -163,6 +163,9 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SchemaKind::Plan)]
         kind: SchemaKind,
     },
+    /// Validate public template sources without decrypting or rendering secrets.
+    #[command(subcommand)]
+    Template(TemplateCommand),
     /// Generate shell completion definitions.
     Completions { shell: CompletionShell },
     /// Dry-run-first migration inspection adapters.
@@ -265,6 +268,15 @@ enum GroupCommand {
         id: nix_seal_core::Id,
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TemplateCommand {
+    /// Check declared placeholders against bounded public template sources.
+    Check {
+        #[arg(long, default_value = "plan.v1.json")]
+        plan: PathBuf,
     },
 }
 
@@ -695,6 +707,7 @@ fn run() -> Result<()> {
         )?,
         Command::Recipients(arguments) => run_recipients(&arguments, cli.json)?,
         Command::Schema { kind } => run_schema(kind)?,
+        Command::Template(TemplateCommand::Check { plan }) => run_template_check(&plan, cli.json)?,
         Command::Completions { shell } => completions(shell),
         Command::Migrate(command) => run_migrate(command, cli.json)?,
         Command::Cache(CacheCommand::Status { root }) => cache_status(root, cli.json)?,
@@ -923,6 +936,64 @@ fn run_schema(kind: SchemaKind) -> Result<()> {
             SchemaKind::Activation => nix_seal_runtime::activation_json_schema()?,
         }
     );
+    Ok(())
+}
+
+fn run_template_check(plan_path: &Path, json: bool) -> Result<()> {
+    let plan = read_plan_bounded(plan_path)?;
+    let parent = plan_path
+        .parent()
+        .context("compiled plan path has no parent")?;
+    for (template_id, template) in &plan.templates {
+        let source = Path::new(&template.source);
+        let source = if source.is_absolute() {
+            source.to_owned()
+        } else {
+            parent.join(source)
+        };
+        let mut bytes = Vec::new();
+        fs::File::open(&source)
+            .with_context(|| format!("could not open public template source for {template_id}"))?
+            .take(2 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            bail!("public template source for {template_id} exceeds the 2 MiB safety limit");
+        }
+        let placeholders = template
+            .placeholders
+            .iter()
+            .map(|(name, placeholder)| {
+                let encoding = match placeholder.encoding {
+                    nix_seal_core::TemplateEncoding::Utf8 => {
+                        nix_seal_runtime::TemplateEncodingV1::Utf8
+                    }
+                    nix_seal_core::TemplateEncoding::Base64 => {
+                        nix_seal_runtime::TemplateEncodingV1::Base64
+                    }
+                    nix_seal_core::TemplateEncoding::Hex => {
+                        nix_seal_runtime::TemplateEncodingV1::Hex
+                    }
+                };
+                (
+                    name.clone(),
+                    nix_seal_runtime::TemplatePlaceholderSpecV1 {
+                        secret_id: placeholder.secret.clone(),
+                        encoding,
+                    },
+                )
+            })
+            .collect();
+        nix_seal_runtime::validate_template_source(&bytes, &placeholders)
+            .with_context(|| format!("public template source for {template_id} is invalid"))?;
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"schema":"nix-seal.output.v1","ok":true,"templates":plan.templates.len()})
+        );
+    } else {
+        println!("{} public templates are valid", plan.templates.len());
+    }
     Ok(())
 }
 
