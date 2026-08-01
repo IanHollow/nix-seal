@@ -1789,4 +1789,15 @@ mod tests {
         assert_eq!(report[1].state, LifecycleStateV1::RotationDue);
         Ok(())
     }
+
+    #[test]
+    fn checked_in_plan_schema_matches_the_released_schema_generator()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let generated = format!("{}\n", json_schema()?);
+        assert_eq!(
+            generated,
+            include_str!("../../../schemas/plan-v1.schema.json")
+        );
+        Ok(())
+    }
 }
