@@ -189,6 +189,9 @@ enum Command {
     /// Internal authenticated runtime activation entrypoint.
     #[command(hide = true)]
     Activate(ActivateArgs),
+    /// Internal isolated age-plugin worker. This is not a stable user command.
+    #[command(name = "__plugin-worker", hide = true)]
+    PluginWorker,
     /// Secret authoring operations.
     #[command(subcommand)]
     Secret(SecretCommand),
@@ -871,6 +874,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Provision(arguments) => run_provision(arguments, cli.json)?,
         Command::Generate(arguments) => run_generate(&arguments, cli.json)?,
         Command::Activate(arguments) => run_activate(&arguments, cli.json)?,
+        Command::PluginWorker => run_plugin_worker()?,
         Command::Secret(command) => run_secret(command, cli.json)?,
         Command::Rotate(arguments) => run_secret_write(
             &arguments,
@@ -984,7 +988,7 @@ fn run_plan(
 ) -> Result<()> {
     let plan = load_plan(toml, nix_plan)?;
     nix_seal_policy::validate(&plan)?;
-    validate_plan_identity_material(&plan, false)?;
+    validate_plan_identity_material(&plan)?;
     let plan_hash = nix_seal_policy::plan_hash(&plan)?;
     if let Some(target) = target {
         let policy = nix_seal_policy::target_policy(&plan, &target)?;
@@ -1042,7 +1046,7 @@ fn run_check(
 ) -> Result<()> {
     let plan = load_plan(toml, nix_plan)?;
     nix_seal_policy::validate(&plan)?;
-    validate_plan_identity_material(&plan, false)?;
+    validate_plan_identity_material(&plan)?;
     validate_plan_templates(&plan, toml)?;
     let hash = nix_seal_policy::plan_hash(&plan)?;
     if deep {
@@ -1208,15 +1212,14 @@ fn run_template_render(
         .with_context(|| format!("public template source for {template_id} is invalid"))?;
 
     let identity = read_identity(identity_path)?;
-    let public = nix_seal_crypto::recipient_from_identity(&identity)?;
-    let public_fingerprint = nix_seal_crypto::recipient_fingerprint(&public)?;
     let mut secret_paths = BTreeMap::new();
     for placeholder in template.placeholders.values() {
         let recipients = nix_seal_policy::secret_recipients(&plan, &placeholder.secret)?;
-        if !recipients.recipients.values().any(|recipient| {
-            nix_seal_crypto::recipient_fingerprint(recipient)
-                .is_ok_and(|fingerprint| fingerprint == public_fingerprint)
-        }) {
+        if !recipients
+            .recipients
+            .values()
+            .any(|recipient| nix_seal_crypto::identity_matches_recipient(&identity, recipient))
+        {
             bail!(
                 "render identity is not authorized by canonical recipient policy for {}",
                 placeholder.secret
@@ -3803,11 +3806,11 @@ fn ensure_rekey_identity_authorized(
 ) -> Result<()> {
     let identity = identity
         .context("--identity is required to rekey administrator-encrypted canonical ciphertext")?;
-    let actual = nix_seal_crypto::recipient_from_identity(identity)?;
     let recipients = nix_seal_policy::secret_recipients(plan, secret)?;
-    let authorized = recipients.recipients.values().any(|candidate| {
-        nix_seal_crypto::normalize_recipient(candidate).is_ok_and(|candidate| candidate == actual)
-    });
+    let authorized = recipients
+        .recipients
+        .values()
+        .any(|candidate| nix_seal_crypto::identity_matches_recipient(identity, candidate));
     if !authorized {
         bail!(
             "identity is not an authorized administrator or recovery recipient for secret {secret}"
@@ -4919,14 +4922,12 @@ fn materialize_generator_secret_dependencies(
     else {
         bail!("external generator secret dependencies require a validated plan context");
     };
-    let public = nix_seal_crypto::recipient_from_identity(identity)?;
-    let public_fingerprint = nix_seal_crypto::recipient_fingerprint(&public)?;
     for (index, secret_id) in generator.secret_dependencies.iter().enumerate() {
         let recipients = nix_seal_policy::secret_recipients(plan, secret_id)?;
-        let authorized = recipients.recipients.values().any(|recipient| {
-            nix_seal_crypto::recipient_fingerprint(recipient)
-                .is_ok_and(|fingerprint| fingerprint == public_fingerprint)
-        });
+        let authorized = recipients
+            .recipients
+            .values()
+            .any(|recipient| nix_seal_crypto::identity_matches_recipient(identity, recipient));
         if !authorized {
             bail!(
                 "generator identity is not authorized by canonical recipient policy for {secret_id}"
@@ -5436,13 +5437,20 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_plugin_worker() -> Result<()> {
+    if std::env::var_os("NIX_SEAL_PLUGIN_WORKER").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        bail!("internal age-plugin worker may only be launched by nix-seal");
+    }
+    nix_seal_crypto::run_plugin_worker_protocol(std::io::stdin().lock(), std::io::stdout().lock())
+        .map_err(anyhow::Error::from)
+}
+
 fn ensure_identity_matches_recipient(
     identity: &secrecy::SecretString,
     recipient: &str,
 ) -> Result<()> {
-    if nix_seal_crypto::recipient_from_identity(identity)?
-        != nix_seal_crypto::normalize_recipient(recipient)?
-    {
+    nix_seal_crypto::normalize_recipient(recipient)?;
+    if !nix_seal_crypto::identity_matches_recipient(identity, recipient) {
         bail!("target identity does not match the recipient selected by plan policy");
     }
     Ok(())
@@ -5500,12 +5508,12 @@ fn read_plan_bounded(path: &Path) -> Result<nix_seal_core::PlanV1> {
     let plan: nix_seal_core::PlanV1 =
         serde_json::from_slice(&bytes).context("invalid strict plan.v1 JSON")?;
     nix_seal_policy::validate(&plan)?;
-    validate_plan_identity_material(&plan, false)?;
+    validate_plan_identity_material(&plan)?;
     Ok(plan)
 }
 
 fn deep_check_plan(plan: &nix_seal_core::PlanV1, repository_root: &Path) -> Result<()> {
-    validate_plan_identity_material(plan, true)?;
+    validate_plan_identity_material(plan)?;
     for (secret_id, secret) in &plan.secrets {
         let recipients = nix_seal_policy::secret_recipients(plan, secret_id)?;
         for recipient in recipients.recipients.values() {
@@ -5528,7 +5536,7 @@ fn deep_check_plan(plan: &nix_seal_core::PlanV1, repository_root: &Path) -> Resu
     Ok(())
 }
 
-fn validate_plan_identity_material(plan: &nix_seal_core::PlanV1, deep: bool) -> Result<()> {
+fn validate_plan_identity_material(plan: &nix_seal_core::PlanV1) -> Result<()> {
     let mut trusted = nix_seal_manifest::TrustedKeys::new();
     for (id, identity) in &plan.identities {
         match identity.kind {
@@ -5538,9 +5546,8 @@ fn validate_plan_identity_material(plan: &nix_seal_core::PlanV1, deep: bool) -> 
                     .with_context(|| format!("signer identity {id} is malformed or duplicated"))?;
             }
             nix_seal_core::IdentityKind::Plugin => {
-                if deep {
-                    bail!("identity {id} uses a plugin that this release cannot deeply validate");
-                }
+                nix_seal_crypto::recipient_fingerprint(&identity.public)
+                    .with_context(|| format!("plugin identity {id} has a malformed recipient"))?;
             }
             nix_seal_core::IdentityKind::Administrator
             | nix_seal_core::IdentityKind::Target
@@ -5612,12 +5619,11 @@ fn run_secret(command: SecretCommand, json: bool) -> Result<()> {
             let plan = read_plan_bounded(&arguments.policy.plan)?;
             let recipients = nix_seal_policy::secret_recipients(&plan, &arguments.policy.secret)?;
             let identity = read_identity(&arguments.identity)?;
-            let public = nix_seal_crypto::recipient_from_identity(&identity)?;
-            let public_fingerprint = nix_seal_crypto::recipient_fingerprint(&public)?;
-            if !recipients.recipients.values().any(|value| {
-                nix_seal_crypto::recipient_fingerprint(value)
-                    .is_ok_and(|fingerprint| fingerprint == public_fingerprint)
-            }) {
+            if !recipients
+                .recipients
+                .values()
+                .any(|value| nix_seal_crypto::identity_matches_recipient(&identity, value))
+            {
                 bail!("reveal identity is not authorized by canonical recipient policy");
             }
             let secret = plan

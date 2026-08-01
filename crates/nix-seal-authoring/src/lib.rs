@@ -222,7 +222,7 @@ pub struct EditRequest<'a> {
 }
 
 /// Encrypts a bounded input, verifies it by round-trip decryption, and commits atomically.
-pub fn write_secret<R: Read>(
+pub fn write_secret<R: Read + Send>(
     repository_root: &Path,
     relative_destination: &Path,
     input: R,
@@ -245,7 +245,7 @@ pub fn write_secret<R: Read>(
 /// committing ciphertext. This lets migration callers stream an external
 /// decryptor directly into age encryption while still failing closed when that
 /// process reports an error after closing standard output.
-pub fn write_secret_checked<R: Read, F: FnOnce() -> Result<(), AuthoringError>>(
+pub fn write_secret_checked<R: Read + Send, F: FnOnce() -> Result<(), AuthoringError>>(
     repository_root: &Path,
     relative_destination: &Path,
     input: R,
@@ -254,12 +254,9 @@ pub fn write_secret_checked<R: Read, F: FnOnce() -> Result<(), AuthoringError>>(
     mode: WriteMode,
     final_input_check: F,
 ) -> Result<AuthoringResult, AuthoringError> {
-    let verification_recipient = nix_seal_crypto::recipient_from_identity(verification_identity)?;
-    let normalized_recipients = recipients
-        .iter()
-        .map(|recipient| nix_seal_crypto::normalize_recipient(recipient))
-        .collect::<Result<Vec<_>, _>>()?;
-    if !normalized_recipients.contains(&verification_recipient) {
+    if !recipients.iter().any(|recipient| {
+        nix_seal_crypto::identity_matches_recipient(verification_identity, recipient)
+    }) {
         return Err(AuthoringError::VerificationIdentity);
     }
     let destination = resolve_destination(repository_root, relative_destination)?;
@@ -319,12 +316,9 @@ pub fn rekey_secret(
     verification_identity: &SecretString,
     mode: WriteMode,
 ) -> Result<AuthoringResult, AuthoringError> {
-    let verification_recipient = nix_seal_crypto::recipient_from_identity(verification_identity)?;
-    let normalized_recipients = recipients
-        .iter()
-        .map(|recipient| nix_seal_crypto::normalize_recipient(recipient))
-        .collect::<Result<Vec<_>, _>>()?;
-    if !normalized_recipients.contains(&verification_recipient) {
+    if !recipients.iter().any(|recipient| {
+        nix_seal_crypto::identity_matches_recipient(verification_identity, recipient)
+    }) {
         return Err(AuthoringError::VerificationIdentity);
     }
     let source = resolve_existing(repository_root, relative_source)?;
@@ -623,16 +617,12 @@ fn prepare_batch_writes(
     if writes.is_empty() || writes.len() > 10_000 {
         return Err(AuthoringError::UnsafePath);
     }
-    let verification_recipient = nix_seal_crypto::recipient_from_identity(verification_identity)?;
     let mut destinations = BTreeSet::new();
     let mut prepared = Vec::with_capacity(writes.len());
     for write in writes {
-        let normalized_recipients = write
-            .recipients
-            .iter()
-            .map(|recipient| nix_seal_crypto::normalize_recipient(recipient))
-            .collect::<Result<Vec<_>, _>>()?;
-        if !normalized_recipients.contains(&verification_recipient) {
+        if !write.recipients.iter().any(|recipient| {
+            nix_seal_crypto::identity_matches_recipient(verification_identity, recipient)
+        }) {
             return Err(AuthoringError::VerificationIdentity);
         }
         let destination = resolve_destination(repository_root, write.relative_destination)?;

@@ -336,9 +336,15 @@ that validated public plan. It exposes only each stable ID, role, and public
 recipient, signer, or plugin reference; it never searches for or reads private
 identity files.
 
-Age-plugin identities are deliberately rejected until the Rust sandbox client
-can enforce its descriptor, environment, timeout, and error-redaction contract.
-They are not silently run through `PATH` or accepted as deferred recipients.
+Age-plugin recipients and identities use the standard age plugin protocol
+through an isolated internal worker. The worker resolves only the declared
+`age-plugin-*` binaries, clears the inherited environment, passes an explicit
+allowlist needed by hardware/agent plugins, closes unrelated descriptors,
+enforces bounded streaming I/O and a timeout, and terminates the worker process
+group on failure. Plugin callbacks are non-interactive in this release, so a
+plugin that requires a prompt fails closed. Plugin identities do not expose a
+generic public key; authorization prechecks compare the plugin name and the age
+stanza decryption remains authoritative.
 
 Approval signer identities may use either the native `nix-seal-ed25519-v1:`
 public-key format or a standard `ssh-ed25519` public key. The corresponding

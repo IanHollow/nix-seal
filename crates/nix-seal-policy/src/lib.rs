@@ -265,14 +265,12 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
         ));
     }
     for (id, identity) in &plan.identities {
-        if matches!(identity.kind, IdentityKind::Plugin) {
-            return Err(PolicyError::Violation(format!(
-                "identity {id} uses an age plugin, but the sandboxed plugin client is not implemented"
-            )));
-        }
         if matches!(
             identity.kind,
-            IdentityKind::Administrator | IdentityKind::Target | IdentityKind::Recovery
+            IdentityKind::Administrator
+                | IdentityKind::Target
+                | IdentityKind::Recovery
+                | IdentityKind::Plugin
         ) && nix_seal_crypto::normalize_recipient(&identity.public).is_err()
         {
             return Err(PolicyError::Violation(format!(
@@ -2045,7 +2043,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_identities_fail_closed_until_the_sandbox_client_exists() -> Result<(), PolicyError> {
+    fn plugin_identities_require_standard_age_plugin_recipients() -> Result<(), PolicyError> {
         let mut plan = PlanV1::default();
         let id = Id::parse("hardware-token")
             .map_err(|error| PolicyError::Violation(error.to_string()))?;
@@ -2053,7 +2051,7 @@ mod tests {
             id,
             Identity {
                 kind: IdentityKind::Plugin,
-                public: "age1examplepluginrecipient".to_owned(),
+                public: "not-a-plugin-recipient".to_owned(),
             },
         );
         assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));

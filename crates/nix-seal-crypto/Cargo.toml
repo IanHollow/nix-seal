@@ -10,6 +10,8 @@ repository.workspace = true
 age.workspace = true
 blake3.workspace = true
 getrandom.workspace = true
+rustix.workspace = true
+tempfile.workspace = true
 secrecy.workspace = true
 thiserror.workspace = true
 

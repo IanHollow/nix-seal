@@ -1,6 +1,6 @@
 # ADR 0005: Plugins and generators
 
-Status: accepted; plugin client pending, unsupported plugin identities rejected
+Status: accepted; standard age plugin worker implemented
 
 Age identities use the standard plugin protocol. Generators are built-in Rust or
 direct declared executables from Nix packages; no shell evaluation. Processes
@@ -17,8 +17,15 @@ secret dependencies. The CLI checks canonical recipient authorization before
 streaming any dependency into that workspace. Plugin errors are redacted and
 unrelated descriptors are closed.
 
-Until the sandboxed client can enforce those invariants, any `plugin` identity
-causes plan validation to fail. This avoids accepting a policy whose recipients
-cannot be executed through the Rust adapter. Native age and OpenSSH migration
-recipients remain available; enabling a plugin is a reviewed future capability,
-not a silent fallback.
+The Rust adapter executes standard age plugin recipients and identities through
+the hidden `__plugin-worker` command. The parent resolves each required
+`age-plugin-*` executable to a regular file before launching it, then starts a
+private worker with a cleared environment, a narrow allowlist for hardware and
+agent integration, no inherited standard error, bounded framed input/output, and
+a process-group timeout. The worker uses `NoCallbacks`, so interactive plugin
+prompts fail closed rather than blocking or leaking prompt text. Plugin identity
+public values remain opaque: authorization prechecks compare the plugin name,
+while age stanza decryption is the authoritative key proof. Malformed frames,
+oversized fields, excessive recipients, missing binaries, non-zero exits, output
+overflows, and timeout/cleanup failures are redacted as one
+`CryptoError::Plugin` category.
