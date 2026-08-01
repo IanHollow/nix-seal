@@ -5416,7 +5416,7 @@ fn spawn_external_generator(
                 let _ = status_reader.join();
                 marker
             }
-            Ok(Ok(_)) | Ok(Err(())) => {
+            Ok(Ok(_) | Err(())) => {
                 terminate_child_process_tree(&mut child);
                 let _ = status_reader.join();
                 bail!("generator isolation worker returned an invalid status");
