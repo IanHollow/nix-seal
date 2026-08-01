@@ -25,8 +25,8 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-const SOPS_MIGRATION_MAX_PLAINTEXT_BYTES: u64 = 64 * 1024 * 1024;
-const SOPS_MIGRATION_TIMEOUT: Duration = Duration::from_mins(2);
+const EXTERNAL_MIGRATION_MAX_PLAINTEXT_BYTES: u64 = 64 * 1024 * 1024;
+const EXTERNAL_MIGRATION_TIMEOUT: Duration = Duration::from_mins(2);
 const PASSPHRASE_WORDS: [&str; 64] = [
     "amber", "anchor", "april", "arch", "aspen", "atlas", "aurora", "bamboo", "beacon", "birch",
     "blue", "brisk", "canyon", "cedar", "cinder", "cobalt", "comet", "coral", "crystal", "dawn",
@@ -1620,7 +1620,9 @@ fn migrate_sops_document(
     let (complete_tx, complete_rx) = mpsc::channel();
     let watchdog_child = Arc::clone(&child);
     let watchdog = thread::spawn(move || {
-        if complete_rx.recv_timeout(SOPS_MIGRATION_TIMEOUT).is_err()
+        if complete_rx
+            .recv_timeout(EXTERNAL_MIGRATION_TIMEOUT)
+            .is_err()
             && let Ok(mut child) = watchdog_child.lock()
             && child.try_wait().ok().flatten().is_none()
         {
@@ -1630,11 +1632,11 @@ fn migrate_sops_document(
     let result = nix_seal_authoring::write_secret_checked(
         repository_root,
         destination,
-        BoundedReader::new(stdout, SOPS_MIGRATION_MAX_PLAINTEXT_BYTES),
+        BoundedReader::new(stdout, EXTERNAL_MIGRATION_MAX_PLAINTEXT_BYTES),
         recipients,
         &identity,
         mode,
-        || wait_for_external_migration(&child, SOPS_MIGRATION_TIMEOUT),
+        || wait_for_external_migration(&child, EXTERNAL_MIGRATION_TIMEOUT),
     );
     let _ = complete_tx.send(());
     let _ = watchdog.join();
@@ -1717,19 +1719,7 @@ fn migrate_pgp_document(
         nix_seal_authoring::WriteMode::Create
     };
 
-    let mut command = ProcessCommand::new(gpg);
-    command
-        .arg("--batch")
-        .arg("--quiet")
-        .arg("--no-tty")
-        .arg("--decrypt")
-        .arg(&source)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .env_clear()
-        .env("GNUPGHOME", &gnupg_home)
-        .env("LC_ALL", "C");
+    let mut command = pgp_decrypt_command(&gpg, &gnupg_home, &source);
     let mut child = command
         .spawn()
         .context("could not start the explicit GnuPG migration executable")?;
@@ -1741,7 +1731,9 @@ fn migrate_pgp_document(
     let (complete_tx, complete_rx) = mpsc::channel();
     let watchdog_child = Arc::clone(&child);
     let watchdog = thread::spawn(move || {
-        if complete_rx.recv_timeout(SOPS_MIGRATION_TIMEOUT).is_err()
+        if complete_rx
+            .recv_timeout(EXTERNAL_MIGRATION_TIMEOUT)
+            .is_err()
             && let Ok(mut child) = watchdog_child.lock()
             && child.try_wait().ok().flatten().is_none()
         {
@@ -1751,11 +1743,11 @@ fn migrate_pgp_document(
     let result = nix_seal_authoring::write_secret_checked(
         repository_root,
         destination,
-        BoundedReader::new(stdout, SOPS_MIGRATION_MAX_PLAINTEXT_BYTES),
+        BoundedReader::new(stdout, EXTERNAL_MIGRATION_MAX_PLAINTEXT_BYTES),
         recipients,
         &identity,
         mode,
-        || wait_for_external_migration(&child, SOPS_MIGRATION_TIMEOUT),
+        || wait_for_external_migration(&child, EXTERNAL_MIGRATION_TIMEOUT),
     );
     let _ = complete_tx.send(());
     let _ = watchdog.join();
@@ -1783,6 +1775,27 @@ fn migrate_pgp_document(
         );
     }
     Ok(())
+}
+
+fn pgp_decrypt_command(gpg: &Path, gnupg_home: &Path, source: &Path) -> ProcessCommand {
+    let mut command = ProcessCommand::new(gpg);
+    command
+        .arg("--no-options")
+        .arg("--batch")
+        .arg("--quiet")
+        .arg("--no-tty")
+        .arg("--no-auto-key-locate")
+        .arg("--no-auto-key-import")
+        .arg("--no-auto-key-retrieve")
+        .arg("--decrypt")
+        .arg(source)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env_clear()
+        .env("GNUPGHOME", gnupg_home)
+        .env("LC_ALL", "C");
+    command
 }
 
 fn resolve_private_gnupg_home(path: &Path) -> Result<PathBuf> {
@@ -6588,6 +6601,49 @@ mod tests {
         assert_eq!(resolve_private_gnupg_home(&home)?, home);
         assert!(resolve_private_gnupg_home(&root.join("missing")).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn pgp_migration_command_ignores_configuration_and_network_key_lookup() {
+        let command = pgp_decrypt_command(
+            Path::new("/private/bin/gpg"),
+            Path::new("/private/gnupg"),
+            Path::new("/repository/legacy/source.pgp"),
+        );
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            vec![
+                "--no-options",
+                "--batch",
+                "--quiet",
+                "--no-tty",
+                "--no-auto-key-locate",
+                "--no-auto-key-import",
+                "--no-auto-key-retrieve",
+                "--decrypt",
+                "/repository/legacy/source.pgp",
+            ]
+        );
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment,
+            BTreeMap::from([
+                ("GNUPGHOME".to_owned(), Some("/private/gnupg".to_owned())),
+                ("LC_ALL".to_owned(), Some("C".to_owned())),
+            ])
+        );
     }
 
     #[test]

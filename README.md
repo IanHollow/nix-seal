@@ -322,8 +322,9 @@ hardware-backed identity before automated import.
 PGP is migration-only and never a native nix-seal encryption backend. Its
 dry-run-first bridge requires an absolute GnuPG executable and private,
 owner-only `GNUPGHOME`; execution clears inherited environment variables,
-suppresses GnuPG diagnostics, bounds the plaintext stream, and encrypts directly
-into a new native age file:
+disables option-file and automatic-key lookup behavior, suppresses GnuPG
+diagnostics, bounds the plaintext stream, and encrypts directly into a new
+native age file:
 
 ```console
 nix-seal migrate pgp --repository-root . --source legacy/service.pgp \
