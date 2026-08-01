@@ -1,6 +1,18 @@
 
 # cargo-vet audits file
 
+[[audits.proc-macro-error-attr3]]
+who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "3.1.0"
+notes = "Reviewed the proc-macro attribute helper at the pinned 3.1.0 release: compile-time token transformation only, no runtime I/O, process, network, filesystem, or unsafe-code capability in the enabled dependency surface."
+
+[[audits.proc-macro-error3]]
+who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "3.1.0"
+notes = "Reviewed the proc-macro implementation at the pinned 3.1.0 release: compile-time token parsing only, no runtime I/O, process, network, filesystem, or unsafe-code capability in the enabled dependency surface."
+
 [[audits.ed25519]]
 who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
 criteria = "safe-to-deploy"
