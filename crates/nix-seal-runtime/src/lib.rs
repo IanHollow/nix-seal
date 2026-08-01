@@ -2418,4 +2418,22 @@ mod tests {
         ));
         Ok(())
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_activation_lock() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let runtime = temporary.path().join("runtime");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&runtime)?;
+        std::fs::write(&outside, b"untrusted")?;
+        symlink(&outside, runtime.join(".activate.lock"))?;
+        assert!(matches!(
+            Generation::begin(&runtime),
+            Err(RuntimeError::UnsafeSource)
+        ));
+        Ok(())
+    }
 }
