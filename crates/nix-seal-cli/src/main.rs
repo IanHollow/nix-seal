@@ -4131,7 +4131,15 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
             continue;
         }
         let prompt_values = read_generator_prompts(generator, &prompt_files)?;
-        let generated_values = generate_generator_values(generator, &prompt_values)?;
+        let generated_values = generate_generator_values(
+            generator,
+            &prompt_values,
+            GeneratorSecretInputs::Plan {
+                plan: &plan,
+                repository_root: &arguments.repository_root,
+                identity: &identity,
+            },
+        )?;
         if generated_values.len() != generator.outputs.len() {
             bail!("generator produced an unexpected output count");
         }
@@ -4426,9 +4434,24 @@ fn validate_generator_prompt_files(
     Ok(prompt_files)
 }
 
+#[derive(Clone, Copy)]
+enum GeneratorSecretInputs<'a> {
+    /// Materialize explicitly declared canonical sources from this validated plan.
+    Plan {
+        plan: &'a nix_seal_core::PlanV1,
+        repository_root: &'a Path,
+        identity: &'a SecretString,
+    },
+    /// Test-only or built-in invocation without private canonical inputs.
+    #[allow(dead_code)]
+    // Used by the in-process generator tests; production always has a plan.
+    None,
+}
+
 fn generate_generator_values(
     generator: &nix_seal_core::Generator,
     prompts: &[SecretBox<Vec<u8>>],
+    secret_inputs: GeneratorSecretInputs<'_>,
 ) -> Result<Vec<SecretBox<Vec<u8>>>> {
     if generator.executable.starts_with("builtin:") {
         if generator.executable == "builtin:argon2id-password-hash" {
@@ -4437,18 +4460,22 @@ fn generate_generator_values(
         if !prompts.is_empty() {
             bail!("built-in generators do not accept prompts");
         }
+        if !generator.secret_dependencies.is_empty() {
+            bail!("built-in generators do not accept secret dependencies");
+        }
         return generator
             .outputs
             .iter()
             .map(|_| generate_builtin_value(generator))
             .collect();
     }
-    generate_external_values(generator, prompts)
+    generate_external_values(generator, prompts, secret_inputs)
 }
 
 fn generate_external_values(
     generator: &nix_seal_core::Generator,
     prompts: &[SecretBox<Vec<u8>>],
+    secret_inputs: GeneratorSecretInputs<'_>,
 ) -> Result<Vec<SecretBox<Vec<u8>>>> {
     let workspace = tempfile::Builder::new()
         .prefix("nix-seal-generator-")
@@ -4469,6 +4496,11 @@ fn generate_external_values(
             value.expose_secret(),
         )?;
     }
+    let secret_directory = workspace.path().join("secrets");
+    fs::create_dir(&secret_directory)
+        .context("could not create private generator secret directory")?;
+    set_private_directory(&secret_directory)?;
+    materialize_generator_secret_dependencies(generator, secret_inputs, &secret_directory)?;
     let runtime_path = std::env::join_paths(
         generator
             .runtime_inputs
@@ -4486,6 +4518,11 @@ fn generate_external_values(
         .env("NIX_SEAL_OUTPUT_COUNT", generator.outputs.len().to_string())
         .env("NIX_SEAL_PROMPT_DIR", &prompt_directory)
         .env("NIX_SEAL_PROMPT_COUNT", prompts.len().to_string())
+        .env("NIX_SEAL_SECRET_DIR", &secret_directory)
+        .env(
+            "NIX_SEAL_SECRET_COUNT",
+            generator.secret_dependencies.len().to_string(),
+        )
         .current_dir(workspace.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -4534,6 +4571,58 @@ fn generate_external_values(
         .iter()
         .map(|name| read_generator_output(&output_directory.join(name), generator.max_output_bytes))
         .collect()
+}
+
+fn materialize_generator_secret_dependencies(
+    generator: &nix_seal_core::Generator,
+    secret_inputs: GeneratorSecretInputs<'_>,
+    secret_directory: &Path,
+) -> Result<()> {
+    if generator.secret_dependencies.is_empty() {
+        return Ok(());
+    }
+    let GeneratorSecretInputs::Plan {
+        plan,
+        repository_root,
+        identity,
+    } = secret_inputs
+    else {
+        bail!("external generator secret dependencies require a validated plan context");
+    };
+    let public = nix_seal_crypto::recipient_from_identity(identity)?;
+    let public_fingerprint = nix_seal_crypto::recipient_fingerprint(&public)?;
+    for (index, secret_id) in generator.secret_dependencies.iter().enumerate() {
+        let recipients = nix_seal_policy::secret_recipients(plan, secret_id)?;
+        let authorized = recipients.recipients.values().any(|recipient| {
+            nix_seal_crypto::recipient_fingerprint(recipient)
+                .is_ok_and(|fingerprint| fingerprint == public_fingerprint)
+        });
+        if !authorized {
+            bail!(
+                "generator identity is not authorized by canonical recipient policy for {secret_id}"
+            );
+        }
+        let secret = plan
+            .secrets
+            .get(secret_id)
+            .context("generator secret dependency is absent from plan")?;
+        let ciphertext_path = existing_secret_path(repository_root, &secret.source)?;
+        let ciphertext = open_public_ciphertext(&ciphertext_path)?;
+        let output_path = secret_directory.join(index.to_string());
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output_path)
+            .context("could not create private generator secret dependency")?;
+        set_private_file(&output_path)?;
+        nix_seal_crypto::decrypt(ciphertext, &mut output, identity).with_context(|| {
+            format!("could not decrypt generator secret dependency {secret_id}")
+        })?;
+        output
+            .sync_all()
+            .context("could not durably stage generator secret dependency")?;
+    }
+    Ok(())
 }
 
 fn read_generator_output(path: &Path, maximum: u64) -> Result<SecretBox<Vec<u8>>> {
@@ -6861,6 +6950,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn built_in_generators_are_bounded_and_format_safe() -> Result<(), Box<dyn std::error::Error>> {
         let output = nix_seal_core::Id::parse("application/token")?;
@@ -6871,6 +6961,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
             prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "48".to_owned())]),
@@ -6884,6 +6975,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
             prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
@@ -6899,6 +6991,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
             prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
@@ -6912,6 +7005,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
             prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
@@ -6932,6 +7026,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
@@ -6950,6 +7045,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![output],
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
@@ -6974,6 +7070,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![nix_seal_core::Id::parse("application/passphrase")?],
             prompts: Vec::new(),
             parameters: BTreeMap::from([("words".to_owned(), "12".to_owned())]),
@@ -7004,6 +7101,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![nix_seal_core::Id::parse("application/password-hash")?],
             prompts: vec![nix_seal_core::GeneratorPrompt {
                 id: nix_seal_core::Id::parse("password")?,
@@ -7020,7 +7118,8 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             validation: None,
         };
         let password = SecretBox::new(Box::new(b"argon2id-test-password".to_vec()));
-        let generated = generate_generator_values(&generator, &[password])?;
+        let generated =
+            generate_generator_values(&generator, &[password], GeneratorSecretInputs::None)?;
         let encoded = std::str::from_utf8(generated[0].expose_secret())?;
         assert!(encoded.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
         let parsed = PasswordHash::new(encoded)
@@ -7038,7 +7137,8 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         assert!(
             generate_generator_values(
                 &visible,
-                &[SecretBox::new(Box::new(b"argon2id-test-password".to_vec()))]
+                &[SecretBox::new(Box::new(b"argon2id-test-password".to_vec()))],
+                GeneratorSecretInputs::None,
             )
             .is_err()
         );
@@ -7074,6 +7174,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![secret_id],
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
@@ -7112,6 +7213,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![nix_seal_core::Id::parse("application/ssh-private-key")?],
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
@@ -7169,6 +7271,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: 5,
             max_output_bytes: 1024,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![
                 nix_seal_core::Id::parse("generator/one")?,
                 nix_seal_core::Id::parse("generator/two")?,
@@ -7183,11 +7286,104 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             parameters: BTreeMap::new(),
             validation: None,
         };
-        let values =
-            generate_external_values(&generator, &[SecretBox::new(Box::new(b"first".to_vec()))])?;
+        let values = generate_external_values(
+            &generator,
+            &[SecretBox::new(Box::new(b"first".to_vec()))],
+            GeneratorSecretInputs::None,
+        )?;
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].expose_secret(), b"first");
         assert_eq!(values[1].expose_secret(), b"second");
+        Ok(())
+    }
+
+    #[test]
+    fn constrained_external_generator_receives_only_declared_secret_inputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let shell = std::env::split_paths(&std::env::var_os("PATH").ok_or("PATH is absent")?)
+            .map(|directory| directory.join("sh"))
+            .find(|candidate| candidate.is_file())
+            .ok_or("sh is absent from PATH")?
+            .canonicalize()?;
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(repository.join("secrets"))?;
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        let dependency_id = nix_seal_core::Id::parse("application/input")?;
+        let output_id = nix_seal_core::Id::parse("application/output")?;
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.identities.insert(
+            nix_seal_core::Id::parse("administrator")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: recipient.clone(),
+            },
+        );
+        plan.identities.insert(
+            nix_seal_core::Id::parse("signer")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Signer,
+                public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public()?,
+            },
+        );
+        plan.secrets.insert(
+            dependency_id.clone(),
+            nix_seal_core::Secret {
+                source: "secrets/input.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: Vec::new(),
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: None,
+            },
+        );
+        nix_seal_crypto::encrypt(
+            std::io::Cursor::new(b"dependency-canary"),
+            fs::File::create(repository.join("secrets/input.age"))?,
+            &[recipient],
+        )?;
+        let generator = nix_seal_core::Generator {
+            executable: shell.to_string_lossy().into_owned(),
+            arguments: vec![
+                "-c".to_owned(),
+                "test \"$NIX_SEAL_SECRET_COUNT\" = 1; test -f \"$NIX_SEAL_SECRET_DIR/0\"; test ! -e \"$NIX_SEAL_SECRET_DIR/1\"; IFS= read -r value < \"$NIX_SEAL_SECRET_DIR/0\"; printf %s \"$value\" > \"$NIX_SEAL_OUTPUT_DIR/0\"".to_owned(),
+            ],
+            runtime_inputs: Vec::new(),
+            timeout_seconds: 5,
+            max_output_bytes: 1024,
+            dependencies: Vec::new(),
+            secret_dependencies: vec![dependency_id],
+            outputs: vec![output_id],
+            prompts: Vec::new(),
+            parameters: BTreeMap::new(),
+            validation: None,
+        };
+        let values = generate_external_values(
+            &generator,
+            &[],
+            GeneratorSecretInputs::Plan {
+                plan: &plan,
+                repository_root: &repository,
+                identity: &identity,
+            },
+        )?;
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].expose_secret(), b"dependency-canary");
+        let (unauthorized_identity, _) = nix_seal_crypto::generate_x25519();
+        assert!(
+            generate_external_values(
+                &generator,
+                &[],
+                GeneratorSecretInputs::Plan {
+                    plan: &plan,
+                    repository_root: &repository,
+                    identity: &unauthorized_identity,
+                },
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -7466,6 +7662,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
                 max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
                 dependencies: Vec::new(),
+                secret_dependencies: Vec::new(),
                 outputs: vec![secret_id, second_secret_id],
                 prompts: Vec::new(),
                 parameters: BTreeMap::from([("bytes".to_owned(), "20".to_owned())]),

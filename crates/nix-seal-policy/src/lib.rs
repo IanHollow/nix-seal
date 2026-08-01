@@ -879,27 +879,19 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
     let mut indegree = BTreeMap::new();
     let mut dependents: BTreeMap<&Id, Vec<&Id>> = BTreeMap::new();
     let mut generated_outputs = BTreeSet::new();
+    let mut output_producers = BTreeMap::new();
     let mut generator_prompts = BTreeSet::new();
     for (generator_id, generator) in &plan.generators {
-        if generator.dependencies.len() > 10_000 || generator.outputs.len() > 10_000 {
+        if generator.dependencies.len() > 10_000
+            || generator.secret_dependencies.len() > 10_000
+            || generator.outputs.len() > 10_000
+        {
             return Err(PolicyError::Violation(format!(
                 "generator {generator_id} exceeds dependency or output limits"
             )));
         }
         validate_generator_execution(generator_id, generator)?;
-        if generator.prompts.len() > 64
-            || generator.prompts.iter().any(|prompt| {
-                prompt.message.is_empty()
-                    || prompt.message.len() > 4096
-                    || prompt.message.bytes().any(|byte| byte == 0)
-                    || prompt.persistent
-                    || !generator_prompts.insert(&prompt.id)
-            })
-        {
-            return Err(PolicyError::Violation(format!(
-                "generator {generator_id} has invalid, duplicate, or unsupported persistent prompts"
-            )));
-        }
+        validate_generator_prompts(generator_id, generator, &mut generator_prompts)?;
         if generator.outputs.is_empty() {
             return Err(PolicyError::Violation(format!(
                 "generator {generator_id} must declare at least one output"
@@ -911,7 +903,9 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
                     "generator {generator_id} has a missing or duplicate secret output {output}"
                 )));
             }
+            output_producers.insert(output, generator_id);
         }
+        validate_generator_secret_dependencies(plan, generator_id, generator)?;
         if generator.parameters.len() > 128
             || generator.parameters.iter().any(|(key, value)| {
                 !is_generator_parameter_name(key)
@@ -972,6 +966,67 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
             "generator dependency graph contains a cycle".to_owned(),
         ));
     }
+    validate_generated_secret_dependency_order(plan, &output_producers)?;
+    Ok(())
+}
+
+fn validate_generated_secret_dependency_order(
+    plan: &PlanV1,
+    output_producers: &BTreeMap<&Id, &Id>,
+) -> Result<(), PolicyError> {
+    for (generator_id, generator) in &plan.generators {
+        for secret_id in &generator.secret_dependencies {
+            if let Some(producer) = output_producers.get(secret_id)
+                && !generator.dependencies.contains(*producer)
+            {
+                return Err(PolicyError::Violation(format!(
+                    "generator {generator_id} must directly depend on generator {producer}, which produces secret dependency {secret_id}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_generator_prompts<'a>(
+    generator_id: &Id,
+    generator: &'a Generator,
+    known_prompts: &mut BTreeSet<&'a Id>,
+) -> Result<(), PolicyError> {
+    if generator.prompts.len() > 64
+        || generator.prompts.iter().any(|prompt| {
+            prompt.message.is_empty()
+                || prompt.message.len() > 4096
+                || prompt.message.bytes().any(|byte| byte == 0)
+                || prompt.persistent
+                || !known_prompts.insert(&prompt.id)
+        })
+    {
+        return Err(PolicyError::Violation(format!(
+            "generator {generator_id} has invalid, duplicate, or unsupported persistent prompts"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_generator_secret_dependencies(
+    plan: &PlanV1,
+    generator_id: &Id,
+    generator: &Generator,
+) -> Result<(), PolicyError> {
+    let secret_dependencies: BTreeSet<_> = generator.secret_dependencies.iter().collect();
+    if secret_dependencies.len() != generator.secret_dependencies.len()
+        || secret_dependencies
+            .iter()
+            .any(|secret| !plan.secrets.contains_key(*secret))
+        || secret_dependencies
+            .iter()
+            .any(|secret| generator.outputs.contains(*secret))
+    {
+        return Err(PolicyError::Violation(format!(
+            "generator {generator_id} has invalid, duplicate, missing, or self-referential secret dependencies"
+        )));
+    }
     Ok(())
 }
 
@@ -1031,6 +1086,11 @@ fn validate_generator_execution(
     }
     if generator.executable == "builtin:argon2id-password-hash" {
         validate_argon2id_password_hash_generator(generator_id, generator)?;
+    }
+    if is_builtin && !generator.secret_dependencies.is_empty() {
+        return Err(PolicyError::Violation(format!(
+            "built-in generator {generator_id} cannot declare secret dependencies"
+        )));
     }
     Ok(())
 }
@@ -1253,6 +1313,7 @@ mod tests {
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::from([("words".to_owned(), "16".to_owned())]),
@@ -1261,6 +1322,19 @@ mod tests {
         let id =
             Id::parse("passphrase").map_err(|error| PolicyError::Violation(error.to_string()))?;
         validate_generator_execution(&id, &generator)?;
+        assert!(
+            validate_generator_execution(
+                &id,
+                &nix_seal_core::Generator {
+                    secret_dependencies: vec![
+                        Id::parse("application/input")
+                            .map_err(|error| PolicyError::Violation(error.to_string()))?
+                    ],
+                    ..generator.clone()
+                }
+            )
+            .is_err()
+        );
         let ssh = nix_seal_core::Generator {
             executable: "builtin:ssh-ed25519".to_owned(),
             parameters: BTreeMap::new(),
@@ -1336,6 +1410,98 @@ mod tests {
             );
         }
         assert!(validate(&plan).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn generator_secret_dependencies_are_distinct_existing_and_not_outputs()
+    -> Result<(), PolicyError> {
+        let mut plan = PlanV1::default();
+        let administrator = Id::parse("administrator")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let signer =
+            Id::parse("signer").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let input = Id::parse("application/input")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let output = Id::parse("application/output")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.identities.insert(
+            administrator,
+            Identity {
+                kind: IdentityKind::Administrator,
+                public: RECIPIENT.to_owned(),
+            },
+        );
+        plan.identities.insert(
+            signer,
+            Identity {
+                kind: IdentityKind::Signer,
+                public: SIGNER.to_owned(),
+            },
+        );
+        for (id, source) in [
+            (&input, "secrets/input.age"),
+            (&output, "secrets/output.age"),
+        ] {
+            plan.secrets.insert(
+                id.clone(),
+                Secret {
+                    source: source.to_owned(),
+                    delivery: DeliveryMode::Rekeyed,
+                    administrators: Vec::new(),
+                    consumers: Vec::new(),
+                    phase: ActivationPhase::Activation,
+                    runtime: RuntimeSettings::default(),
+                    lifecycle: Lifecycle::default(),
+                    approval_policy: None,
+                },
+            );
+        }
+        let generator_id = Id::parse("application/generator")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.generators.insert(
+            generator_id,
+            Generator {
+                executable: "/nix/store/abc123-generator/bin/generate".to_owned(),
+                arguments: Vec::new(),
+                runtime_inputs: Vec::new(),
+                timeout_seconds: 30,
+                max_output_bytes: 1024,
+                dependencies: Vec::new(),
+                secret_dependencies: vec![input.clone(), output.clone()],
+                outputs: vec![output.clone()],
+                prompts: Vec::new(),
+                parameters: BTreeMap::new(),
+                validation: None,
+            },
+        );
+        assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
+        let invalid = plan
+            .generators
+            .remove(
+                &Id::parse("application/generator")
+                    .map_err(|error| PolicyError::Violation(error.to_string()))?,
+            )
+            .ok_or_else(|| PolicyError::Violation("test generator is missing".to_owned()))?;
+        let producer_id = Id::parse("application/producer")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let consumer_id = Id::parse("application/consumer")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let mut producer = invalid.clone();
+        producer.secret_dependencies = Vec::new();
+        producer.outputs = vec![input.clone()];
+        let mut consumer = invalid;
+        consumer.secret_dependencies = vec![input];
+        consumer.outputs = vec![output];
+        consumer.dependencies = Vec::new();
+        plan.generators.insert(producer_id.clone(), producer);
+        plan.generators.insert(consumer_id.clone(), consumer);
+        assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
+        plan.generators
+            .get_mut(&consumer_id)
+            .ok_or_else(|| PolicyError::Violation("test consumer is missing".to_owned()))?
+            .dependencies = vec![producer_id];
+        validate(&plan)?;
         Ok(())
     }
 

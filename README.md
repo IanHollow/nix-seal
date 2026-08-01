@@ -376,6 +376,18 @@ enter the plan, command arguments, environment, or logs. Persistent prompt
 storage and terminal prompting remain explicitly unavailable until their
 separate storage and TTY hardening designs are complete.
 
+External generators may additionally declare `secretDependencies`. nix-seal
+requires every declared ID to be an existing canonical secret, forbids duplicate
+or self-output dependencies, verifies that the supplied identity is an
+authorized canonical recipient, then streams each dependency into an owned
+`0600` file named `0`, `1`, and so on beneath `$NIX_SEAL_SECRET_DIR` in declared
+order. `$NIX_SEAL_SECRET_COUNT` is public metadata only. Built-in generators
+cannot receive secret dependencies. No undeclared canonical secret is decrypted
+for the generator, and the private workspace is removed whether generation
+succeeds or fails. If an input is itself produced by another generator, that
+producer must be a direct entry in `dependencies`, making generation order
+explicit and checkable.
+
 ## Migration inspection
 
 Migration begins with a deliberately non-destructive public inventory. Export

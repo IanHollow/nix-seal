@@ -6,6 +6,11 @@ Age identities use the standard plugin protocol. Generators are built-in Rust or
 direct declared executables from Nix packages; no shell evaluation. Processes
 receive a sanitized environment, explicit descriptors and secret dependencies,
 private workspace, time/output bounds, and network isolation when enforceable.
+External generators receive each explicitly declared canonical secret dependency
+as one numbered `0600` file beneath a private `NIX_SEAL_SECRET_DIR`; no
+dependency value is passed through arguments, an ordinary environment value, or
+the Nix store. Built-ins reject secret dependencies. The CLI checks canonical
+recipient authorization before streaming any dependency into that workspace.
 Plugin errors are redacted and unrelated descriptors are closed.
 
 Until the sandboxed client can enforce those invariants, any `plugin` identity

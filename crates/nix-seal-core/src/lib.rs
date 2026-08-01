@@ -309,6 +309,9 @@ pub struct Generator {
     /// Generator dependencies.
     #[serde(default)]
     pub dependencies: Vec<Id>,
+    /// Canonical secret inputs exposed only to a constrained external generator.
+    #[serde(default)]
+    pub secret_dependencies: Vec<Id>,
     /// Declared outputs.
     pub outputs: Vec<Id>,
     /// Explicit prompt declarations. Prompt values never enter the public plan.

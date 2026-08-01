@@ -230,6 +230,14 @@
             "type": "string"
           }
         },
+        "secretDependencies": {
+          "description": "Canonical secret inputs exposed only to a constrained external generator.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
         "timeoutSeconds": {
           "description": "Maximum external-generator execution time in seconds.",
           "type": "integer",
