@@ -59,11 +59,11 @@ collections and invalid collection IDs during Nix evaluation, and emits the same
 let
   plan = nixSeal.lib.mkPlan {
     identities.admin = {
-      kind = "age";
+      kind = "administrator";
       public = "age1example...";
     };
     targets.desktop = {
-      kind = "nixos";
+      kind = "nixOs";
       system = "x86_64-linux";
       identity = "admin";
     };
@@ -631,7 +631,7 @@ configuration or rewrite the legacy ciphertext.
 nixSeal.lib.agenixRekeyMigrationExport {
   target = {
     id = "desktop";
-    kind = "nixos";
+    kind = "nixOs";
     system = "x86_64-linux";
     recipient = "ssh-ed25519 AAAA...";
     storageMode = "derivation";
