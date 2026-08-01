@@ -76,9 +76,11 @@ marker only after every action succeeds. A failed action therefore does not roll
 back the already-atomic secret switch, but the next activation retries the
 actions even when the plaintext generation is unchanged. The activation lock
 remains held through the switch, action execution, and marker update so
-concurrent activations cannot lose or duplicate the pending state. Removing
-actions from a later plan clears a matching or stale marker without executing
-it.
+concurrent activations cannot lose or duplicate the pending state. A later
+activation that does not carry the same authenticated policy fails closed and
+leaves the marker in place; operators must retry the original action set before
+it can be cleared. This prevents a plan-only or configuration-only change from
+silently skipping a service restart that already failed.
 
 On systemd platforms, a secret may map its runtime path to one or more explicit
 `(service unit, credential name)` pairs. The modules emit only

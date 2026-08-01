@@ -390,6 +390,10 @@ pub enum RuntimeError {
     /// A public post-switch service action exceeded its timeout.
     #[error("post-switch service action timed out for {0}")]
     ServiceTimeout(String),
+    /// A previous generation switch has a service action that must be retried
+    /// with the same authenticated activation policy before it can be cleared.
+    #[error("a previous activation has a pending post-switch action; retry that activation policy")]
+    PendingPostSwitch,
     /// Artifact authentication failed before decryption.
     #[error(transparent)]
     Manifest(#[from] nix_seal_manifest::ManifestError),
@@ -711,13 +715,17 @@ impl Generation {
         plan_hash: &str,
         actions: Option<&PostSwitchSpecV1>,
     ) -> Result<(), RuntimeError> {
-        let pending = pending_matches(&self.root, current, plan_hash)?;
-        if pending && let Some(actions) = actions {
-            run_post_switch(actions)?;
+        if !pending_marker_exists(&self.root)? {
+            return Ok(());
         }
-        if pending || pending_marker_exists(&self.root)? {
-            clear_pending(&self.root)?;
+        if !pending_matches(&self.root, current, plan_hash)? {
+            return Err(RuntimeError::PendingPostSwitch);
         }
+        let Some(actions) = actions else {
+            return Err(RuntimeError::PendingPostSwitch);
+        };
+        run_post_switch(actions)?;
+        clear_pending(&self.root)?;
         Ok(())
     }
 
@@ -733,6 +741,13 @@ impl Generation {
         plan_hash: &str,
         actions: Option<&PostSwitchSpecV1>,
     ) -> Result<PathBuf, RuntimeError> {
+        // A failed post-switch action belongs to the currently active
+        // generation. Never replace or clear that durable marker while
+        // publishing a different generation; the operator must retry the
+        // original authenticated action set first.
+        if pending_marker_exists(&self.root)? {
+            return Err(RuntimeError::PendingPostSwitch);
+        }
         let generation = generation.map_or_else(|| next_generation(&self.root), Ok)?;
         sync_tree(self.transaction.path())?;
         let destination = self.root.join(format!("generation-{generation}"));
@@ -2377,15 +2392,37 @@ mod tests {
             Path::new("generation-1")
         );
         assert!(fixture.runtime.join(PENDING_MARKER).exists());
+        let replacement = Generation::begin(&fixture.runtime)?;
+        replacement.write_from(&fixture.secret_id, b"new-value".as_slice(), 0o400)?;
+        assert!(matches!(
+            replacement.commit_and_switch(2),
+            Err(RuntimeError::PendingPostSwitch)
+        ));
+        assert_eq!(
+            std::fs::read_link(fixture.runtime.join("current"))?,
+            Path::new("generation-1")
+        );
+        assert!(fixture.runtime.join(PENDING_MARKER).exists());
         assert!(matches!(
             activate(&request),
             Err(RuntimeError::ServiceAction(_))
         ));
         assert!(!fixture.runtime.join("generation-2").exists());
         request.post_switch = None;
-        let recovered = activate(&request)?;
-        assert!(!recovered.changed);
-        assert!(!fixture.runtime.join(PENDING_MARKER).exists());
+        assert!(matches!(
+            activate(&request),
+            Err(RuntimeError::PendingPostSwitch)
+        ));
+        assert!(fixture.runtime.join(PENDING_MARKER).exists());
+        std::fs::write(
+            fixture.runtime.join(PENDING_MARKER),
+            pending_payload(&fixture.runtime.join("generation-1"), "different-plan-hash")?,
+        )?;
+        assert!(matches!(
+            activate(&request),
+            Err(RuntimeError::PendingPostSwitch)
+        ));
+        assert!(fixture.runtime.join(PENDING_MARKER).exists());
         Ok(())
     }
 
@@ -2538,9 +2575,14 @@ mod tests {
                         current = Some(generation);
                         assert!(fixture.runtime.join(PENDING_MARKER).exists());
                         request.post_switch = None;
-                        let retry = activate(&request)?;
-                        assert!(!retry.changed);
-                        assert!(!fixture.runtime.join(PENDING_MARKER).exists());
+                        assert!(matches!(
+                            activate(&request),
+                            Err(RuntimeError::PendingPostSwitch)
+                        ));
+                        assert!(fixture.runtime.join(PENDING_MARKER).exists());
+                        // The harness models an operator explicitly resolving
+                        // the external service failure before the next step.
+                        clear_pending(&fixture.runtime)?;
                     }
                     assert_eq!(current, observed_generation()?);
                 }

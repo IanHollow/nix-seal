@@ -19,7 +19,9 @@
   artifact and export publication now use atomic no-replace renames with
   regression coverage; a descriptor-relative parent-substitution race regression
   verifies that an attacker cannot redirect publication through a swapped
-  symlink. The Linux NixOS VM now exercises a real systemd credential consumer
+  symlink. Pending post-switch action markers now fail closed when a later
+  activation supplies a different or missing policy, preserving durable retry
+  semantics. The Linux NixOS VM now exercises a real systemd credential consumer
   and post-switch restart after activation; service actions now reject untrusted
   manager paths.
 - Phase 3: authoring and lifecycle commands, identity/value rotation,

@@ -154,7 +154,10 @@ does not change the credential used by the service.
    old generation before confirming the replacement is healthy.
 3. Use the platform's normal Nix rollback or redeploy the previously approved
    artifact generation. Re-run activation and service health checks, then
-   inspect unit reload/restart results.
+   inspect unit reload/restart results. If activation reports a pending
+   post-switch action, retry the same approved activation policy; nix-seal
+   intentionally preserves that marker and refuses to clear it when a later
+   plan omits or changes the action set.
 4. Remember that old generations contain old plaintext until removed or the host
    reboots. If the failed deployment involved a suspected credential exposure,
    rotate the application value before making the rollback durable.
