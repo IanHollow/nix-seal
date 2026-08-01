@@ -15,6 +15,15 @@
 - Phase 5: attack-path review, sustained fuzz/mutation/platform/performance
   work, release candidate, independent audit and remediation, then 1.0.
 
+## Verified supply-chain follow-ups
+
+- `spin 0.9.8` is a yanked transitive dependency of the pinned `age` stack.
+  Update it only with a reviewed Cargo Vet record and compatibility checks; do
+  not add a blanket exemption merely to silence the yanked-package check.
+- `rsa` is required by `age` only for the documented OpenSSH RSA migration
+  compatibility path. Its unfixed timing advisory remains constrained by ADR
+  0009 and must be reassessed on every `age`/`rsa` update.
+
 Post-1.0 candidates include remote provider SDK/daemon, Vault and cloud/password
 manager providers, dynamic leases, SPIFFE, reviewed threshold decryption,
 attested TPM-bound delivery, and organization-wide tamper-evident audit.
