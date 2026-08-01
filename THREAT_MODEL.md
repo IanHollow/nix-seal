@@ -66,3 +66,8 @@ Every cryptography, signing, manifest, activation, plugin, migration, or trust
 root change updates this document and its ADR. Release candidates include an
 attack-path review. The security team reviews the model at least once per minor
 release and after every incident.
+
+The operational procedures in [`docs/runbooks.md`](docs/runbooks.md) are part of
+the threat-model control set. They must be exercised for administrator-key,
+target-key, signer, cache-loss, rollback, and recovery scenarios before a 1.0
+release and after any material trust-root change.
