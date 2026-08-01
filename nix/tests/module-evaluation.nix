@@ -318,6 +318,9 @@ let
   invalidCollectionId = builtins.tryEval (
     builtins.deepSeq (nixSealLib.mkPlan { secrets."bad//id" = { }; }) true
   );
+  invalidDotSegmentId = builtins.tryEval (
+    builtins.deepSeq (nixSealLib.mkPlan { secrets."bad/./id" = { }; }) true
+  );
   invalidArtifactEntries = builtins.tryEval (
     nixSealLib.artifactBundle {
       path = pkgs.runCommand "nix-seal-invalid-artifact" { } ''
@@ -346,6 +349,7 @@ in
       '';
   lib-plan-builder =
     assert !invalidCollectionId.success;
+    assert !invalidDotSegmentId.success;
     pkgs.runCommand "nix-seal-lib-plan-builder" { nativeBuildInputs = [ pkgs.jq ]; } ''
       jq -e '
         .schema == "nix-seal.plan.v1" and

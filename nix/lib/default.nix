@@ -4,7 +4,8 @@ let
     value:
     builtins.isString value
     && builtins.match "[a-z0-9._-]+(/[a-z0-9._-]+)*" value != null
-    && !(lib.hasInfix ".." value);
+    && !(lib.hasInfix ".." value)
+    && lib.all (segment: segment != ".") (lib.splitString "/" value);
 
   validateCollection =
     kind: value:
