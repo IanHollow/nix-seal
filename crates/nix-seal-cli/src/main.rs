@@ -7011,11 +7011,18 @@ fn run_secret_rekey(arguments: &SecretRekeyArgs, json: bool) -> Result<()> {
         .as_deref()
         .context("canonical rekey requires --identity when --yes is supplied")?;
     let identity = read_identity(identity_path)?;
-    if !recipients
-        .iter()
-        .any(|recipient| nix_seal_crypto::identity_matches_recipient(&identity, recipient))
-    {
-        bail!("rekey identity is not authorized by canonical recipient policy");
+    let administrator_authorized = recipient_policy.recipients.iter().any(|(id, recipient)| {
+        plan.identities.get(id).is_some_and(|declared| {
+            matches!(
+                declared.kind,
+                nix_seal_core::IdentityKind::Administrator | nix_seal_core::IdentityKind::Recovery
+            ) && nix_seal_crypto::identity_matches_recipient(&identity, recipient)
+        })
+    });
+    if !administrator_authorized {
+        bail!(
+            "rekey identity must be an administrator or recovery identity authorized by canonical recipient policy"
+        );
     }
     if matches!(secret.delivery, nix_seal_core::DeliveryMode::Direct) {
         eprintln!(
