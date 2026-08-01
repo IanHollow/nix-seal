@@ -1166,9 +1166,11 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "nix-seal-core",
+ "nix-seal-crypto",
  "nix-seal-manifest",
  "nix-seal-policy",
  "nix-seal-runtime",
+ "secrecy",
  "serde_json",
 ]
 

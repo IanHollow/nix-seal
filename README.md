@@ -155,11 +155,12 @@ nix build github:IanHollow/nix-seal#documentation
 ## Fuzzing
 
 The checked-in `fuzz` workspace exercises strict public `plan.v1`,
-`activation.v2`, template-parser, and signed-artifact-envelope boundaries. It
-deserializes untrusted bytes, validates successful documents, checks their
-public JSON serialization round trips, and renders accepted templates through a
-bounded writer; the plan target also derives each target projection. Run the
-short sanitizer campaigns locally with a nightly Rust toolchain:
+`activation.v2`, template-parser, signed-artifact-envelope, and age
+recipient/identity-parser boundaries. It deserializes untrusted bytes, validates
+successful documents, checks their public JSON serialization round trips, and
+renders accepted templates through a bounded writer; the plan target also
+derives each target projection. Run the short sanitizer campaigns locally with a
+nightly Rust toolchain:
 
 ```console
 cd fuzz
@@ -167,6 +168,7 @@ cargo fuzz run plan-v1 -- -max_total_time=60
 cargo fuzz run activation-v2 -- -max_total_time=60
 cargo fuzz run template-v1 -- -max_total_time=60
 cargo fuzz run artifact-envelope-v1 -- -max_total_time=60
+cargo fuzz run identity-v1 -- -max_total_time=60
 ```
 
 The CI smoke run catches regressions quickly; sustained parser, cache, runtime,

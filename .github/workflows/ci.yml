@@ -71,6 +71,9 @@ jobs:
       - name: Fuzz strict public artifact-envelope parsing
         working-directory: fuzz
         run: cargo fuzz run artifact-envelope-v1 -- -max_total_time=60
+      - name: Fuzz recipient and identity parsing
+        working-directory: fuzz
+        run: cargo fuzz run identity-v1 -- -max_total_time=60
   policy:
     runs-on: ubuntu-latest
     steps:
