@@ -23,7 +23,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const EXTERNAL_MIGRATION_MAX_PLAINTEXT_BYTES: u64 = 64 * 1024 * 1024;
 const EXTERNAL_MIGRATION_TIMEOUT: Duration = Duration::from_mins(2);
@@ -5116,7 +5116,9 @@ fn read_tty_prompt(prompt: &nix_seal_core::GeneratorPrompt) -> Result<SecretBox<
                 .position(|byte| *byte == b'\n')
                 .map_or(read, |position| position + 1);
             value.extend_from_slice(&buffer[..end]);
-            if value.len() > MAX_INTERACTIVE_PROMPT_BYTES || end != read {
+            let finished = value.len() > MAX_INTERACTIVE_PROMPT_BYTES || end != read;
+            buffer.zeroize();
+            if finished {
                 break;
             }
         }
