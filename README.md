@@ -196,6 +196,9 @@ nix-seal migrate secretctl --index /tmp/secretctl-index.json --json
 nix-seal migrate agenix --directory ./secrets --json
 # ragenix uses the same standard age ciphertext inventory format
 nix-seal migrate ragenix --directory ./secrets --json
+# inspect an evaluated agenix-rekey policy export without decrypting data
+nix eval --json .#agenixRekeyMigration > /tmp/agenix-rekey.json
+nix-seal migrate agenix-rekey --metadata /tmp/agenix-rekey.json --json
 # inspect structured SOPS JSON metadata without decrypting values or invoking SOPS
 nix-seal migrate sops-json --directory ./secrets --json
 # Convert one SOPS document using only an explicit SOPS binary and private age key file.
@@ -228,6 +231,29 @@ reports require an explicit nix-seal target/recipient mapping before import. Use
 source ciphertext directly into replacement recipients, verifies the new
 ciphertext with the named identity, and atomically creates or replaces the
 destination. It never writes plaintext to the repository or Nix store.
+
+For agenix-rekey, expose one public evaluated configuration with
+`nixSeal.lib.agenixRekeyMigrationExport`. The target must declare `id`, `kind`
+(`nixos`, `darwin`, or `home-manager`), `system`, `recipient`, and `storageMode`
+(`local` or `derivation`); `masterRecipients` contains only public master
+recipients. Each secret maps to a repository-relative string `rekeyFile` and may
+set `intermediary = true`. The inventory validates all of those public values,
+normalizes recipients, and preserves intermediary secrets as repository-only.
+It does not infer private runtime configuration or rewrite ciphertext.
+
+```nix
+nixSeal.lib.agenixRekeyMigrationExport {
+  target = {
+    id = "desktop";
+    kind = "nixos";
+    system = "x86_64-linux";
+    recipient = "ssh-ed25519 AAAA...";
+    storageMode = "derivation";
+  };
+  masterRecipients = [ "age1..." ];
+  secrets.service-token.rekeyFile = "secrets/service-token.age";
+}
+```
 
 To produce a separate, reviewable `plan.v1.json` bridge from a `secretctl`
 index, provide every legacy target's Nix system and at least one independent

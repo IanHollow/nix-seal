@@ -33,7 +33,9 @@ never reads values. Because the filesystem leaves do not authoritatively encode
 the storage backend, secrecy classification, target selection, or runtime
 policy, importing a value requires an explicit reviewed mapping.
 
-Adapters for agenix-rekey metadata and Clan Facts remain planned. Their
-format-specific policy mapping must be reviewed before any mutation path is
-added. Removal of a source manager is a separate explicit operation after build,
-activation, rollback, rotation, and recovery verification.
+The agenix-rekey adapter consumes an explicit public evaluated export instead of
+guessing policy from filenames. It checks the master-to-target boundary,
+canonical source paths, target platform, storage mode, recipients, and
+repository-only intermediaries. Clan Facts still requires format-specific policy
+mapping. Removal of a source manager is a separate explicit operation after
+build, activation, rollback, rotation, and recovery verification.
