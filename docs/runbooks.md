@@ -48,8 +48,8 @@ does not change the credential used by the service.
 
 4. For each canonical ciphertext whose recipients changed, keep at least one
    uncompromised administrator/recovery identity authorized long enough to
-   perform the conversion. Review the recipient-only canonical rekey first;
-   it changes encryption recipients without changing the application value:
+   perform the conversion. Review the recipient-only canonical rekey first; it
+   changes encryption recipients without changing the application value:
 
    ```console
    nix-seal secret rekey --plan plan.v1.json --secret <id> \

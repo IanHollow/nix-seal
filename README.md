@@ -132,8 +132,8 @@ committed. Editor execution uses no shell, inherits no environment, and runs in
 a private ephemeral workspace. `secret rekey` changes canonical encryption
 recipients without changing the application credential; `rotate` changes the
 application credential. `secret rekey` is dry-run by default and requires
-`--yes` for its atomic same-source replacement. The top-level `rekey` command
-is separate: it creates signed target artifacts in the ciphertext-only cache.
+`--yes` for its atomic same-source replacement. The top-level `rekey` command is
+separate: it creates signed target artifacts in the ciphertext-only cache.
 
 For the default `rekeyed` delivery, `nix-seal rekey` decrypts canonical
 ciphertext with `--identity` and produces a separately target-encrypted, signed
