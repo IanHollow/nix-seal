@@ -6,6 +6,7 @@
 }:
 let
   inherit (inputs.nixpkgs) lib;
+  nixSealLib = self.lib;
   digest = character: builtins.concatStringsSep "" (lib.replicate 64 character);
   ciphertext = pkgs.writeText "nix-seal-test-artifact.age" "public ciphertext fixture";
   envelope = pkgs.writeText "nix-seal-test-envelope.json" "public envelope fixture";
@@ -266,8 +267,30 @@ let
     lib.any (
       assertion: !assertion.assertion && assertion.message == message
     ) evaluated.config.assertions;
+  strictPlan = nixSealLib.mkPlan {
+    identities.admin = { };
+    secrets."db/password" = { };
+  };
+  strictPlanFile = pkgs.writeText "nix-seal-test-strict-plan-v1.json" strictPlan;
+  invalidCollectionId = builtins.tryEval (
+    builtins.deepSeq (nixSealLib.mkPlan { secrets."bad//id" = { }; }) true
+  );
 in
 {
+  lib-plan-builder =
+    assert !invalidCollectionId.success;
+    pkgs.runCommand "nix-seal-lib-plan-builder" { nativeBuildInputs = [ pkgs.jq ]; } ''
+      jq -e '
+        .schema == "nix-seal.plan.v1" and
+        (.identities | keys) == ["admin"] and
+        (.secrets | keys) == ["db/password"] and
+        ((keys | sort) == [
+          "approvalPolicies", "backends", "generators", "groups",
+          "identities", "schema", "secrets", "targets", "templates"
+        ])
+      ' ${strictPlanFile} >/dev/null
+      touch "$out"
+    '';
   module-nixos =
     checkDocument "nix-seal-module-nixos" "systemd-system" "root" "root"
       nixos.config.nixSeal.activationSpec

@@ -39,6 +39,37 @@ rather than silently running them at an unsafe point. Home Manager orders
 `users`, `activation`, and `services` in its activation DAG with separate
 `$XDG_RUNTIME_DIR/nix-seal` roots; it rejects installer-only `partitioning`.
 
+## Nix plan front-end
+
+The flake library exposes `nixSeal.lib.mkPlan` for public Nix metadata. It has a
+closed top-level argument set (`identities`, `groups`, `targets`, `secrets`,
+`generators`, `templates`, `approvalPolicies`, and `backends`), rejects unknown
+collections and invalid collection IDs during Nix evaluation, and emits the
+same `plan.v1.json` object consumed by the Rust policy validator:
+
+```nix
+let
+  plan = nixSeal.lib.mkPlan {
+    identities.admin = {
+      kind = "age";
+      public = "age1example...";
+    };
+    targets.desktop = {
+      kind = "nixos";
+      system = "x86_64-linux";
+      identity = "admin";
+    };
+  };
+in
+  pkgs.writeText "plan.v1.json" plan
+```
+
+Collection values remain public metadata; plaintext values, prompts, and
+private identities must never be placed in a Nix expression. Nested fields are
+validated with the versioned JSON schema and policy rules by `nix-seal check`.
+When a TOML plan is also supplied, the Rust merge is disjoint by collection and
+ID, so an overlap is a fatal error rather than a precedence decision.
+
 Start a repository with an empty, valid public plan; this does not generate keys
 or create secrets and refuses to overwrite an existing file:
 
