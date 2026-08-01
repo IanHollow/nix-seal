@@ -1291,6 +1291,39 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn concurrent_opens_and_writes_preserve_cache_state() -> Result<(), CacheError> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("cache");
+        Cache::open(&root)?;
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+        for worker in 0..4_usize {
+            let root = root.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || -> Result<(), CacheError> {
+                barrier.wait();
+                let cache = Cache::open(root)?;
+                for offset in 0..16_usize {
+                    let bytes = format!("worker-{worker}-object-{offset}").into_bytes();
+                    cache.put(&bytes)?;
+                    let address = state_machine_address(worker * 16 + offset)?;
+                    let ciphertext = format!("worker-{worker}-artifact-{offset}").into_bytes();
+                    cache.put_artifact(&address, ciphertext.as_slice(), b"envelope")?;
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle.join().map_err(|_| CacheError::UnsafeMetadata)??;
+        }
+        let cache = Cache::open(&root)?;
+        let inventory = cache.inventory()?;
+        assert_eq!(inventory.object_count, 64);
+        assert_eq!(inventory.artifact_count, 64);
+        Ok(())
+    }
+
     fn state_machine_address(step: usize) -> Result<ArtifactAddress, CacheError> {
         ArtifactAddress::new(
             format!("{:064x}", step + 1),

@@ -11,7 +11,9 @@ verification, and atomic rename. Temporary entries use an explicit private
 transaction prefix. Cache open takes the cache lock before removing only
 owner-validated abandoned transaction files, so an interrupted writer cannot
 poison inventory while unexpected names and links still fail closed. Cache
-export/import carries ciphertext and public signed metadata.
+open/write concurrency is lock-serialized and covered by an inventory
+consistency test. Cache export/import carries ciphertext and public signed
+metadata.
 
 The v1 implementation streams administrator plaintext directly from the age
 decryptor into target age encryption. It copies canonical ciphertext into a
