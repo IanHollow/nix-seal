@@ -769,7 +769,7 @@ fn checked_transfer_bytes(total: u64, additional: u64) -> Result<u64, CacheError
 fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), CacheError> {
     #[cfg(unix)]
     {
-        rename_noreplace_impl(source, destination, || {})
+        rename_noreplace_impl(source, destination, || Ok(()))
     }
     #[cfg(not(unix))]
     {
@@ -787,7 +787,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), CacheError>
 }
 
 #[cfg(unix)]
-fn rename_noreplace_impl<F: FnOnce()>(
+fn rename_noreplace_impl<F: FnOnce() -> Result<(), CacheError>>(
     source: &Path,
     destination: &Path,
     after_open: F,
@@ -800,7 +800,7 @@ fn rename_noreplace_impl<F: FnOnce()>(
     let destination_name = destination.file_name().ok_or(CacheError::UnsafeMetadata)?;
     let source_directory = open_directory_nofollow(source_parent)?;
     let destination_directory = open_directory_nofollow(destination_parent)?;
-    after_open();
+    after_open()?;
     renameat_with(
         &source_directory,
         source_name,
@@ -1496,8 +1496,9 @@ mod tests {
             // directory descriptors have already been opened, so the
             // descriptor-relative rename must still target the original
             // directory rather than following this replacement symlink.
-            std::fs::rename(&publish, &publish_real).expect("rename publish parent");
-            symlink(&outside, &publish).expect("replace publish parent with symlink");
+            std::fs::rename(&publish, &publish_real)?;
+            symlink(&outside, &publish)?;
+            Ok(())
         });
         assert!(result.is_ok());
         assert_eq!(
