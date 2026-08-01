@@ -141,8 +141,27 @@ pkgs.testers.nixosTest {
             mode: "0400",
             owner: "root",
             group: "root"
-          }]
+          }],
+          postSwitch: {
+            executable: "/run/current-system/sw/bin/systemctl",
+            manager: "systemd-system",
+            reloadUnits: [],
+            restartUnits: ["nix-seal-test.service"],
+            timeoutSeconds: 30
+          }
         }' > "$root/activation.json"
+
+      printf '%s\n' \
+        '[Unit]' \
+        'Description=nix-seal VM credential consumer' \
+        "" \
+        '[Service]' \
+        'Type=oneshot' \
+        'RemainAfterExit=yes' \
+        'LoadCredential=database-password:/run/nix-seal/current/app/token' \
+        "ExecStart=/bin/sh -c 'umask 077; cat \"\$CREDENTIALS_DIRECTORY/database-password\" > /run/nix-seal-service-observed'" \
+        > /etc/systemd/system/nix-seal-test.service
+      systemctl daemon-reload
 
       nix-seal activate --spec "$root/activation.json" --identity "$root/target.age"
 
@@ -150,6 +169,8 @@ pkgs.testers.nixosTest {
       test "$(stat -c %U:%G /run/nix-seal/current/app/token)" = root:root
       test "$(stat -c %a /run/nix-seal/current/templates/app/config)" = 400
       cut -d= -f2 /run/nix-seal/current/templates/app/config | base64 -d | cmp - /run/nix-seal/current/app/token
+      systemctl is-active --quiet nix-seal-test.service
+      cmp /run/nix-seal-service-observed /run/nix-seal/current/app/token
 
       # The random plaintext must not have escaped into the host-visible Nix
       # store. -f reads the candidate from the activated private file rather
@@ -170,6 +191,7 @@ pkgs.testers.nixosTest {
       printf x >> "$artifact_dir/ciphertext.age"
       ! nix-seal activate --spec "$root/activation.json" --identity "$root/target.age"
       cut -d= -f2 /run/nix-seal/current/templates/app/config | base64 -d | cmp - /run/nix-seal/current/app/token
+      cmp /run/nix-seal-service-observed /run/nix-seal/current/app/token
     """)
   '';
 }

@@ -16,7 +16,8 @@
   cache-operation recovery is now lock-protected and link-safe; concurrent cache
   open/write coverage now verifies serialized recovery and inventory
   consistency; cache roots and export parents are canonicalized before writes;
-  adversarial race injection remains required.
+  adversarial race injection remains required. The Linux NixOS VM now exercises
+  a real systemd credential consumer and post-switch restart after activation.
 - Phase 3: authoring and lifecycle commands, identity/value rotation,
   generators, prompts, templates, and provisioning phases.
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
