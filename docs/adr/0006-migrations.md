@@ -18,7 +18,11 @@ and rollback verification. The `secretctl` adapter validates group membership,
 target recipient expansion, and every secret's direct recipient set against its
 declared consumers before it emits a mapping report. With explicit target-system
 and approval-signer mappings it may also write a separate valid direct-delivery
-candidate plan; it never mutates the legacy configuration or ciphertext.
+candidate plan; it never mutates the legacy configuration or ciphertext. With an
+explicit repository-relative destination, private identity, and replacement
+recipient set, `--execute` additionally performs a side-by-side bulk rekey of
+the validated `secrets/*.age` sources. It streams and round-trip verifies every
+file in one transaction and leaves the legacy tree untouched.
 
 SOPS JSON inspection is similarly non-destructive: it validates bounded
 cleartext metadata (including provider and age-recipient declarations) without

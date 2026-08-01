@@ -793,23 +793,44 @@ struct ClanFactsMigrationArgs {
     execute: bool,
 }
 
+#[derive(Args)]
+struct SecretctlMigrationArgs {
+    /// `nix eval --json .#secretIndex` output saved to a public JSON file.
+    #[arg(long)]
+    index: PathBuf,
+    /// Write a new canonical public `plan.v1.json` candidate; refuses to overwrite.
+    #[arg(long)]
+    plan_output: Option<PathBuf>,
+    /// Required target-system mapping for a candidate plan as `LEGACY_TARGET=SYSTEM`.
+    #[arg(long = "target-system", value_name = "LEGACY_TARGET=SYSTEM")]
+    target_systems: Vec<String>,
+    /// Trusted approval signer for a candidate plan as `ID=PUBLIC_KEY`; repeat as needed.
+    #[arg(long = "signer", value_name = "ID=PUBLIC_KEY")]
+    signers: Vec<String>,
+    /// Repository root containing the legacy secretctl ciphertexts and destination tree.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Repository-relative destination tree for a side-by-side import.
+    #[arg(long)]
+    destination: Option<PathBuf>,
+    /// Private identity authorized to decrypt every legacy ciphertext.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Explicit replacement recipient; repeat for each recipient.
+    #[arg(long = "recipient")]
+    recipients: Vec<String>,
+    /// Replace existing destination ciphertexts; omission is create-only.
+    #[arg(long)]
+    replace: bool,
+    /// Commit the complete preflighted import. Without this flag no ciphertext is opened.
+    #[arg(long)]
+    execute: bool,
+}
+
 #[derive(Subcommand)]
 enum MigrateCommand {
-    /// Inspect a public secretctl `secretIndex` JSON export and optionally write a new candidate plan.
-    Secretctl {
-        /// `nix eval --json .#secretIndex` output saved to a public JSON file.
-        #[arg(long)]
-        index: PathBuf,
-        /// Write a new canonical public `plan.v1.json` candidate; refuses to overwrite.
-        #[arg(long)]
-        plan_output: Option<PathBuf>,
-        /// Required target-system mapping for a candidate plan as `LEGACY_TARGET=SYSTEM`.
-        #[arg(long = "target-system", value_name = "LEGACY_TARGET=SYSTEM")]
-        target_systems: Vec<String>,
-        /// Trusted approval signer for a candidate plan as `ID=PUBLIC_KEY`; repeat as needed.
-        #[arg(long = "signer", value_name = "ID=PUBLIC_KEY")]
-        signers: Vec<String>,
-    },
+    /// Inspect or bulk-import a public secretctl `secretIndex` JSON export.
+    Secretctl(SecretctlMigrationArgs),
     /// Inspect or bulk-rekey an agenix ciphertext tree. The legacy tree is
     /// never modified; import writes a side-by-side destination tree.
     Agenix(AgeTreeMigrationArgs),
@@ -1571,18 +1592,7 @@ struct ValidatedSecretctlSecrets {
 
 fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
     match command {
-        MigrateCommand::Secretctl {
-            index,
-            plan_output,
-            target_systems,
-            signers,
-        } => migrate_secretctl(
-            &index,
-            plan_output.as_deref(),
-            &target_systems,
-            &signers,
-            json,
-        ),
+        MigrateCommand::Secretctl(arguments) => migrate_secretctl(&arguments, json),
         MigrateCommand::Agenix(arguments) => migrate_agenix_tree(&arguments, "agenix", json),
         MigrateCommand::Ragenix(arguments) => migrate_agenix_tree(&arguments, "ragenix", json),
         MigrateCommand::AgenixRekey(arguments) => migrate_agenix_rekey_export(&arguments, json),
@@ -3323,29 +3333,101 @@ fn migrate_clan_facts_tree(arguments: &ClanFactsMigrationArgs, json: bool) -> Re
     Ok(())
 }
 
-fn migrate_secretctl(
-    index_path: &Path,
-    plan_output: Option<&Path>,
-    target_systems: &[String],
-    signers: &[String],
-    json: bool,
-) -> Result<()> {
+#[allow(clippy::too_many_lines)]
+fn migrate_secretctl(arguments: &SecretctlMigrationArgs, json: bool) -> Result<()> {
     let index: SecretctlIndexV1 =
-        read_json_bounded(index_path).context("invalid strict secretctl secretIndex JSON")?;
+        read_json_bounded(&arguments.index).context("invalid strict secretctl secretIndex JSON")?;
     let report = build_secretctl_migration_report(&index)?;
-    let candidate_plan = if let Some(output) = plan_output {
-        let plan = build_secretctl_candidate_plan(&index, target_systems, signers)?;
+    let candidate_plan = if let Some(output) = arguments.plan_output.as_deref() {
+        let plan =
+            build_secretctl_candidate_plan(&index, &arguments.target_systems, &arguments.signers)?;
         let canonical = nix_seal_policy::canonical_json(&plan)?;
         emit_canonical_public_json(Some(output), &canonical)?;
         Some(output)
     } else {
-        if !target_systems.is_empty() || !signers.is_empty() {
+        if !arguments.target_systems.is_empty() || !arguments.signers.is_empty() {
             bail!("--target-system and --signer require --plan-output");
         }
         None
     };
+    let import_requested = arguments.destination.is_some()
+        || arguments.identity.is_some()
+        || !arguments.recipients.is_empty()
+        || arguments.replace
+        || arguments.execute;
+    let (repository_root, replacement_recipients, entries) = if import_requested {
+        let repository_root = resolve_migration_repository_root(&arguments.repository_root)?;
+        let destination = arguments
+            .destination
+            .as_deref()
+            .context("bulk secretctl migration requires --destination")?;
+        validate_migration_relative_path(destination, "destination")?;
+        let identity = arguments
+            .identity
+            .as_deref()
+            .context("bulk secretctl migration requires --identity")?;
+        if !identity.is_absolute() {
+            bail!("bulk secretctl migration identity must be an absolute private path");
+        }
+        let replacement_recipients = normalize_migration_recipients(&arguments.recipients)?;
+        let destination_root = repository_root.join(destination);
+        let mut entries = Vec::with_capacity(index.secrets.len());
+        for secret in index.secrets.values() {
+            let relative_source = PathBuf::from(migrate_secretctl_source(&secret.file)?);
+            let source = resolve_migration_regular_file(&repository_root, &relative_source)?;
+            if destination_root.starts_with(&source) || source.starts_with(&destination_root) {
+                bail!("bulk secretctl destination must be side-by-side with the legacy tree");
+            }
+            entries.push((relative_source.clone(), destination.join(relative_source)));
+        }
+        (repository_root, replacement_recipients, entries)
+    } else {
+        (PathBuf::new(), Vec::new(), Vec::new())
+    };
+    let mut mappings = report.secrets;
+    if import_requested {
+        for (mapping, (_, destination)) in mappings.iter_mut().zip(&entries) {
+            mapping["destination"] = serde_json::json!(destination);
+        }
+    }
+    if import_requested && arguments.execute {
+        let identity = read_identity(
+            arguments
+                .identity
+                .as_deref()
+                .context("bulk secretctl migration identity was not initialized")?,
+        )?;
+        let writes = entries
+            .iter()
+            .map(
+                |(relative_source, relative_destination)| nix_seal_authoring::BatchRekeyWrite {
+                    relative_source,
+                    relative_destination,
+                    recipients: &replacement_recipients,
+                },
+            )
+            .collect::<Vec<_>>();
+        let results = nix_seal_authoring::rekey_secret_batch(
+            &repository_root,
+            &writes,
+            &identity,
+            if arguments.replace {
+                nix_seal_authoring::WriteMode::Replace
+            } else {
+                nix_seal_authoring::WriteMode::Create
+            },
+        )?;
+        for (mapping, result) in mappings.iter_mut().zip(results) {
+            mapping["ciphertextHash"] = serde_json::json!(result.ciphertext_hash);
+            mapping["plaintextBytes"] = serde_json::json!(result.plaintext_bytes);
+        }
+    }
     let mut warnings = vec![
-        "dry run only: no ciphertext, configuration, or source manager was changed".to_owned(),
+        if import_requested && arguments.execute {
+            "side-by-side migration committed only after every source was staged and round-trip verified".to_owned()
+        } else {
+            "dry run only: no ciphertext, configuration, or source manager was changed".to_owned()
+        },
         "secretctl uses SSH recipients; native age is preferred, while unencrypted OpenSSH identities are available only for reviewed migration compatibility".to_owned(),
         "the reported legacy group memberships and direct-recipient sets were cross-checked; review normalized IDs and scope selectors before generating a nix-seal plan".to_owned(),
     ];
@@ -3354,26 +3436,37 @@ fn migrate_secretctl(
             "candidate plans retain legacy direct delivery and use default root-only runtime settings; review runtime ownership, phases, templates, lifecycle metadata, and a rekeyed administrator/recovery policy before activation".to_owned(),
         );
     }
+    if import_requested {
+        warnings.push(
+            "legacy secretctl ciphertexts remain untouched for side-by-side rollback; runtime, lifecycle, templates, and approval mappings still require review".to_owned(),
+        );
+    }
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "schema":"nix-seal.migration-report.v1",
                 "source":"secretctl",
-                "dryRun":true,
+                "dryRun":!import_requested || !arguments.execute,
                 "groups":report.groups,
-                "secrets":report.secrets,
+                "secrets":mappings,
                 "targets":report.targets,
                 "sshRecipientCount":report.ssh_recipient_count,
+                "recipientPolicy":if import_requested { serde_json::json!({"recipients":&replacement_recipients}) } else { serde_json::Value::Null },
                 "candidatePlan":candidate_plan,
                 "warnings":warnings
             })
         );
     } else {
         println!(
-            "secretctl dry-run: {} groups, {} secrets, and {} targets mapped; {} SSH recipients require a reviewed migration path",
+            "secretctl {}: {} groups, {} secrets, and {} targets mapped; {} SSH recipients require a reviewed migration path",
+            if import_requested && arguments.execute {
+                "migration"
+            } else {
+                "dry-run"
+            },
             report.groups.len(),
-            report.secrets.len(),
+            mappings.len(),
             report.targets.len(),
             report.ssh_recipient_count,
         );
@@ -3386,7 +3479,13 @@ fn migrate_secretctl(
                 path.display()
             );
         }
-        for mapping in report.secrets {
+        if import_requested {
+            eprintln!(
+                "replacement recipient policy: {} recipient(s)",
+                replacement_recipients.len()
+            );
+        }
+        for mapping in mappings {
             println!(
                 "{} -> {} ({})",
                 mapping["legacyId"].as_str().unwrap_or("unknown"),
@@ -9120,6 +9219,83 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             .ok_or("target")?
             .recipients = vec![first];
         assert!(build_secretctl_migration_report(&index).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn secretctl_migration_bulk_rekeys_side_by_side_after_dry_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let private = "-----BEGIN_OPENSSH_PRIVATE_KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+QyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYgAAAJgAIAxdACAM\n\
+XQAAAAtzc2gtZWQyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYg\n\
+AAAEC2BsIi0QwW2uFscKTUUXNHLsYX4FxlaSDSblbAj7WR7bM+rvN+ot98qgEN796jTiQf\n\
+ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
+-----END_OPENSSH_PRIVATE_KEY-----\n";
+        let private = private.replace('_', " ");
+        let recipient =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        let source = repository.join("secrets/operators/token.age");
+        fs::create_dir_all(source.parent().ok_or("source parent")?)?;
+        let mut ciphertext = fs::File::create(&source)?;
+        nix_seal_crypto::encrypt(
+            b"secretctl-canary".as_slice(),
+            &mut ciphertext,
+            &[recipient.to_owned()],
+        )?;
+        ciphertext.sync_all()?;
+        let identity_path = temporary.path().join("identity");
+        write_private_bytes(&identity_path, private.as_bytes())?;
+        let index_path = temporary.path().join("secretIndex.json");
+        fs::write(
+            &index_path,
+            serde_json::json!({
+                "version":1,
+                "groups":{"operators":[recipient]},
+                "targets":{"host:nixos:desktop":{
+                    "type":"host",
+                    "groups":["operators"],
+                    "publicKey":recipient,
+                    "recipients":[recipient]
+                }},
+                "secrets":{"operators.token":{
+                    "id":"operators.token",
+                    "group":"operators",
+                    "scope":"host",
+                    "selector":null,
+                    "agenixName":"token",
+                    "file":"secrets/operators/token.age",
+                    "recipients":[recipient],
+                    "consumers":["host:nixos:desktop"]
+                }}
+            })
+            .to_string(),
+        )?;
+        let common = || SecretctlMigrationArgs {
+            index: index_path.clone(),
+            plan_output: None,
+            target_systems: Vec::new(),
+            signers: Vec::new(),
+            repository_root: repository.clone(),
+            destination: Some(PathBuf::from("migrated")),
+            identity: Some(identity_path.clone()),
+            recipients: vec![recipient.to_owned()],
+            replace: false,
+            execute: false,
+        };
+        migrate_secretctl(&common(), true)?;
+        let destination = repository.join("migrated/secrets/operators/token.age");
+        assert!(!destination.exists());
+        let mut execute = common();
+        execute.execute = true;
+        migrate_secretctl(&execute, true)?;
+        let identity = SecretString::from(private);
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(fs::File::open(destination)?, &mut plaintext, &identity)?;
+        assert_eq!(plaintext, b"secretctl-canary");
+        assert!(source.is_file());
         Ok(())
     }
 

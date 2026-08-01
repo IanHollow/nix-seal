@@ -516,6 +516,11 @@ the existing index and inspect the stable mapping before touching ciphertext:
 ```console
 nix eval --json .#secretIndex > /tmp/secretctl-index.json
 nix-seal migrate secretctl --index /tmp/secretctl-index.json --json
+# after review, rekey legacy files into a side-by-side native age tree
+nix-seal migrate secretctl --index /tmp/secretctl-index.json \
+  --repository-root . --destination secrets/nix-seal \
+  --identity /absolute/private/legacy.agekey \
+  --recipient age1admin... --recipient age1recovery... --execute
 nix-seal migrate agenix --directory ./secrets --json
 # ragenix uses the same standard age ciphertext inventory format
 nix-seal migrate ragenix --directory ./secrets --json
@@ -557,12 +562,15 @@ nix-seal migrate ciphertext --source legacy/token.age --destination secrets/toke
 It validates legacy paths, scopes, consumers, IDs, groups, and SSH recipient
 metadata. For `secretctl`, it additionally cross-checks every target recipient
 set against its declared group membership and every secret recipient set against
-its consumer targets before reporting normalized nix-seal IDs. It never decrypts
-or rewrites legacy files. New plans should use native age recipients. Existing
-unencrypted OpenSSH Ed25519/RSA identities are supported only as a migration
-compatibility path; encrypted SSH private keys are deliberately rejected in
-non-interactive workflows, so convert them to a reviewed native-age or
-hardware-backed identity before automated import.
+its consumer targets before reporting normalized nix-seal IDs. An explicit
+repository-relative destination, private identity, and replacement recipients
+enable a side-by-side bulk rekey; `--execute` is required before ciphertext is
+opened, and the source tree remains untouched. Without those import flags it
+never decrypts or rewrites legacy files. New plans should use native age
+recipients. Existing unencrypted OpenSSH Ed25519/RSA identities are supported
+only as a migration compatibility path; encrypted SSH private keys are
+deliberately rejected in non-interactive workflows, so convert them to a
+reviewed native-age or hardware-backed identity before automated import.
 
 PGP is migration-only and never a native nix-seal encryption backend. Its
 dry-run-first bridge requires an absolute GnuPG executable and private,
