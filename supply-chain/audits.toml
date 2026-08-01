@@ -2,3 +2,9 @@
 # cargo-vet audits file
 
 [audits]
+
+[[audits.spin]]
+delta = "0.9.8 -> 0.9.9"
+who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+notes = "Reviewed the 0.9.8 to 0.9.9 delta: the only production code change fixes Once ownership with ManuallyDrop and assume_init_read, avoiding a double-drop. No new unsafe blocks, capabilities, dependencies, build script, or network/filesystem behavior."
