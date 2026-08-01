@@ -6,3 +6,39 @@ who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
 criteria = "safe-to-deploy"
 delta = "0.9.8 -> 0.9.9"
 notes = "Reviewed the 0.9.8 to 0.9.9 delta: the only production code change fixes Once ownership with ManuallyDrop and assume_init_read, avoiding a double-drop. No new unsafe blocks, capabilities, dependencies, build script, or network/filesystem behavior."
+
+[[audits.ed25519]]
+who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.2.3"
+notes = "Reviewed the pinned RustCrypto signature-trait crate and enabled source: it forbids unsafe code, has no build script or I/O capability, and provides only Ed25519 signature/key encoding and trait definitions."
+
+[[audits.ed25519-dalek]]
+who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "2.2.0"
+notes = "Reviewed the pinned pure-Rust signing backend and its enabled feature surface through ssh-key: no build script, no network/process/filesystem capability, and unsafe code is forbidden outside tests. This records supply-chain deployment review, not a replacement for the upstream cryptographic audit."
+
+[[audits.pem-rfc7468]]
+who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.7.0"
+notes = "Reviewed the PEM codec used only for SSHSIG/key parsing. It denies unsafe code except one UTF-8 conversion after its ASCII-only Base64 encoder; it has no build script or I/O capability."
+
+[[audits.ssh-cipher]]
+who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0"
+notes = "Reviewed the RustCrypto SSH cipher framing crate at the enabled dependency surface: it forbids unsafe code, has no build script or I/O capability, and operates only on caller-provided buffers."
+
+[[audits.ssh-encoding]]
+who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.2.0"
+notes = "Reviewed the RustCrypto RFC4251 encoding crate with alloc, PEM, Base64, and SHA-2 support only. It forbids unsafe code, has no build script or I/O capability, and parses caller-provided bytes."
+
+[[audits.ssh-key]]
+who = "Ian Holloway <72767437+IanHollow@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+version = "0.6.7"
+notes = "Reviewed the pinned RustCrypto SSHSIG/key crate and the enabled alloc+ed25519 features: it forbids unsafe code, has no build script, and does not enable filesystem, process, network, RSA, ECDSA, encryption, or hardware-key support."
