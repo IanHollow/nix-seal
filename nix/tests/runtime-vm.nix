@@ -156,11 +156,12 @@ pkgs.testers.nixosTest {
       # than exposing it through argv or an environment variable.
       # Nix store paths may contain dangling symlinks after GC. Restrict the
       # scan to regular files rather than treating an unreadable dangling target
-      # as a plaintext-leak failure. `find` prints at most one matching path;
-      # the canary itself stays in the private `-f` file rather than argv.
+      # as a plaintext-leak failure. `find` batches its regular-file arguments
+      # for grep, which emits only matching public paths; the canary itself
+      # stays in the private `-f` file rather than argv.
       if find /nix/store -type f \
-        -exec grep -q --binary-files=without-match -F -f /run/nix-seal/current/app/token {} \; \
-        -print -quit 2>/dev/null | grep -q .; then
+        -exec grep -l --binary-files=without-match -F -f /run/nix-seal/current/app/token {} + \
+        2>/dev/null | grep -q .; then
         exit 1
       fi
 
