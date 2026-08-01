@@ -54,7 +54,11 @@ fn plan_directed_create_rotate_and_reveal() -> Result<(), Box<dyn std::error::Er
             path_text(root)?,
         ],
     )?;
-    assert!(checked.status.success());
+    assert!(
+        checked.status.success(),
+        "deep check failed: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
 
     let revealed = run(root, &reveal_args(plan_path, root, identity_path)?)?;
     assert!(revealed.status.success());

@@ -3,11 +3,11 @@
 
 use age::{Decryptor, Encryptor, Identity, Recipient, secrecy::ExposeSecret};
 use secrecy::{ExposeSecretMut, SecretBox};
-use std::io::{BufReader, Cursor, Read, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use thiserror::Error;
 
 const MAX_SECRET_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_CIPHERTEXT_BYTES: u64 = 70 * 1024 * 1024;
+const MAX_AGE_HEADER_BYTES: usize = 1024 * 1024;
 
 /// A redacted cryptographic error.
 #[derive(Debug, Error)]
@@ -190,8 +190,97 @@ fn decrypt_with_identity<R: Read, W: Write>(
 
 /// Parses and bounds a standard age ciphertext header without decrypting plaintext.
 pub fn validate_ciphertext_header<R: Read>(input: R) -> Result<(), CryptoError> {
-    Decryptor::new(input.take(MAX_CIPHERTEXT_BYTES + 1)).map_err(|_| CryptoError::Decrypt)?;
+    let mut reader = BufReader::new(input);
+    let header = read_age_header(&mut reader)?;
+    validate_age_header_structure(&header)?;
+    Decryptor::new(Cursor::new(header).chain(reader)).map_err(|_| CryptoError::Decrypt)?;
     Ok(())
+}
+
+fn read_age_header<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, CryptoError> {
+    let mut header = Vec::new();
+    loop {
+        let line_start = header.len();
+        loop {
+            let available = reader.fill_buf().map_err(|_| CryptoError::Io)?;
+            if available.is_empty() || header.len() == MAX_AGE_HEADER_BYTES {
+                return Err(CryptoError::Decrypt);
+            }
+            let capacity = MAX_AGE_HEADER_BYTES
+                .checked_sub(header.len())
+                .ok_or(CryptoError::InputTooLarge)?;
+            let readable = available.len().min(capacity);
+            let consumed = available[..readable]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(readable, |index| index + 1);
+            let completed_line = consumed <= readable && available[consumed - 1] == b'\n';
+            header.extend_from_slice(&available[..consumed]);
+            reader.consume(consumed);
+            if completed_line {
+                break;
+            }
+        }
+        if header[line_start..].starts_with(b"--- ") {
+            return Ok(header);
+        }
+    }
+}
+
+fn validate_age_header_structure(ciphertext: &[u8]) -> Result<(), CryptoError> {
+    let mut lines = ciphertext.split_inclusive(|byte| *byte == b'\n');
+    if lines.next() != Some(b"age-encryption.org/v1\n".as_slice()) {
+        return Err(CryptoError::Decrypt);
+    }
+
+    let mut stanza_count = 0_u16;
+    let mut expects_body = false;
+    let mut long_body_stanza = false;
+    let mut grease_stanza = false;
+    for raw_line in lines {
+        let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
+        if expects_body
+            && !(grease_stanza && (line.starts_with(b"-> ") || line.starts_with(b"--- ")))
+        {
+            if line.is_empty()
+                || line.starts_with(b"->")
+                || line.starts_with(b"---")
+                || (!long_body_stanza && line.len() >= 64)
+            {
+                return Err(CryptoError::Decrypt);
+            }
+            if !grease_stanza {
+                expects_body = false;
+            }
+            continue;
+        }
+        if let Some(stanza) = line.strip_prefix(b"-> ") {
+            let fields = stanza.split(|byte| *byte == b' ').collect::<Vec<_>>();
+            let valid_fields = match fields.first().copied() {
+                Some(b"X25519") => fields.len() == 2,
+                Some(b"ssh-ed25519") => fields.len() == 3,
+                Some(tag) if tag.ends_with(b"-grease") => true,
+                Some(_) => fields.len() >= 2,
+                None => false,
+            };
+            if !valid_fields || fields.iter().any(|value| value.is_empty()) {
+                return Err(CryptoError::Decrypt);
+            }
+            stanza_count = stanza_count
+                .checked_add(1)
+                .ok_or(CryptoError::InputTooLarge)?;
+            long_body_stanza = fields.first() == Some(&b"ssh-rsa".as_slice())
+                || fields.first().is_some_and(|tag| tag.ends_with(b"-grease"));
+            grease_stanza = fields.first().is_some_and(|tag| tag.ends_with(b"-grease"));
+            expects_body = true;
+            continue;
+        }
+        if line.starts_with(b"--- ") && stanza_count > 0 {
+            return Ok(());
+        }
+        return Err(CryptoError::Decrypt);
+    }
+    Err(CryptoError::Decrypt)
 }
 
 /// Streams a canonical age payload directly into new target encryption.
@@ -241,12 +330,16 @@ pub fn rekey<R: Read, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest as _, Sha256};
     use std::{
+        collections::BTreeMap,
         os::unix::fs::PermissionsExt,
+        path::PathBuf,
         process::{Command, Stdio},
     };
 
     const SSH_ED25519_RECIPIENT: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHsKLqeplhpW+uObz5dvMgjz1OxfM/XXUB+VHtZ6isGN alice@rust";
+    const SUPPORTED_CCTV_VECTOR_COUNT: u16 = 48;
     const SSH_ED25519_IDENTITY_ARMOR: &str = "-----BEGIN_OPENSSH_PRIVATE_KEY-----\n\
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
 QyNTUxOQAAACB7Ci6nqZYaVvrjm8+XbzII89TsXzP111AflR7WeorBjQAAAJCfEwtqnxML\n\
@@ -394,5 +487,206 @@ AAAEADBJvjZT8X6JRJI8xVq/1aU8nMVgOtVnmdwqWwrSlXG3sKLqeplhpW+uObz5dvMgjz\n\
             return Err(format!("interoperability command failed: {binary}").into());
         }
         Ok(output.stdout)
+    }
+
+    #[test]
+    fn cctv_age_vectors_cover_supported_x25519_and_parser_cases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let required = std::env::var_os("NIX_SEAL_REQUIRE_CCTV").is_some();
+        let Some(directory) = cctv_age_testdata_directory(required)? else {
+            return Ok(());
+        };
+        let mut paths = std::fs::read_dir(directory)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.sort();
+
+        let mut executed = 0_u16;
+        for path in paths {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.file_type().is_file() {
+                return Err("CCTV age testdata contains a non-regular entry".into());
+            }
+            let bytes = std::fs::read(&path)?;
+            let (metadata, ciphertext) = parse_cctv_vector(&bytes)?;
+            if metadata.compressed
+                || metadata.armored
+                || metadata.has_unsupported_identity()
+                || metadata.has_passphrase
+            {
+                continue;
+            }
+            match metadata.expect.as_str() {
+                "header failure" => {
+                    let validation = validate_ciphertext_header(ciphertext);
+                    if let Some(identity) = metadata.native_x25519_identity() {
+                        let decrypt_result = decrypt(
+                            ciphertext,
+                            std::io::sink(),
+                            &secrecy::SecretString::from(identity.to_owned()),
+                        );
+                        assert!(
+                            validation.is_err() || decrypt_result.is_err(),
+                            "accepted official invalid age header: {}",
+                            path.display()
+                        );
+                    } else {
+                        assert!(
+                            validation.is_err(),
+                            "accepted official invalid age header: {}",
+                            path.display()
+                        );
+                    }
+                    executed = executed
+                        .checked_add(1)
+                        .ok_or("CCTV vector count overflow")?;
+                }
+                "no match" => {
+                    assert!(
+                        validate_ciphertext_header(ciphertext).is_ok(),
+                        "rejected official no-match age header: {}",
+                        path.display()
+                    );
+                    if let Some(identity) = metadata.native_x25519_identity() {
+                        let mut plaintext = Vec::new();
+                        assert!(
+                            decrypt(
+                                ciphertext,
+                                &mut plaintext,
+                                &secrecy::SecretString::from(identity.to_owned()),
+                            )
+                            .is_err()
+                        );
+                    }
+                    executed = executed
+                        .checked_add(1)
+                        .ok_or("CCTV vector count overflow")?;
+                }
+                "HMAC failure" | "payload failure" | "success" => {
+                    let Some(identity) = metadata.native_x25519_identity() else {
+                        continue;
+                    };
+                    let mut plaintext = Vec::new();
+                    let result = decrypt(
+                        ciphertext,
+                        &mut plaintext,
+                        &secrecy::SecretString::from(identity.to_owned()),
+                    );
+                    if metadata.expect == "success" {
+                        result?;
+                        assert_cctv_payload(&metadata, &plaintext)?;
+                    } else {
+                        assert!(result.is_err());
+                        if metadata.expect == "payload failure" {
+                            assert_cctv_payload(&metadata, &plaintext)?;
+                        }
+                    }
+                    executed = executed
+                        .checked_add(1)
+                        .ok_or("CCTV vector count overflow")?;
+                }
+                _ => return Err("CCTV age vector has an unsupported expectation".into()),
+            }
+        }
+        assert_eq!(executed, SUPPORTED_CCTV_VECTOR_COUNT);
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct CctvVector {
+        expect: String,
+        payload_sha256: Option<String>,
+        identities: Vec<String>,
+        compressed: bool,
+        armored: bool,
+        has_passphrase: bool,
+    }
+
+    impl CctvVector {
+        fn native_x25519_identity(&self) -> Option<&str> {
+            self.identities
+                .iter()
+                .map(String::as_str)
+                .find(|identity| identity.starts_with("AGE-SECRET-KEY-1"))
+        }
+
+        fn has_unsupported_identity(&self) -> bool {
+            self.identities
+                .iter()
+                .any(|identity| identity.starts_with("AGE-SECRET-KEY-PQ-1"))
+        }
+    }
+
+    fn cctv_age_testdata_directory(
+        required: bool,
+    ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+        let Some(path) = std::env::var_os("NIX_SEAL_CCTV_AGE_TESTDATA") else {
+            if required {
+                return Err("required CCTV age testdata path is absent".into());
+            }
+            return Ok(None);
+        };
+        let path = PathBuf::from(path);
+        if !path.is_absolute() || !path.is_dir() {
+            return Err("CCTV age testdata path is unsafe or absent".into());
+        }
+        Ok(Some(path))
+    }
+
+    fn parse_cctv_vector(bytes: &[u8]) -> Result<(CctvVector, &[u8]), Box<dyn std::error::Error>> {
+        let separator = bytes
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .ok_or("CCTV age vector has no metadata separator")?;
+        let header = std::str::from_utf8(&bytes[..separator])?;
+        let mut entries = BTreeMap::new();
+        let mut identities = Vec::new();
+        for line in header.lines() {
+            let (key, value) = line
+                .split_once(": ")
+                .ok_or("CCTV age vector metadata is malformed")?;
+            if key == "identity" {
+                identities.push(value.to_owned());
+            } else if matches!(key, "expect" | "payload" | "compressed" | "armored")
+                && entries.insert(key, value).is_some()
+            {
+                return Err("CCTV age vector repeats singleton metadata".into());
+            }
+        }
+        let expect = entries
+            .remove("expect")
+            .ok_or("CCTV age vector omits expectation")?
+            .to_owned();
+        let payload_sha256 = entries.remove("payload").map(str::to_owned);
+        let compressed = entries
+            .remove("compressed")
+            .is_some_and(|value| value == "zlib");
+        let armored = entries
+            .remove("armored")
+            .is_some_and(|value| value == "yes");
+        let has_passphrase = header.lines().any(|line| line.starts_with("passphrase: "));
+        Ok((
+            CctvVector {
+                expect,
+                payload_sha256,
+                identities,
+                compressed,
+                armored,
+                has_passphrase,
+            },
+            &bytes[separator + 2..],
+        ))
+    }
+
+    fn assert_cctv_payload(
+        metadata: &CctvVector,
+        plaintext: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let expected = metadata
+            .payload_sha256
+            .as_deref()
+            .ok_or("CCTV age vector omits payload hash")?;
+        assert_eq!(format!("{:x}", Sha256::digest(plaintext)), expected);
+        Ok(())
     }
 }

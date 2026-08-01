@@ -1,5 +1,21 @@
 {
   "nodes": {
+    "cctv": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1780686846,
+        "narHash": "sha256-kHXnsDrh3GeQRbE87uAxPw/G28IyZY5NL5sxevprYQo=",
+        "owner": "C2SP",
+        "repo": "CCTV",
+        "rev": "1e3d2860d46e94e777e1b17c7a6f2436387e3ecc",
+        "type": "github"
+      },
+      "original": {
+        "owner": "C2SP",
+        "repo": "CCTV",
+        "type": "github"
+      }
+    },
     "flake-parts": {
       "inputs": {
         "nixpkgs-lib": "nixpkgs-lib"
@@ -91,6 +107,7 @@
     },
     "root": {
       "inputs": {
+        "cctv": "cctv",
         "flake-parts": "flake-parts",
         "home-manager": "home-manager",
         "nix-darwin": "nix-darwin",

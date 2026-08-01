@@ -17,4 +17,13 @@ configuration must prefer native age or reviewed hardware-backed age plugins.
 The Nix package check requires bidirectional X25519 round trips with the
 reference `age` executable and `rage`. These command-line tools are test-only
 inputs and never shipped or invoked by the nix-seal runtime. This differential
-check complements, but does not replace, the planned official age-vector suite.
+check complements the pinned C2SP/CCTV vector suite. The test harness runs all
+supported unarmored, uncompressed X25519 and parser cases, including expected
+rejection and partial-payload behavior. It skips passphrase, armor, and hybrid
+recipient vectors only until their corresponding native adapter capabilities are
+implemented.
+
+The adapter additionally performs a bounded structural preflight before passing
+the ciphertext to `age`. This keeps malformed recipient-stanza cases rejected
+even where the pinned pre-1.0 adapter defers validation until identity
+resolution, while preserving standard SSH and GREASE stanza behavior.

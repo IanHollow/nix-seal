@@ -5,6 +5,10 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     systems.url = "github:nix-systems/default";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    cctv = {
+      url = "github:C2SP/CCTV";
+      flake = false;
+    };
     home-manager = {
       url = "github:nix-community/home-manager";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -41,6 +45,8 @@
           ];
           preCheck = ''
             export NIX_SEAL_REQUIRE_INTEROP=1
+            export NIX_SEAL_REQUIRE_CCTV=1
+            export NIX_SEAL_CCTV_AGE_TESTDATA=${inputs.cctv}/age/testdata
           '';
           cargoBuildFlags = [
             "--package"

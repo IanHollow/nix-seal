@@ -157,6 +157,13 @@ reference `age` executable and `rage`, in both encryption directions. They are
 test-only dependencies; the shipped runtime remains Rust and uses its isolated
 age adapter.
 
+It also pins C2SP/CCTV's age corpus in `flake.lock` and runs every supported
+unarmored, uncompressed X25519 and parser vector, including expected rejection
+and partial-payload cases. Unsupported passphrase, armor, and hybrid-recipient
+vectors remain explicitly skipped until their corresponding native adapter
+capabilities are implemented. A bounded structural preflight rejects malformed
+recipient stanzas before delegation to the pinned pre-1.0 age adapter.
+
 ## Installed documentation
 
 The flake's `packages.<system>.documentation` output installs the versioned
