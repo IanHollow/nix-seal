@@ -611,8 +611,14 @@ fn run_plugin_operation<R: Read + Send, W: Write>(
     isolate_plugin_process_group(&mut command);
 
     let mut child = command.spawn().map_err(|_| CryptoError::Plugin)?;
-    let stdin = child.stdin.take().ok_or(CryptoError::Plugin)?;
-    let mut stdout = child.stdout.take().ok_or(CryptoError::Plugin)?;
+    let Some(stdin) = child.stdin.take() else {
+        terminate_plugin_process_tree(&mut child);
+        return Err(CryptoError::Plugin);
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate_plugin_process_tree(&mut child);
+        return Err(CryptoError::Plugin);
+    };
     let child = Arc::new(Mutex::new(child));
     let watchdog_child = Arc::clone(&child);
     let (complete_tx, complete_rx) = mpsc::channel();

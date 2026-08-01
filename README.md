@@ -187,8 +187,9 @@ slice provides strict plan parsing and validation, canonical plan hashing,
 native age X25519 encryption/decryption, signed target artifacts, transactional
 ciphertext cache writes, authenticated atomic activation, ownership-aware
 generation changes, activation-time secret templates, post-switch service
-coordination, JSON Schema output, and NixOS/nix-darwin/Home Manager modules. See
-[SPEC.md](SPEC.md) and [ROADMAP.md](ROADMAP.md) before relying on it.
+coordination, isolated standard age-plugin operations, JSON Schema output, and
+NixOS/nix-darwin/Home Manager modules. See [SPEC.md](SPEC.md) and
+[ROADMAP.md](ROADMAP.md) before relying on it.
 
 The Nix package check requires round-trip interoperability with both the
 reference `age` executable and `rage`, in both encryption directions. They are
@@ -199,8 +200,10 @@ It also pins C2SP/CCTV's age corpus in `flake.lock` and runs every supported
 unarmored, uncompressed X25519 and parser vector, including expected rejection
 and partial-payload cases. Unsupported passphrase, armor, and hybrid-recipient
 vectors remain explicitly skipped until their corresponding native adapter
-capabilities are implemented. A bounded structural preflight rejects malformed
-recipient stanzas before delegation to the pinned pre-1.0 age adapter.
+capabilities are implemented. Standard age-plugin recipients and identities are
+handled through the isolated worker described in the security section. A bounded
+structural preflight rejects malformed recipient stanzas before delegation to
+the pinned pre-1.0 age adapter.
 
 ## Installed documentation
 
