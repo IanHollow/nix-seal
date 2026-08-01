@@ -1,10 +1,10 @@
 # ADR 0003: Ciphertext cache and Nix bridge
 
-Status: accepted; rekey/cache transaction foundation implemented
+Status: accepted; rekey/cache transaction and Nix import bridge implemented
 
-Target artifacts live in a content-addressed XDG cache and fixed-output Nix
-derivations, never Git by default. Rekey is an explicit impure preparation step;
-Nix builds fail safely when an expected object is absent. Transactions use
+Target artifacts live in a content-addressed XDG cache and ciphertext-only Nix
+store imports, never Git by default. Rekey is an explicit impure preparation
+step; Nix evaluation fails safely when an expected object is absent. Transactions use
 private same-filesystem temporary files, locks, fsync, content verification, and
 atomic rename. Cache export/import carries ciphertext and public signed
 metadata.
@@ -49,3 +49,13 @@ append-only and idempotent for byte-identical entries; a matching address with
 different ciphertext or envelope fails closed. Artifact authorization remains a
 policy/activation operation, so importing an artifact never by itself grants it
 runtime use.
+
+The public Nix library's `artifactBundle` helper consumes one exported target
+artifact directory and requires the exact two-member set
+`ciphertext.age`/`manifest.dsse.json`. It copies ciphertext and signed public
+metadata through `builtins.path`, derives module paths from the bundle, and
+rejects malformed layouts before store import. The helper emits the complete
+operator-supplied `nix-seal rekey` command when the bundle is missing. It never
+reads an identity, invokes a process, or performs rekeying in a derivation;
+artifact signatures and target bindings remain verified by the Rust activation
+runtime.

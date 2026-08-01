@@ -146,6 +146,46 @@ nix-seal provision --plan plan.v1.json --target host.example --generation 4 \
 Provisioning never transmits plaintext. Use the explicit ciphertext-only cache
 export/import flow or `nix copy` for a remote build or deployment transport.
 
+### Nix/store artifact bridge
+
+After provisioning, export the ciphertext-only cache on the administrator
+machine and import that directory into the deployment checkout or build host:
+
+```console
+nix-seal cache export --destination /tmp/nix-seal-cache-export
+nix-seal cache import --source /tmp/nix-seal-cache-export
+```
+
+Each target artifact is a directory containing exactly `ciphertext.age` and
+`manifest.dsse.json`. The public flake library can import one such directory
+without running a command or reading an identity:
+
+```nix
+let
+  artifact = nixSeal.lib.artifactBundle {
+    path = ./artifacts/host-example/db-password;
+    target = "host.example";
+    secret = "db/password";
+  };
+in
+{
+  nixSeal.secrets."db/password" = {
+    artifact = artifact;
+    sourceCiphertextHash = "…64 lowercase hexadecimal characters…";
+  };
+}
+```
+
+For integrations that need the two public paths directly, use
+`nixSeal.lib.artifactPaths artifact` instead of reconstructing the layout.
+
+The module derives the ciphertext and signed-envelope paths from `artifact` and
+rejects overrides. The helper rejects missing paths, symlinks, extra files, and
+wrong artifact layouts before they enter the store. If an artifact is absent,
+evaluation fails with the exact `nix-seal rekey` command to run; rekeying is
+never implicit in a Nix derivation. Artifact contents are ciphertext and public
+metadata only, so importing them into the store does not place plaintext there.
+
 Deletion never unlinks canonical ciphertext directly. It requires `--yes` and
 atomically moves the ciphertext into a private, collision-safe
 `.nix-seal/trash/v1` tombstone containing its public secret ID, original source,

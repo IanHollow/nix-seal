@@ -10,6 +10,16 @@ let
   digest = character: builtins.concatStringsSep "" (lib.replicate 64 character);
   ciphertext = pkgs.writeText "nix-seal-test-artifact.age" "public ciphertext fixture";
   envelope = pkgs.writeText "nix-seal-test-envelope.json" "public envelope fixture";
+  exportedArtifact = pkgs.runCommand "nix-seal-test-exported-artifact" { } ''
+    mkdir -p "$out"
+    printf '%s' 'public ciphertext fixture' > "$out/ciphertext.age"
+    printf '%s' 'public envelope fixture' > "$out/manifest.dsse.json"
+  '';
+  importedArtifact = nixSealLib.artifactBundle {
+    path = exportedArtifact;
+    target = "host.test";
+    secret = "db/password";
+  };
   templateSource = pkgs.writeText "nix-seal-test-template" ''
     password={{nix-seal:password}}
   '';
@@ -64,6 +74,25 @@ let
       {
         system.stateVersion = "26.05";
         nixSeal.planObjects = { };
+      }
+    ];
+  };
+  nixosArtifactBundle = inputs.nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = [
+      self.nixosModules.default
+      {
+        system.stateVersion = "26.05";
+        nixSeal = {
+          enable = true;
+          targetId = "host.test";
+          identityFile = "/run/keys/nix-seal-target";
+          inherit planFile;
+          secrets."db/password" = {
+            artifact = importedArtifact;
+            sourceCiphertextHash = digest "2";
+          };
+        };
       }
     ];
   };
@@ -289,6 +318,23 @@ let
   invalidCollectionId = builtins.tryEval (
     builtins.deepSeq (nixSealLib.mkPlan { secrets."bad//id" = { }; }) true
   );
+  invalidArtifactEntries = builtins.tryEval (
+    nixSealLib.artifactBundle {
+      path = pkgs.runCommand "nix-seal-invalid-artifact" { } ''
+        mkdir -p "$out"
+        touch "$out/ciphertext.age" "$out/manifest.dsse.json" "$out/unexpected"
+      '';
+      target = "host.test";
+      secret = "db/password";
+    }
+  );
+  missingArtifact = builtins.tryEval (
+    nixSealLib.artifactBundle {
+      target = "host.test";
+      secret = "db/password";
+      rekeyCommand = "nix-seal rekey --plan plan.v1.json --target host.test --secret db/password";
+    }
+  );
 in
 {
   module-plan-objects =
@@ -310,6 +356,27 @@ in
           "identities", "schema", "secrets", "targets", "templates"
         ])
       ' ${strictPlanFile} >/dev/null
+      touch "$out"
+    '';
+  lib-artifact-bundle =
+    assert invalidArtifactEntries.success == false;
+    assert missingArtifact.success == false;
+    assert builtins.pathExists "${importedArtifact}/ciphertext.age";
+    assert builtins.pathExists "${importedArtifact}/manifest.dsse.json";
+    pkgs.runCommand "nix-seal-lib-artifact-bundle" { } ''
+      test -f ${importedArtifact}/ciphertext.age
+      test -f ${importedArtifact}/manifest.dsse.json
+      test "$(find ${importedArtifact} -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2
+      touch "$out"
+    '';
+  module-artifact-bundle =
+    assert nixosArtifactBundle.config.nixSeal.secrets."db/password".ciphertext
+      == "${importedArtifact}/ciphertext.age";
+    assert nixosArtifactBundle.config.nixSeal.secrets."db/password".envelope
+      == "${importedArtifact}/manifest.dsse.json";
+    pkgs.runCommand "nix-seal-module-artifact-bundle" { nativeBuildInputs = [ pkgs.jq ]; } ''
+      jq -e '.artifacts[0].ciphertext == "${importedArtifact}/ciphertext.age" and .artifacts[0].envelope == "${importedArtifact}/manifest.dsse.json"' \
+        ${nixosArtifactBundle.config.nixSeal.activationSpec} >/dev/null
       touch "$out"
     '';
   module-nixos =

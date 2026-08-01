@@ -40,6 +40,7 @@ let
     name: name != "." && name != ".."
   );
   configuredSecrets = lib.filterAttrs (_: secret: secret.ciphertext != null) cfg.secrets;
+  missingSecretArtifacts = lib.filterAttrs (_: secret: secret.ciphertext == null) cfg.secrets;
   configuredTemplates = lib.filterAttrs (_: template: template.source != null) cfg.templates;
   phaseRuntimeDirectory =
     phase: if phase == "activation" then cfg.runtimeDirectory else "${cfg.runtimeDirectory}/${phase}";
@@ -75,6 +76,10 @@ let
     ) (builtins.attrNames (configuredSecretsForPhase phase));
   serviceCredentialBindings = lib.concatMap serviceCredentialBindingsForPhase activationPhases;
   serviceCredentialKeys = map (binding: "${binding.unit}:${binding.name}") serviceCredentialBindings;
+  artifactBundleEntries = {
+    "ciphertext.age" = "regular";
+    "manifest.dsse.json" = "regular";
+  };
   reloadUnitsForPhase = explicitReloadUnitsForPhase;
   restartUnitsForPhase =
     phase:
@@ -225,14 +230,32 @@ in
                 type = privateModeType;
                 default = "0400";
               };
-              ciphertext = mkOption {
+              artifact = mkOption {
                 type = types.nullOr types.path;
                 default = null;
+                description = ''
+                  Ciphertext-only target artifact bundle imported from
+                  `nix-seal cache export`. The directory must contain exactly
+                  `ciphertext.age` and `manifest.dsse.json`; those paths are
+                  derived automatically and may enter the Nix store.
+                '';
+              };
+              ciphertext = mkOption {
+                type = types.nullOr types.path;
+                default =
+                  if config.nixSeal.secrets.${name}.artifact == null then
+                    null
+                  else
+                    "${config.nixSeal.secrets.${name}.artifact}/ciphertext.age";
                 description = "Target-encrypted artifact path. Ciphertext may enter the Nix store.";
               };
               envelope = mkOption {
                 type = types.nullOr types.path;
-                default = null;
+                default =
+                  if config.nixSeal.secrets.${name}.artifact == null then
+                    null
+                  else
+                    "${config.nixSeal.secrets.${name}.artifact}/manifest.dsse.json";
                 description = "Signed public artifact manifest path.";
               };
               sourceCiphertextHash = mkOption {
@@ -409,10 +432,29 @@ in
             message = "every nixSeal ciphertext requires an envelope and sourceCiphertextHash";
           }
           {
-            assertion =
-              builtins.length (builtins.attrNames configuredSecrets)
-              == builtins.length (builtins.attrNames cfg.secrets);
-            message = "every declared nixSeal secret requires a target ciphertext";
+            assertion = missingSecretArtifacts == { };
+            message =
+              let
+                secret = builtins.head (builtins.attrNames missingSecretArtifacts);
+              in
+              "nixSeal secret ${secret} is missing a target ciphertext artifact; run `nix-seal rekey --plan ${toString cfg.planFile} --target ${cfg.targetId} --secret ${secret} --identity /path/to/admin.agekey --signing-key /path/to/approval-signing-key` and import its cache export";
+          }
+          {
+            assertion = lib.all (
+              secret:
+              secret.artifact == null
+              || (
+                secret.ciphertext == "${secret.artifact}/ciphertext.age"
+                && secret.envelope == "${secret.artifact}/manifest.dsse.json"
+              )
+            ) (builtins.attrValues cfg.secrets);
+            message = "nixSeal artifact bundles derive ciphertext and envelope paths; do not override either path";
+          }
+          {
+            assertion = lib.all (
+              secret: secret.artifact == null || builtins.readDir secret.artifact == artifactBundleEntries
+            ) (builtins.attrValues cfg.secrets);
+            message = "nixSeal artifact bundles must contain exactly ciphertext.age and manifest.dsse.json";
           }
           {
             assertion =
