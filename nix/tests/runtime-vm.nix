@@ -21,6 +21,16 @@ pkgs.testers.nixosTest {
       pkgs.gnugrep
       pkgs.jq
     ];
+    environment.etc."systemd/system/nix-seal-test.service".text = ''
+      [Unit]
+      Description=nix-seal VM credential consumer
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      LoadCredential=database-password:/run/nix-seal/current/app/token
+      ExecStart=/bin/sh -c 'umask 077; cat "$CREDENTIALS_DIRECTORY/database-password" > /run/nix-seal-service-observed'
+    '';
     virtualisation.memorySize = 1024;
     system.stateVersion = "26.05";
   };
@@ -151,17 +161,13 @@ pkgs.testers.nixosTest {
           }
         }' > "$root/activation.json"
 
-      printf '%s\n' \
-        '[Unit]' \
-        'Description=nix-seal VM credential consumer' \
-        "" \
-        '[Service]' \
-        'Type=oneshot' \
-        'RemainAfterExit=yes' \
-        'LoadCredential=database-password:/run/nix-seal/current/app/token' \
-        "ExecStart=/bin/sh -c 'umask 077; cat \"\$CREDENTIALS_DIRECTORY/database-password\" > /run/nix-seal-service-observed'" \
-        > /etc/systemd/system/nix-seal-test.service
+      # Establish the first immutable generation without service actions. The
+      # credential consumer needs an existing source before systemd can start.
+      jq '.postSwitch = null | .templates = []' "$root/activation.json" > "$root/activation-initial.json"
       systemctl daemon-reload
+      nix-seal activate --spec "$root/activation-initial.json" --identity "$root/target.age"
+      systemctl start nix-seal-test.service
+      cmp /run/nix-seal-service-observed /run/nix-seal/current/app/token
 
       nix-seal activate --spec "$root/activation.json" --identity "$root/target.age"
 
