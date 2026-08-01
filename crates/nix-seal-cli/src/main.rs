@@ -6712,6 +6712,8 @@ mod tests {
     #[test]
     fn sops_migration_commits_only_after_external_success() -> Result<(), Box<dyn std::error::Error>>
     {
+        use std::os::unix::fs::PermissionsExt;
+
         let temporary = tempfile::tempdir()?;
         let root = temporary.path().canonicalize()?;
         fs::create_dir(root.join("legacy"))?;
@@ -6720,11 +6722,23 @@ mod tests {
         let (identity, recipient) = nix_seal_crypto::generate_x25519();
         let identity_path = root.join("identity.age");
         write_private_bytes(&identity_path, identity.expose_secret().as_bytes())?;
+        // Nix sandbox builders do not provide /usr/bin/true, and the PATH
+        // entry is commonly a multicall coreutils symlink. Use an ephemeral,
+        // regular executable so this continues to exercise the production
+        // absolute, non-symlink check on every supported test platform.
+        let shell = std::env::split_paths(&std::env::var_os("PATH").ok_or("PATH is absent")?)
+            .map(|directory| directory.join("sh"))
+            .find(|candidate| candidate.is_file())
+            .ok_or("sh is absent from PATH")?
+            .canonicalize()?;
+        let producer = root.join("successful-sops-producer");
+        fs::write(&producer, format!("#!{}\nexit 0\n", shell.display()))?;
+        fs::set_permissions(&producer, fs::Permissions::from_mode(0o700))?;
         migrate_sops_document(
             &root,
             Path::new("legacy/source.yaml"),
             Path::new("secrets/result.age"),
-            Path::new("/usr/bin/true"),
+            &producer,
             None,
             &identity_path,
             &[recipient],
