@@ -529,6 +529,16 @@ enum SecretCommand {
     Show(SecretPlanArgs),
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SecretFormat {
+    /// Validate stdin as a strict JSON document before encrypting its original bytes.
+    Json,
+    /// Validate stdin as a strict TOML document before encrypting its original bytes.
+    Toml,
+    /// Validate stdin as a bounded dotenv collection before encrypting its original bytes.
+    Dotenv,
+}
+
 #[derive(Clone, Args)]
 struct SecretPlanArgs {
     /// Canonical compiled plan.v1 JSON.
@@ -549,6 +559,9 @@ struct SecretWriteArgs {
     /// Administrator/recovery identity used to verify encryption or reveal plaintext.
     #[arg(long)]
     identity: PathBuf,
+    /// Optional logical collection format to validate before encryption.
+    #[arg(long, value_enum)]
+    format: Option<SecretFormat>,
 }
 
 #[derive(Args)]
@@ -5314,10 +5327,11 @@ fn run_secret_write(
         .canonicalize()
         .context("repository root must exist")?;
     let identity = read_identity(&arguments.identity)?;
+    let input = read_structured_secret_input(arguments.format)?;
     let result = nix_seal_authoring::write_secret(
         &root,
         Path::new(&secret.source),
-        std::io::stdin().lock(),
+        std::io::Cursor::new(input.expose_secret().as_slice()),
         &recipients,
         &identity,
         mode,
@@ -5350,6 +5364,60 @@ fn run_secret_write(
         );
         if let Some(rotated_at) = rotated_at {
             eprintln!("record lifecycle.rotatedAt = {rotated_at} in the authoritative plan source");
+        }
+    }
+    Ok(())
+}
+
+fn read_structured_secret_input(format: Option<SecretFormat>) -> Result<SecretBox<Vec<u8>>> {
+    let mut input = SecretBox::new(Box::new(Vec::new()));
+    BoundedReader::new(
+        std::io::stdin().lock(),
+        EXTERNAL_MIGRATION_MAX_PLAINTEXT_BYTES,
+    )
+    .read_to_end(input.expose_secret_mut())
+    .context("secret input exceeds the 64 MiB safety limit")?;
+    let Some(format) = format else {
+        return Ok(input);
+    };
+    let text = std::str::from_utf8(input.expose_secret())
+        .context("structured secret input must be valid UTF-8")?;
+    match format {
+        SecretFormat::Json => {
+            let _: serde_json::Value =
+                serde_json::from_str(text).context("structured JSON secret input is malformed")?;
+        }
+        SecretFormat::Toml => {
+            let _: toml::Value =
+                toml::from_str(text).context("structured TOML secret input is malformed")?;
+        }
+        SecretFormat::Dotenv => validate_dotenv(text)?,
+    }
+    Ok(input)
+}
+
+fn validate_dotenv(input: &str) -> Result<()> {
+    let mut keys = BTreeSet::new();
+    for line in input.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, _value) = line
+            .strip_prefix("export ")
+            .unwrap_or(line)
+            .split_once('=')
+            .context("dotenv entries must use KEY=VALUE syntax")?;
+        if key.is_empty()
+            || !key.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_uppercase()
+                    || byte.is_ascii_lowercase()
+                    || byte == b'_'
+                    || index > 0 && byte.is_ascii_digit()
+            })
+            || !keys.insert(key)
+        {
+            bail!("dotenv entries require unique shell-compatible keys");
         }
     }
     Ok(())
@@ -6105,6 +6173,14 @@ mod tests {
         );
         assert!(nix_seal_policy::validate(&plan).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn dotenv_validation_rejects_duplicate_and_unsafe_keys() {
+        assert!(validate_dotenv("TOKEN=value\nexport PORT=443\n").is_ok());
+        assert!(validate_dotenv("TOKEN=one\nTOKEN=two\n").is_err());
+        assert!(validate_dotenv("1TOKEN=value\n").is_err());
+        assert!(validate_dotenv("TOKEN\n").is_err());
     }
 
     #[test]
