@@ -35,6 +35,12 @@ atomic transactions, fsync, link/path checks, and fail-closed generation switch.
 Plaintext is excluded from store, argv, ordinary environment, JSON, diagnostics,
 logs, and CI. External processes receive a minimal environment, explicit file
 descriptors, deadlines, output bounds, and the least required secret set.
+Generator prompt input is non-interactive by default. Explicit interactive input
+uses only a verified controlling terminal, masks hidden values with guaranteed
+terminal-mode restoration, bounds bytes, and zeroizes transient read buffers.
+The current release does not enforce network isolation for external generators;
+it warns at invocation and treats their executables and declared runtime inputs
+as trusted code.
 
 Security tests cover traversal, symlink/hardlink/TOCTOU races, malformed crypto
 and signatures, replay and target substitution, disk exhaustion, crashes,
