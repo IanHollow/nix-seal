@@ -4716,6 +4716,51 @@ mod tests {
     }
 
     #[test]
+    fn identity_add_rejects_a_nix_plan_collision_before_rewriting_toml()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let toml_path = temporary.path().join("nix-seal.toml");
+        fs::write(
+            &toml_path,
+            toml::to_string_pretty(&nix_seal_core::PlanV1::default())?,
+        )?;
+        let nix_plan_path = temporary.path().join("nix-plan.json");
+        let id = nix_seal_core::Id::parse("administrator")?;
+        let (_, recipient) = nix_seal_crypto::generate_x25519();
+        let mut nix_plan = nix_seal_core::PlanV1::default();
+        nix_plan.identities.insert(
+            id.clone(),
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: recipient.clone(),
+            },
+        );
+        fs::write(&nix_plan_path, serde_json::to_vec(&nix_plan)?)?;
+
+        assert!(
+            run_identity(
+                IdentityCommand::Add {
+                    plan: IdentityPlanArgs {
+                        toml: toml_path.clone(),
+                        nix_plan: Some(nix_plan_path),
+                    },
+                    id,
+                    kind: IdentityRole::Administrator,
+                    public: recipient,
+                },
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            nix_seal_policy::load_toml(&toml_path)?
+                .identities
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn sops_migration_source_must_remain_below_its_repository_root()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
