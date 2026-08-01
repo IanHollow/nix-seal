@@ -222,16 +222,16 @@ list (default 16, 96 bits of selection entropy). `builtin:ssh-ed25519` produces
 one standard unencrypted OpenSSH Ed25519 private key, which is immediately
 encrypted through the normal canonical-secret transaction; its public key is
 derivable from that secret. Generation is create-only unless `--replace` is
-explicit. Generators may produce multiple secret outputs:
-every output is encrypted and round-trip verified before an existing ciphertext
-is changed, and replacement failures restore prior ciphertext. Direct executable
-generators use an explicit protocol: `executable` and every `runtimeInputs`
-entry must be under `/nix/store`; `arguments` are literal public values; and the
-process runs with a cleared environment, null standard streams, a private
-workspace, and a bounded timeout. It must write exactly one regular file named
-`0`, `1`, and so on for each declared output beneath `$NIX_SEAL_OUTPUT_DIR`.
-Unlisted files, links, oversized output, nonzero exits, and timeouts fail the
-full transaction without exposing process output.
+explicit. Generators may produce multiple secret outputs: every output is
+encrypted and round-trip verified before an existing ciphertext is changed, and
+replacement failures restore prior ciphertext. Direct executable generators use
+an explicit protocol: `executable` and every `runtimeInputs` entry must be under
+`/nix/store`; `arguments` are literal public values; and the process runs with a
+cleared environment, null standard streams, a private workspace, and a bounded
+timeout. It must write exactly one regular file named `0`, `1`, and so on for
+each declared output beneath `$NIX_SEAL_OUTPUT_DIR`. Unlisted files, links,
+oversized output, nonzero exits, and timeouts fail the full transaction without
+exposing process output.
 
 Declared external-generator prompts are non-interactive by default. Supply each
 response with
