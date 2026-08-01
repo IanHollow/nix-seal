@@ -741,7 +741,7 @@ impl Generation {
         }
         let source = self.transaction.keep();
         std::fs::rename(source, &destination)?;
-        File::open(&self.root)?.sync_all()?;
+        open_directory_nofollow(&self.root)?.sync_all()?;
 
         let pending_result = if actions.is_some() {
             write_pending(&self.root, &destination, plan_hash)
@@ -863,7 +863,7 @@ fn write_pending(root: &Path, generation: &Path, plan_hash: &str) -> Result<(), 
     file.write_all(pending_payload(generation, plan_hash)?.as_bytes())?;
     file.sync_all()?;
     std::fs::rename(next, root.join(PENDING_MARKER))?;
-    File::open(root)?.sync_all()?;
+    open_directory_nofollow(root)?.sync_all()?;
     Ok(())
 }
 
@@ -872,7 +872,7 @@ fn clear_pending(root: &Path) -> Result<(), RuntimeError> {
         let marker = root.join(PENDING_MARKER);
         let _ = open_regular_nofollow(&marker)?;
         std::fs::remove_file(marker)?;
-        File::open(root)?.sync_all()?;
+        open_directory_nofollow(root)?.sync_all()?;
     }
     Ok(())
 }
@@ -1488,7 +1488,7 @@ fn sync_tree(root: &Path) -> Result<(), RuntimeError> {
         }
     }
     for directory in directories.iter().rev() {
-        File::open(directory)?.sync_all()?;
+        open_directory_nofollow(directory)?.sync_all()?;
     }
     Ok(())
 }
@@ -1521,7 +1521,7 @@ fn switch_current(root: &Path, generation: u64) -> Result<(), RuntimeError> {
     }
     symlink(format!("generation-{generation}"), &next)?;
     std::fs::rename(&next, &current)?;
-    File::open(root)?.sync_all()?;
+    open_directory_nofollow(root)?.sync_all()?;
     Ok(())
 }
 
@@ -1569,6 +1569,30 @@ fn open_regular_nofollow(path: &Path) -> Result<File, RuntimeError> {
     if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile || metadata.st_nlink != 1
     {
         return Err(RuntimeError::UnsafeSource);
+    }
+    Ok(File::from(descriptor))
+}
+
+#[cfg(unix)]
+fn open_directory_nofollow(path: &Path) -> Result<File, RuntimeError> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+            RuntimeError::InvalidDestination
+        } else {
+            RuntimeError::Io(error.into())
+        }
+    })?;
+    let metadata = fstat(&descriptor).map_err(|error| RuntimeError::Io(error.into()))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(RuntimeError::InvalidDestination);
     }
     Ok(File::from(descriptor))
 }
@@ -1647,6 +1671,15 @@ fn open_regular_nofollow(path: &Path) -> Result<File, RuntimeError> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
         return Err(RuntimeError::UnsafeSource);
+    }
+    Ok(File::open(path)?)
+}
+
+#[cfg(not(unix))]
+fn open_directory_nofollow(path: &Path) -> Result<File, RuntimeError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(RuntimeError::InvalidDestination);
     }
     Ok(File::open(path)?)
 }
