@@ -2315,4 +2315,30 @@ mod tests {
         assert!(!fixture.runtime.exists());
         Ok(())
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_runtime_roots_and_current_target_traversal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let real_root = temporary.path().join("real-runtime");
+        std::fs::create_dir(&real_root)?;
+        let linked_root = temporary.path().join("linked-runtime");
+        symlink(&real_root, &linked_root)?;
+        assert!(matches!(
+            Generation::begin(&linked_root),
+            Err(RuntimeError::InvalidDestination)
+        ));
+
+        let generation = real_root.join("generation-1");
+        std::fs::create_dir(&generation)?;
+        symlink("generation-1/escape", real_root.join("current"))?;
+        assert!(matches!(
+            current_generation(&real_root),
+            Err(RuntimeError::InvalidDestination)
+        ));
+        Ok(())
+    }
 }
