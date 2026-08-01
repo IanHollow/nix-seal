@@ -929,6 +929,7 @@ fn validate_generator_execution(
             | "builtin:hex"
             | "builtin:base64"
             | "builtin:token"
+            | "builtin:passphrase"
             | "builtin:wireguard-private-key"
             | "builtin:uuid"
     );
@@ -1125,6 +1126,27 @@ mod tests {
             "/nix/store/abc123:unsafe/bin/generate"
         ));
     }
+
+    #[test]
+    fn passphrase_is_an_admitted_builtin_generator() -> Result<(), PolicyError> {
+        let generator = nix_seal_core::Generator {
+            executable: "builtin:passphrase".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            outputs: Vec::new(),
+            prompts: Vec::new(),
+            parameters: BTreeMap::from([("words".to_owned(), "16".to_owned())]),
+            validation: None,
+        };
+        let id =
+            Id::parse("passphrase").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        validate_generator_execution(&id, &generator)?;
+        Ok(())
+    }
+
     #[test]
     fn duplicate_ids_are_rejected() -> Result<(), PolicyError> {
         let (mut a, mut b) = (PlanV1::default(), PlanV1::default());
