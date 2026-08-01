@@ -140,7 +140,7 @@
         }
         // lib.optionalAttrs (pkgs.stdenv.hostPlatform.isLinux && system == "x86_64-linux") {
           runtime-vm = import ./nix/tests/runtime-vm.nix {
-            inherit inputs system pkgs;
+            inherit system pkgs;
             inherit (inputs) self;
           };
         }
