@@ -7399,8 +7399,10 @@ fn open_public_ciphertext(path: &Path) -> Result<std::fs::File> {
     use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
     let parent = path
         .parent()
-        .context("canonical ciphertext path has no parent")?;
-    let directory = open_directory_chain_nofollow(parent)?;
+        .context("canonical ciphertext path has no parent")?
+        .canonicalize()
+        .context("canonical ciphertext parent does not exist")?;
+    let directory = open_directory_chain_nofollow(&parent)?;
     let leaf = path
         .file_name()
         .context("canonical ciphertext path has no filename")?;
@@ -7452,7 +7454,13 @@ fn open_directory_chain_nofollow(path: &Path) -> Result<std::fs::File> {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(std::io::Error::from)?;
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not open canonical ciphertext directory component {}: {}",
+                name.to_string_lossy(),
+                std::io::Error::from(error)
+            )
+        })?;
         let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
         if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
             bail!("canonical ciphertext ancestry is not a directory");
@@ -7994,7 +8002,7 @@ mod tests {
         let linked = temporary.path().join("linked");
         symlink(&real, &linked)?;
 
-        assert!(open_public_ciphertext(&linked.join("secret.age")).is_err());
+        assert!(open_directory_chain_nofollow(&linked).is_err());
         Ok(())
     }
 
