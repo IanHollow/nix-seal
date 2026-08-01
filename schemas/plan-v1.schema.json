@@ -512,6 +512,20 @@
             "restartUnits": []
           }
         },
+        "selectors": {
+          "description": "Additional target selection rules. Matches are unioned with `consumers`.",
+          "$ref": "#/$defs/TargetSelectors",
+          "default": {
+            "configurations": [],
+            "environments": [],
+            "groups": [],
+            "kinds": [],
+            "systems": [],
+            "tags": [],
+            "targets": [],
+            "usernames": []
+          }
+        },
         "source": {
           "description": "Repository-relative canonical age ciphertext path.",
           "type": "string"
@@ -524,6 +538,16 @@
       "description": "Target platform consumer.",
       "type": "object",
       "properties": {
+        "configuration": {
+          "description": "Optional Nix configuration name used by selectors.",
+          "type": ["string", "null"],
+          "default": null
+        },
+        "environment": {
+          "description": "Optional deployment environment used by selectors.",
+          "type": ["string", "null"],
+          "default": null
+        },
         "identity": {
           "description": "Recipient identity `ID`.",
           "$ref": "#/$defs/Id"
@@ -546,7 +570,8 @@
         },
         "username": {
           "description": "Optional Home Manager user.",
-          "type": ["string", "null"]
+          "type": ["string", "null"],
+          "default": null
         }
       },
       "additionalProperties": false,
@@ -571,6 +596,77 @@
           "const": "homeManager"
         }
       ]
+    },
+    "TargetSelectors": {
+      "description": "Public selectors for expanding a secret's authorized target set.\n\nNon-empty fields are ANDed, while values within one field are ORed. The\n`tags` field is the exception: every listed tag is required. Explicit\nconsumers remain a separate union, so adding a selector never removes an\nexisting target authorization.",
+      "type": "object",
+      "properties": {
+        "configurations": {
+          "description": "Nix configuration names.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "environments": {
+          "description": "Deployment environments.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "groups": {
+          "description": "Target groups whose leaves are selected.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "kinds": {
+          "description": "Target platform kinds.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TargetKind"
+          }
+        },
+        "systems": {
+          "description": "Nix system values such as `x86_64-linux`.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "tags": {
+          "description": "Tags; every listed tag must be present on a target.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "targets": {
+          "description": "Exact target IDs.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "usernames": {
+          "description": "Home Manager usernames.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "Template": {
       "description": "Runtime template declaration.",

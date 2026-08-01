@@ -64,6 +64,12 @@ in
   pkgs.writeText "plan.v1.json" plan
 ```
 
+Secret `selectors` can select exact targets or groups and filter by target kind,
+system, username, configuration, environment, and tags. Non-empty selector
+fields are ANDed (values within one field are ORed); tags are all-required, and
+the result is unioned with explicit `consumers`. Selector references are
+validated against the target/group graph before recipient derivation.
+
 Collection values remain public metadata; plaintext values, prompts, and private
 identities must never be placed in a Nix expression. Nested fields are validated
 with the versioned JSON schema and policy rules by `nix-seal check`. When a TOML

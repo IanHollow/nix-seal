@@ -165,14 +165,21 @@ pub struct Target {
     /// Recipient identity `ID`.
     pub identity: Id,
     /// Optional Home Manager user.
+    #[serde(default)]
     pub username: Option<String>,
+    /// Optional Nix configuration name used by selectors.
+    #[serde(default)]
+    pub configuration: Option<String>,
+    /// Optional deployment environment used by selectors.
+    #[serde(default)]
+    pub environment: Option<String>,
     /// Public selector tags.
     #[serde(default)]
     pub tags: Vec<String>,
 }
 
 /// Supported integration type.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TargetKind {
     /// `NixOS` system.
@@ -198,6 +205,9 @@ pub struct Secret {
     /// Explicit target/group `IDs`.
     #[serde(default)]
     pub consumers: Vec<Id>,
+    /// Additional target selection rules. Matches are unioned with `consumers`.
+    #[serde(default)]
+    pub selectors: TargetSelectors,
     /// Required activation phase.
     #[serde(default)]
     pub phase: ActivationPhase,
@@ -212,6 +222,41 @@ pub struct Secret {
     pub repository_only: bool,
     /// Approval policy `ID`.
     pub approval_policy: Option<Id>,
+}
+
+/// Public selectors for expanding a secret's authorized target set.
+///
+/// Non-empty fields are `ANDed`, while values within one field are `ORed`. The
+/// `tags` field is the exception: every listed tag is required. Explicit
+/// consumers remain a separate union, so adding a selector never removes an
+/// existing target authorization.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TargetSelectors {
+    /// Exact target IDs.
+    #[serde(default)]
+    pub targets: Vec<Id>,
+    /// Target groups whose leaves are selected.
+    #[serde(default)]
+    pub groups: Vec<Id>,
+    /// Target platform kinds.
+    #[serde(default)]
+    pub kinds: Vec<TargetKind>,
+    /// Nix system values such as `x86_64-linux`.
+    #[serde(default)]
+    pub systems: Vec<String>,
+    /// Home Manager usernames.
+    #[serde(default)]
+    pub usernames: Vec<String>,
+    /// Nix configuration names.
+    #[serde(default)]
+    pub configurations: Vec<String>,
+    /// Deployment environments.
+    #[serde(default)]
+    pub environments: Vec<String>,
+    /// Tags; every listed tag must be present on a target.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Ciphertext delivery model.

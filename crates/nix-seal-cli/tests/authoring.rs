@@ -3,7 +3,7 @@
 
 use nix_seal_core::{
     ActivationPhase, DeliveryMode, Id, Identity, IdentityKind, Lifecycle, PlanV1, RuntimeSettings,
-    Secret,
+    Secret, TargetSelectors,
 };
 use secrecy::ExposeSecret;
 use std::{
@@ -227,6 +227,7 @@ fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
             delivery: DeliveryMode::Rekeyed,
             administrators: Vec::new(),
             consumers: Vec::new(),
+            selectors: TargetSelectors::default(),
             phase: ActivationPhase::Activation,
             runtime: RuntimeSettings::default(),
             lifecycle: Lifecycle::default(),

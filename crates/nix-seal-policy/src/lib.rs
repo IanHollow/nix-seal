@@ -305,6 +305,7 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
         }
     }
     for (id, target) in &plan.targets {
+        validate_target(id, target)?;
         let identity = plan.identities.get(&target.identity).ok_or_else(|| {
             PolicyError::Violation(format!(
                 "target {id} references missing identity {}",
@@ -360,6 +361,7 @@ fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
                 )));
             }
         }
+        validate_target_selectors(plan, id, secret)?;
         validate_repository_only_secret(id, secret)?;
         let administrator_leaves = expand_group_leaves(plan, &secret.administrators)?;
         if administrator_leaves.iter().any(|identity_id| {
@@ -374,7 +376,7 @@ fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
                 "secret {id} administrator groups contain incompatible members"
             )));
         }
-        let consumer_leaves = expand_group_leaves(plan, &secret.consumers)?;
+        let consumer_leaves = selected_consumer_targets(plan, secret)?;
         if consumer_leaves
             .iter()
             .any(|target_id| !plan.targets.contains_key(target_id))
@@ -431,9 +433,12 @@ fn validate_repository_only_secret(
     id: &Id,
     secret: &nix_seal_core::Secret,
 ) -> Result<(), PolicyError> {
-    if secret.repository_only && !secret.consumers.is_empty() {
+    if secret.repository_only
+        && (!secret.consumers.is_empty()
+            || secret.selectors != nix_seal_core::TargetSelectors::default())
+    {
         return Err(PolicyError::Violation(format!(
-            "repository-only secret {id} cannot declare target consumers"
+            "repository-only secret {id} cannot declare target consumers or selectors"
         )));
     }
     if secret.repository_only && matches!(secret.delivery, DeliveryMode::Direct) {
@@ -442,6 +447,173 @@ fn validate_repository_only_secret(
         )));
     }
     Ok(())
+}
+
+fn validate_target(id: &Id, target: &nix_seal_core::Target) -> Result<(), PolicyError> {
+    validate_bounded_selector_values(
+        &format!("target {id}"),
+        [
+            Some(target.system.as_str()),
+            target.username.as_deref(),
+            target.configuration.as_deref(),
+            target.environment.as_deref(),
+        ]
+        .into_iter()
+        .flatten(),
+    )?;
+    validate_bounded_selector_values(
+        &format!("target {id} tags"),
+        target.tags.iter().map(String::as_str),
+    )?;
+    if target.tags.iter().collect::<BTreeSet<_>>().len() != target.tags.len() {
+        return Err(PolicyError::Violation(format!(
+            "target {id} contains duplicate tags"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_target_selectors(
+    plan: &PlanV1,
+    secret_id: &Id,
+    secret: &nix_seal_core::Secret,
+) -> Result<(), PolicyError> {
+    let selectors = &secret.selectors;
+    for (label, values) in [
+        ("targets", &selectors.targets),
+        ("groups", &selectors.groups),
+    ] {
+        if values.len() > 10_000 || values.iter().collect::<BTreeSet<_>>().len() != values.len() {
+            return Err(PolicyError::Violation(format!(
+                "secret {secret_id} selectors.{label} contains duplicate or excessive IDs"
+            )));
+        }
+    }
+    for target in &selectors.targets {
+        if !plan.targets.contains_key(target) {
+            return Err(PolicyError::Violation(format!(
+                "secret {secret_id} selector references missing target {target}"
+            )));
+        }
+    }
+    for group in &selectors.groups {
+        if !plan.groups.contains_key(group) {
+            return Err(PolicyError::Violation(format!(
+                "secret {secret_id} selector references missing group {group}"
+            )));
+        }
+        if expand_group_leaves(plan, std::slice::from_ref(group))?
+            .iter()
+            .any(|member| !plan.targets.contains_key(member))
+        {
+            return Err(PolicyError::Violation(format!(
+                "secret {secret_id} selector group {group} contains a non-target member"
+            )));
+        }
+    }
+    if selectors.kinds.iter().collect::<BTreeSet<_>>().len() != selectors.kinds.len() {
+        return Err(PolicyError::Violation(format!(
+            "secret {secret_id} selectors.kinds contains duplicates"
+        )));
+    }
+    validate_bounded_selector_values(
+        &format!("secret {secret_id} selectors"),
+        selectors
+            .systems
+            .iter()
+            .chain(&selectors.usernames)
+            .chain(&selectors.configurations)
+            .chain(&selectors.environments)
+            .chain(&selectors.tags)
+            .map(String::as_str),
+    )?;
+    for (label, values) in [
+        ("systems", &selectors.systems),
+        ("usernames", &selectors.usernames),
+        ("configurations", &selectors.configurations),
+        ("environments", &selectors.environments),
+        ("tags", &selectors.tags),
+    ] {
+        if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
+            return Err(PolicyError::Violation(format!(
+                "secret {secret_id} selectors.{label} contains duplicates"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_bounded_selector_values<'a>(
+    label: &str,
+    values: impl IntoIterator<Item = &'a str>,
+) -> Result<(), PolicyError> {
+    for value in values {
+        if value.is_empty()
+            || value.len() > 256
+            || value.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(PolicyError::Violation(format!(
+                "{label} contains an empty, oversized, or control-character selector value"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn selected_consumer_targets(
+    plan: &PlanV1,
+    secret: &nix_seal_core::Secret,
+) -> Result<BTreeSet<Id>, PolicyError> {
+    let mut selected = expand_group_leaves(plan, &secret.consumers)?;
+    let selectors = &secret.selectors;
+    if *selectors == nix_seal_core::TargetSelectors::default() {
+        return Ok(selected);
+    }
+    let has_base = !selectors.targets.is_empty() || !selectors.groups.is_empty();
+    let mut candidates = if has_base {
+        selectors.targets.iter().cloned().collect::<BTreeSet<_>>()
+    } else {
+        plan.targets.keys().cloned().collect::<BTreeSet<_>>()
+    };
+    for group in &selectors.groups {
+        candidates.extend(expand_group_leaves(plan, std::slice::from_ref(group))?);
+    }
+    candidates.retain(|target_id| {
+        let Some(target) = plan.targets.get(target_id) else {
+            return false;
+        };
+        (selectors.kinds.is_empty() || selectors.kinds.contains(&target.kind))
+            && (selectors.systems.is_empty() || selectors.systems.contains(&target.system))
+            && (selectors.usernames.is_empty()
+                || target
+                    .username
+                    .as_ref()
+                    .is_some_and(|username| selectors.usernames.contains(username)))
+            && (selectors.configurations.is_empty()
+                || target
+                    .configuration
+                    .as_ref()
+                    .is_some_and(|configuration| selectors.configurations.contains(configuration)))
+            && (selectors.environments.is_empty()
+                || target
+                    .environment
+                    .as_ref()
+                    .is_some_and(|environment| selectors.environments.contains(environment)))
+            && selectors
+                .tags
+                .iter()
+                .all(|tag| target.tags.iter().any(|candidate| candidate == tag))
+    });
+    selected.extend(candidates);
+    if selected
+        .iter()
+        .any(|target_id| !plan.targets.contains_key(target_id))
+    {
+        return Err(PolicyError::Violation(
+            "secret consumer references a non-target object".to_owned(),
+        ));
+    }
+    Ok(selected)
 }
 
 fn parse_timestamp(label: &str, value: &str) -> Result<jiff::Timestamp, PolicyError> {
@@ -701,7 +873,11 @@ fn validate_group_graph(plan: &PlanV1) -> Result<(), PolicyError> {
     Ok(())
 }
 
-fn target_is_consumer(plan: &PlanV1, consumers: &[Id], target_id: &Id) -> bool {
+fn target_is_consumer(plan: &PlanV1, secret: &nix_seal_core::Secret, target_id: &Id) -> bool {
+    if selected_consumer_targets(plan, secret).is_ok_and(|targets| targets.contains(target_id)) {
+        return true;
+    }
+    let consumers = &secret.consumers;
     let mut pending = Vec::new();
     let mut visited = BTreeSet::new();
     for consumer in consumers {
@@ -804,7 +980,7 @@ pub fn secret_recipients(plan: &PlanV1, secret_id: &Id) -> Result<SecretRecipien
         }
     }
     if matches!(secret.delivery, DeliveryMode::Direct) {
-        for target_id in expand_group_leaves(plan, &secret.consumers)? {
+        for target_id in selected_consumer_targets(plan, secret)? {
             let target = plan.targets.get(&target_id).ok_or_else(|| {
                 PolicyError::Violation(format!(
                     "direct consumer reference {target_id} does not resolve to a target"
@@ -1201,7 +1377,7 @@ pub fn target_policy(plan: &PlanV1, target_id: &Id) -> Result<TargetPolicyV1, Po
     })?;
     let mut secrets = BTreeMap::new();
     for (secret_id, secret) in &plan.secrets {
-        if target_is_consumer(plan, &secret.consumers, target_id) {
+        if target_is_consumer(plan, secret, target_id) {
             secrets.insert(
                 secret_id.clone(),
                 TargetSecretPolicyV1 {
@@ -1452,6 +1628,8 @@ mod tests {
                 system: "x86_64-linux".to_owned(),
                 identity: target_identity,
                 username: None,
+                configuration: None,
+                environment: None,
                 tags: Vec::new(),
             },
         );
@@ -1462,6 +1640,7 @@ mod tests {
                 delivery: DeliveryMode::Rekeyed,
                 administrators: Vec::new(),
                 consumers: vec![target],
+                selectors: nix_seal_core::TargetSelectors::default(),
                 phase: ActivationPhase::Activation,
                 runtime: RuntimeSettings::default(),
                 lifecycle: Lifecycle::default(),
@@ -1530,6 +1709,7 @@ mod tests {
                     delivery: DeliveryMode::Rekeyed,
                     administrators: Vec::new(),
                     consumers: Vec::new(),
+                    selectors: nix_seal_core::TargetSelectors::default(),
                     phase: ActivationPhase::Activation,
                     runtime: RuntimeSettings::default(),
                     lifecycle: Lifecycle::default(),
@@ -1628,6 +1808,94 @@ mod tests {
     }
 
     #[test]
+    fn target_selectors_expand_deterministically() -> Result<(), PolicyError> {
+        let mut plan = PlanV1::default();
+        let parse = |value: &str| {
+            Id::parse(value).map_err(|error| PolicyError::Violation(error.to_string()))
+        };
+        let administrator = parse("administrator")?;
+        let signer = parse("release-signer")?;
+        let first_target = parse("desktop")?;
+        let second_target = parse("server")?;
+        plan.identities.insert(
+            administrator,
+            Identity {
+                kind: IdentityKind::Administrator,
+                public: RECIPIENT.to_owned(),
+            },
+        );
+        plan.identities.insert(
+            signer,
+            Identity {
+                kind: IdentityKind::Signer,
+                public: SIGNER.to_owned(),
+            },
+        );
+        for (target_id, identity_id, kind, system, tags) in [
+            (
+                first_target.clone(),
+                parse("target-desktop")?,
+                TargetKind::NixOs,
+                "x86_64-linux",
+                vec!["prod".to_owned(), "desktop".to_owned()],
+            ),
+            (
+                second_target.clone(),
+                parse("target-server")?,
+                TargetKind::Darwin,
+                "aarch64-darwin",
+                vec!["prod".to_owned(), "server".to_owned()],
+            ),
+        ] {
+            plan.identities.insert(
+                identity_id.clone(),
+                Identity {
+                    kind: IdentityKind::Target,
+                    public: RECIPIENT.to_owned(),
+                },
+            );
+            plan.targets.insert(
+                target_id,
+                Target {
+                    kind,
+                    system: system.to_owned(),
+                    identity: identity_id,
+                    username: None,
+                    configuration: Some("desktop".to_owned()),
+                    environment: Some("prod".to_owned()),
+                    tags,
+                },
+            );
+        }
+        let secret_id = parse("db/password")?;
+        plan.secrets.insert(
+            secret_id,
+            Secret {
+                source: "secrets/db-password.age".to_owned(),
+                delivery: DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: Vec::new(),
+                selectors: nix_seal_core::TargetSelectors {
+                    systems: vec!["x86_64-linux".to_owned()],
+                    tags: vec!["desktop".to_owned()],
+                    ..Default::default()
+                },
+                phase: ActivationPhase::Activation,
+                runtime: RuntimeSettings::default(),
+                lifecycle: Lifecycle::default(),
+                approval_policy: None,
+                repository_only: false,
+            },
+        );
+        validate(&plan)?;
+        let first_policy = target_policy(&plan, &first_target)?;
+        let second_policy = target_policy(&plan, &second_target)?;
+        assert_eq!(first_policy.secrets.len(), 1);
+        assert!(second_policy.secrets.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn signer_identities_require_a_valid_approval_key() -> Result<(), PolicyError> {
         let mut plan = PlanV1::default();
         let id = Id::parse("signer").map_err(|error| PolicyError::Violation(error.to_string()))?;
@@ -1674,6 +1942,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn templates_require_valid_secret_bindings_and_noncolliding_outputs() -> Result<(), PolicyError>
     {
         let mut plan = PlanV1::default();
@@ -1700,6 +1969,7 @@ mod tests {
             delivery: DeliveryMode::Rekeyed,
             administrators: Vec::new(),
             consumers: Vec::new(),
+            selectors: nix_seal_core::TargetSelectors::default(),
             phase: ActivationPhase::Activation,
             runtime: RuntimeSettings::default(),
             lifecycle: Lifecycle::default(),
@@ -1823,6 +2093,8 @@ mod tests {
                     system: "x86_64-linux".to_owned(),
                     identity: recipient_id.clone(),
                     username: None,
+                    configuration: None,
+                    environment: None,
                     tags: Vec::new(),
                 },
             );
@@ -1852,6 +2124,7 @@ mod tests {
             delivery: DeliveryMode::Rekeyed,
             administrators: Vec::new(),
             consumers: vec![consumer],
+            selectors: nix_seal_core::TargetSelectors::default(),
             phase: ActivationPhase::Activation,
             runtime: RuntimeSettings::default(),
             lifecycle: Lifecycle::default(),
@@ -1977,6 +2250,8 @@ mod tests {
                 system: "x86_64-linux".to_owned(),
                 identity: target_identity.clone(),
                 username: None,
+                configuration: None,
+                environment: None,
                 tags: Vec::new(),
             },
         );
@@ -1993,6 +2268,7 @@ mod tests {
                 delivery: DeliveryMode::Direct,
                 administrators: vec![admin.clone()],
                 consumers: vec![group],
+                selectors: nix_seal_core::TargetSelectors::default(),
                 phase: ActivationPhase::Activation,
                 runtime: RuntimeSettings::default(),
                 lifecycle: Lifecycle::default(),
@@ -2035,6 +2311,7 @@ mod tests {
             delivery: DeliveryMode::Rekeyed,
             administrators: Vec::new(),
             consumers: Vec::new(),
+            selectors: nix_seal_core::TargetSelectors::default(),
             phase: ActivationPhase::Activation,
             runtime: RuntimeSettings::default(),
             lifecycle,
