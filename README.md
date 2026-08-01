@@ -152,6 +152,11 @@ public-policy and canonical-ciphertext checks used before deployment, then
 reports verified cache inventory and platform/runtime caveats. It emits only
 public metadata and does not decrypt secrets.
 
+`nix-seal key list --plan plan.v1.json` inventories the identities declared by
+that validated public plan. It exposes only each stable ID, role, and public
+recipient, signer, or plugin reference; it never searches for or reads private
+identity files.
+
 ## Built-in generation
 
 `nix-seal generate` follows the public plan, derives the canonical recipients,

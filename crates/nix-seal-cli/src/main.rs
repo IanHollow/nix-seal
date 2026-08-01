@@ -27,6 +27,18 @@ struct BoundedReader<R> {
     remaining: u64,
 }
 
+/// A public plan identity suitable for human and machine-readable inventory.
+///
+/// This intentionally excludes every private identity location and material:
+/// the compiled plan is the sole source and contains public references only.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicIdentityRecord {
+    id: String,
+    kind: &'static str,
+    public: String,
+}
+
 impl<R> BoundedReader<R> {
     fn new(inner: R, limit: u64) -> Self {
         Self {
@@ -156,6 +168,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum KeyCommand {
+    /// List public identities declared by a compiled plan.
+    List {
+        #[arg(long, default_value = "plan.v1.json")]
+        plan: PathBuf,
+    },
     /// Generate an age `X25519` identity into a new mode-0600 file.
     Generate {
         #[arg(long)]
@@ -2392,6 +2409,21 @@ fn load_plan(toml: &Path, nix_plan: Option<&Path>) -> Result<nix_seal_core::Plan
 
 fn run_key(command: KeyCommand, json: bool) -> Result<()> {
     match command {
+        KeyCommand::List { plan } => {
+            let plan = read_plan_bounded(&plan)?;
+            let identities = public_identity_records(&plan);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema":"nix-seal.identities.v1","identities":identities})
+                );
+            } else {
+                for identity in identities {
+                    let PublicIdentityRecord { id, kind, public } = identity;
+                    println!("{id} {kind} {public}");
+                }
+            }
+        }
         KeyCommand::Generate { identity_out } => {
             let (identity, recipient) = nix_seal_crypto::generate_x25519();
             write_new_private(&identity_out, identity.expose_secret().as_bytes())?;
@@ -2429,6 +2461,27 @@ fn run_key(command: KeyCommand, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn public_identity_records(plan: &nix_seal_core::PlanV1) -> Vec<PublicIdentityRecord> {
+    plan.identities
+        .iter()
+        .map(|(id, identity)| PublicIdentityRecord {
+            id: id.as_str().to_owned(),
+            kind: identity_kind_name(&identity.kind),
+            public: identity.public.clone(),
+        })
+        .collect()
+}
+
+fn identity_kind_name(kind: &nix_seal_core::IdentityKind) -> &'static str {
+    match kind {
+        nix_seal_core::IdentityKind::Administrator => "administrator",
+        nix_seal_core::IdentityKind::Target => "target",
+        nix_seal_core::IdentityKind::Recovery => "recovery",
+        nix_seal_core::IdentityKind::Signer => "signer",
+        nix_seal_core::IdentityKind::Plugin => "plugin",
+    }
 }
 
 fn print_signing_key(key: &nix_seal_manifest::ApprovalSigningKey, path: &Path, json: bool) {
@@ -4249,6 +4302,31 @@ mod tests {
         let mut output = Vec::new();
         assert!(reader.read_to_end(&mut output).is_err());
         assert_eq!(output, b"ab");
+    }
+
+    #[test]
+    fn identity_inventory_contains_only_declared_public_plan_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, recipient) = nix_seal_crypto::generate_x25519();
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.identities.insert(
+            nix_seal_core::Id::parse("administrator")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: recipient.clone(),
+            },
+        );
+
+        let identities = public_identity_records(&plan);
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].id, "administrator");
+        assert_eq!(identities[0].kind, "administrator");
+        assert_eq!(identities[0].public, recipient);
+        assert_eq!(
+            serde_json::to_value(&identities)?[0]["kind"],
+            serde_json::Value::String("administrator".to_owned())
+        );
+        Ok(())
     }
 
     #[test]
