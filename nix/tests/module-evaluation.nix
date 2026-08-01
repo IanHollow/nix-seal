@@ -101,6 +101,17 @@ let
       }
     ];
   };
+  unsafeIdentityPath = inputs.nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = [
+      self.nixosModules.default
+      common
+      {
+        system.stateVersion = "26.05";
+        nixSeal.identityFile = lib.mkForce "/nix/store/public-target.identity";
+      }
+    ];
+  };
   home = inputs.home-manager.lib.homeManagerConfiguration {
     inherit pkgs;
     modules = [
@@ -212,6 +223,13 @@ in
     assert hasFailedAssertion "a nixSeal template output cannot collide with a secret runtime path"
       templatePolicyViolation;
     pkgs.runCommand "nix-seal-module-template-policy" { } ''
+      touch "$out"
+    '';
+  module-identity-policy =
+    assert hasFailedAssertion
+      "nixSeal.identityFile must be an absolute path outside /nix/store"
+      unsafeIdentityPath;
+    pkgs.runCommand "nix-seal-module-identity-policy" { } ''
       touch "$out"
     '';
 }

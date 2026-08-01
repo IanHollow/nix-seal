@@ -5,6 +5,9 @@ nix-darwin, and Home Manager. It stores standard age ciphertext in Git, builds a
 strict deterministic public policy plan, and activates plaintext only in
 restricted runtime directories.
 
+The target decryption identity is always an absolute out-of-store runtime path;
+the Nix modules reject relative paths and `/nix/store` paths for it.
+
 The validated `plan.v1` is the single policy authority.
 `nix-seal plan --target <id>` emits a canonical target-specific projection.
 Rekey and activation derive recipients, hashes, authorized secret/template sets,

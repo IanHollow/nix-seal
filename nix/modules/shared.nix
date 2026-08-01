@@ -21,6 +21,8 @@ let
   idIsValid =
     value: builtins.match "[a-z0-9._-]+(/[a-z0-9._-]+)*" value != null && !lib.hasInfix ".." value;
   idType = types.addCheck types.str idIsValid;
+  privateIdentityPathIsSafe =
+    value: lib.hasPrefix "/" value && !(lib.hasPrefix "/nix/store/" value);
   unitType = types.strMatching "[A-Za-z0-9_.@:-]{1,256}";
   serviceUnitType = types.strMatching "[A-Za-z0-9_.@:-]{1,247}\\.service";
   credentialNameType = types.addCheck (types.strMatching "[A-Za-z0-9_.@-]{1,255}") (
@@ -308,6 +310,10 @@ in
           {
             assertion = cfg.identityFile != null;
             message = "nixSeal.identityFile must name an out-of-store target identity when nix-seal is enabled";
+          }
+          {
+            assertion = cfg.identityFile == null || privateIdentityPathIsSafe cfg.identityFile;
+            message = "nixSeal.identityFile must be an absolute path outside /nix/store";
           }
           {
             assertion = cfg.planFile != null;
