@@ -41,10 +41,12 @@
           buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
           nativeCheckInputs = [
             pkgs.age
+            pkgs.openssh
             pkgs.rage
           ];
           preCheck = ''
             export NIX_SEAL_REQUIRE_INTEROP=1
+            export NIX_SEAL_REQUIRE_SSHSIG_INTEROP=1
             export NIX_SEAL_REQUIRE_CCTV=1
             export NIX_SEAL_CCTV_AGE_TESTDATA=${inputs.cctv}/age/testdata
           '';

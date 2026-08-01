@@ -1214,6 +1214,7 @@ mod tests {
     use std::collections::BTreeMap;
     const RECIPIENT: &str = "age1ml79lp4sk2gz59n3xux5xhasg7p5qa0pnm634rd8pnw80avag4js2etr0l";
     const SIGNER: &str = "nix-seal-ed25519-v1:EcFcZVkcYsuXdMDG2JyOsyuoCExdGk0yUwLVriY0Vyw=";
+    const SSH_SIGNER: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti release@example.com";
     #[test]
     fn empty_plan_is_stable_and_valid() -> Result<(), PolicyError> {
         let plan = PlanV1::default();
@@ -1360,6 +1361,21 @@ mod tests {
         );
         assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
         Ok(())
+    }
+
+    #[test]
+    fn signer_identities_accept_openssh_ed25519_approval_keys() -> Result<(), PolicyError> {
+        let mut plan = PlanV1::default();
+        let id =
+            Id::parse("ssh-signer").map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.identities.insert(
+            id,
+            Identity {
+                kind: IdentityKind::Signer,
+                public: SSH_SIGNER.to_owned(),
+            },
+        );
+        validate(&plan)
     }
 
     #[test]

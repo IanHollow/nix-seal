@@ -5,6 +5,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use nix_seal_core::Id;
 use serde::{Deserialize, Serialize};
+use ssh_key::{
+    Algorithm as SshAlgorithm, HashAlg, LineEnding, PrivateKey as SshPrivateKey,
+    PublicKey as SshPublicKey, SshSig,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
@@ -19,6 +23,8 @@ pub const PRIVATE_KEY_PREFIX: &str = "NIX-SEAL-ED25519-PRIVATE-v1:";
 pub const PUBLIC_KEY_PREFIX: &str = "nix-seal-ed25519-v1:";
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_SIGNATURES: usize = 256;
+const MAX_SIGNATURE_BYTES: usize = 32 * 1024;
+const SSH_SIGNATURE_NAMESPACE: &str = "nix-seal-artifact-v2";
 
 /// Public metadata cryptographically bound to one target ciphertext.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -56,8 +62,28 @@ pub struct TargetManifestV2 {
 pub struct EnvelopeSignature {
     /// Stable fingerprint of the signing key.
     pub key_id: String,
-    /// Base64-encoded strict Ed25519 signature.
+    /// Versioned signature encoding. Omitted fields in legacy envelopes are
+    /// strict native Ed25519 signatures.
+    #[serde(default, skip_serializing_if = "is_native_ed25519_signature")]
+    pub algorithm: ApprovalSignatureAlgorithm,
+    /// Base64-encoded native signature or PEM-encoded OpenSSH `sshsig`.
     pub signature: String,
+}
+
+/// The public signature representation carried by an approval envelope.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalSignatureAlgorithm {
+    /// The project's compact native Ed25519 representation.
+    #[default]
+    Ed25519V1,
+    /// An OpenSSH Ed25519 `sshsig` envelope under the nix-seal namespace.
+    SshEd25519SshsigV1,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // required by serde's `skip_serializing_if` callback.
+fn is_native_ed25519_signature(algorithm: &ApprovalSignatureAlgorithm) -> bool {
+    *algorithm == ApprovalSignatureAlgorithm::Ed25519V1
 }
 
 /// DSSE-compatible JSON envelope containing a canonical manifest payload.
@@ -72,58 +98,122 @@ pub struct SignedEnvelopeV1 {
     pub signatures: Vec<EnvelopeSignature>,
 }
 
-/// Private Ed25519 approval key whose bytes are zeroized on drop.
-pub struct ApprovalSigningKey(SigningKey);
+/// Private approval key whose secret material is zeroized on drop.
+///
+/// Native keys are encoded with [`PRIVATE_KEY_PREFIX`]. OpenSSH input is
+/// restricted to an unencrypted `ssh-ed25519` private key; agent, FIDO and
+/// other SSH algorithms are deliberately rejected until their protocols have
+/// a dedicated security review.
+pub enum ApprovalSigningKey {
+    /// Project-native Ed25519 signing key.
+    Ed25519(SigningKey),
+    /// Interoperable OpenSSH Ed25519 signing key.
+    SshEd25519(SshPrivateKey),
+}
 
 impl ApprovalSigningKey {
     /// Generates a key from the operating system CSPRNG.
     pub fn generate() -> Result<Self, ManifestError> {
         let mut bytes = Zeroizing::new([0_u8; 32]);
         getrandom::fill(bytes.as_mut()).map_err(|_| ManifestError::Random)?;
-        Ok(Self(SigningKey::from_bytes(&bytes)))
+        Ok(Self::Ed25519(SigningKey::from_bytes(&bytes)))
     }
 
-    /// Parses the versioned private-key encoding.
+    /// Parses a native key or an unencrypted OpenSSH Ed25519 private key.
     pub fn parse(encoded: &str) -> Result<Self, ManifestError> {
         let value = encoded.trim();
-        let body = value
-            .strip_prefix(PRIVATE_KEY_PREFIX)
-            .ok_or(ManifestError::PrivateKeyFormat)?;
-        let mut decoded = Zeroizing::new(
-            STANDARD
-                .decode(body)
-                .map_err(|_| ManifestError::PrivateKeyFormat)?,
-        );
-        let bytes = Zeroizing::new(
-            decoded
-                .as_slice()
-                .try_into()
-                .map_err(|_| ManifestError::PrivateKeyFormat)?,
-        );
-        decoded.zeroize();
-        Ok(Self(SigningKey::from_bytes(&bytes)))
+        if let Some(body) = value.strip_prefix(PRIVATE_KEY_PREFIX) {
+            let mut decoded = Zeroizing::new(
+                STANDARD
+                    .decode(body)
+                    .map_err(|_| ManifestError::PrivateKeyFormat)?,
+            );
+            let bytes = Zeroizing::new(
+                decoded
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| ManifestError::PrivateKeyFormat)?,
+            );
+            decoded.zeroize();
+            return Ok(Self::Ed25519(SigningKey::from_bytes(&bytes)));
+        }
+
+        let key = SshPrivateKey::from_openssh(value.as_bytes())
+            .map_err(|_| ManifestError::PrivateKeyFormat)?;
+        if key.is_encrypted() || key.algorithm() != SshAlgorithm::Ed25519 {
+            return Err(ManifestError::PrivateKeyFormat);
+        }
+        Ok(Self::SshEd25519(key))
     }
 
-    /// Returns a versioned private-key encoding for initial persistence.
-    #[must_use]
-    pub fn encode_private(&self) -> Zeroizing<String> {
-        let bytes = Zeroizing::new(self.0.to_bytes());
-        Zeroizing::new(format!(
-            "{PRIVATE_KEY_PREFIX}{}",
-            STANDARD.encode(bytes.as_slice())
-        ))
+    /// Returns a versioned native private-key encoding for initial persistence.
+    ///
+    /// Imported SSH private keys are never re-encoded or written by nix-seal.
+    pub fn encode_private(&self) -> Result<Zeroizing<String>, ManifestError> {
+        match self {
+            Self::Ed25519(key) => {
+                let bytes = Zeroizing::new(key.to_bytes());
+                Ok(Zeroizing::new(format!(
+                    "{PRIVATE_KEY_PREFIX}{}",
+                    STANDARD.encode(bytes.as_slice())
+                )))
+            }
+            Self::SshEd25519(_) => Err(ManifestError::PrivateKeyFormat),
+        }
     }
 
     /// Returns the public key encoding.
-    #[must_use]
-    pub fn encode_public(&self) -> String {
-        encode_public_key(&self.0.verifying_key())
+    pub fn encode_public(&self) -> Result<String, ManifestError> {
+        match self {
+            Self::Ed25519(key) => Ok(encode_public_key(&key.verifying_key())),
+            Self::SshEd25519(key) => normalize_ssh_public_key(key.public_key()),
+        }
     }
 
     /// Returns the stable public key identifier.
+    pub fn key_id(&self) -> Result<String, ManifestError> {
+        match self {
+            Self::Ed25519(key) => Ok(native_key_id(&key.verifying_key())),
+            Self::SshEd25519(key) => ssh_key_id(key.public_key()),
+        }
+    }
+
+    /// Returns whether this key matches one configured public approval key.
     #[must_use]
-    pub fn key_id(&self) -> String {
-        key_id(&self.0.verifying_key())
+    pub fn matches_public_key(&self, encoded: &str) -> bool {
+        let Ok(signing_key_id) = self.key_id() else {
+            return false;
+        };
+        parse_public_key(encoded)
+            .is_ok_and(|key| key.key_id().is_ok_and(|key_id| key_id == signing_key_id))
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<EnvelopeSignature, ManifestError> {
+        match self {
+            Self::Ed25519(key) => {
+                let signature = key.sign(message);
+                Ok(EnvelopeSignature {
+                    key_id: native_key_id(&key.verifying_key()),
+                    algorithm: ApprovalSignatureAlgorithm::Ed25519V1,
+                    signature: STANDARD.encode(signature.to_bytes()),
+                })
+            }
+            Self::SshEd25519(key) => {
+                let signature = key
+                    .sign(SSH_SIGNATURE_NAMESPACE, HashAlg::Sha512, message)
+                    .map_err(|_| ManifestError::InvalidSignature)?
+                    .to_pem(LineEnding::LF)
+                    .map_err(|_| ManifestError::InvalidSignature)?;
+                if signature.len() > MAX_SIGNATURE_BYTES {
+                    return Err(ManifestError::Limit);
+                }
+                Ok(EnvelopeSignature {
+                    key_id: ssh_key_id(key.public_key())?,
+                    algorithm: ApprovalSignatureAlgorithm::SshEd25519SshsigV1,
+                    signature,
+                })
+            }
+        }
     }
 }
 
@@ -165,7 +255,23 @@ pub struct VerifiedManifest {
 
 /// Explicit set of trusted approval verification keys.
 #[derive(Default)]
-pub struct TrustedKeys(BTreeMap<String, VerifyingKey>);
+pub struct TrustedKeys(BTreeMap<String, ApprovalVerificationKey>);
+
+enum ApprovalVerificationKey {
+    /// Project-native Ed25519 verifier.
+    Ed25519(VerifyingKey),
+    /// Interoperable OpenSSH Ed25519 verifier.
+    SshEd25519(SshPublicKey),
+}
+
+impl ApprovalVerificationKey {
+    fn key_id(&self) -> Result<String, ManifestError> {
+        match self {
+            Self::Ed25519(key) => Ok(native_key_id(key)),
+            Self::SshEd25519(key) => ssh_key_id(key),
+        }
+    }
+}
 
 impl TrustedKeys {
     /// Creates an empty trust set.
@@ -177,7 +283,7 @@ impl TrustedKeys {
     /// Parses and inserts one public key, rejecting duplicates.
     pub fn insert_encoded(&mut self, encoded: &str) -> Result<String, ManifestError> {
         let key = parse_public_key(encoded)?;
-        let id = key_id(&key);
+        let id = key.key_id()?;
         if self.0.insert(id.clone(), key).is_some() {
             return Err(ManifestError::DuplicateTrustedKey);
         }
@@ -241,19 +347,26 @@ pub enum ManifestError {
     InvalidSignature,
 }
 
-fn parse_public_key(encoded: &str) -> Result<VerifyingKey, ManifestError> {
-    let body = encoded
-        .trim()
-        .strip_prefix(PUBLIC_KEY_PREFIX)
-        .ok_or(ManifestError::PublicKeyFormat)?;
-    let decoded = STANDARD
-        .decode(body)
-        .map_err(|_| ManifestError::PublicKeyFormat)?;
-    let bytes: [u8; 32] = decoded
-        .as_slice()
-        .try_into()
-        .map_err(|_| ManifestError::PublicKeyFormat)?;
-    VerifyingKey::from_bytes(&bytes).map_err(|_| ManifestError::PublicKeyFormat)
+fn parse_public_key(encoded: &str) -> Result<ApprovalVerificationKey, ManifestError> {
+    let value = encoded.trim();
+    if let Some(body) = value.strip_prefix(PUBLIC_KEY_PREFIX) {
+        let decoded = STANDARD
+            .decode(body)
+            .map_err(|_| ManifestError::PublicKeyFormat)?;
+        let bytes: [u8; 32] = decoded
+            .as_slice()
+            .try_into()
+            .map_err(|_| ManifestError::PublicKeyFormat)?;
+        return VerifyingKey::from_bytes(&bytes)
+            .map(ApprovalVerificationKey::Ed25519)
+            .map_err(|_| ManifestError::PublicKeyFormat);
+    }
+
+    let key = SshPublicKey::from_openssh(value).map_err(|_| ManifestError::PublicKeyFormat)?;
+    if key.algorithm() != SshAlgorithm::Ed25519 {
+        return Err(ManifestError::PublicKeyFormat);
+    }
+    Ok(ApprovalVerificationKey::SshEd25519(key))
 }
 
 /// Validates one versioned public approval verification key without retaining it.
@@ -266,11 +379,32 @@ fn encode_public_key(key: &VerifyingKey) -> String {
     format!("{PUBLIC_KEY_PREFIX}{}", STANDARD.encode(key.as_bytes()))
 }
 
-fn key_id(key: &VerifyingKey) -> String {
+fn native_key_id(key: &VerifyingKey) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"nix-seal.ed25519-key-id.v1\0");
     hasher.update(key.as_bytes());
     format!("ed25519:{}", hasher.finalize().to_hex())
+}
+
+fn normalize_ssh_public_key(key: &SshPublicKey) -> Result<String, ManifestError> {
+    let encoded = key
+        .to_openssh()
+        .map_err(|_| ManifestError::PublicKeyFormat)?;
+    let mut fields = encoded.split_ascii_whitespace();
+    let algorithm = fields.next().ok_or(ManifestError::PublicKeyFormat)?;
+    let body = fields.next().ok_or(ManifestError::PublicKeyFormat)?;
+    if algorithm != "ssh-ed25519" {
+        return Err(ManifestError::PublicKeyFormat);
+    }
+    Ok(format!("{algorithm} {body}"))
+}
+
+fn ssh_key_id(key: &SshPublicKey) -> Result<String, ManifestError> {
+    let encoded = normalize_ssh_public_key(key)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"nix-seal.ssh-ed25519-key-id.v1\0");
+    hasher.update(encoded.as_bytes());
+    Ok(format!("ssh-ed25519:{}", hasher.finalize().to_hex()))
 }
 
 /// Creates an envelope with one signature.
@@ -284,14 +418,10 @@ pub fn sign_manifest(
         return Err(ManifestError::Limit);
     }
     let message = pae(PAYLOAD_TYPE.as_bytes(), &payload)?;
-    let signature = key.0.sign(&message);
     Ok(SignedEnvelopeV1 {
         payload_type: PAYLOAD_TYPE.to_owned(),
         payload: STANDARD.encode(payload),
-        signatures: vec![EnvelopeSignature {
-            key_id: key.key_id(),
-            signature: STANDARD.encode(signature.to_bytes()),
-        }],
+        signatures: vec![key.sign(&message)?],
     })
 }
 
@@ -304,15 +434,12 @@ pub fn add_signature(
     if envelope.signatures.len() >= MAX_SIGNATURES {
         return Err(ManifestError::Limit);
     }
-    let id = key.key_id();
+    let signature = key.sign(&message)?;
+    let id = signature.key_id.clone();
     if envelope.signatures.iter().any(|entry| entry.key_id == id) {
         return Err(ManifestError::DuplicateSigner);
     }
-    let signature = key.0.sign(&message);
-    envelope.signatures.push(EnvelopeSignature {
-        key_id: id,
-        signature: STANDARD.encode(signature.to_bytes()),
-    });
+    envelope.signatures.push(signature);
     // Ensure the decoded canonical payload is retained and no alternate base64 is propagated.
     envelope.payload = STANDARD.encode(payload);
     Ok(())
@@ -339,13 +466,30 @@ pub fn verify(
             .0
             .get(&entry.key_id)
             .ok_or(ManifestError::UntrustedSigner)?;
-        let bytes = STANDARD
-            .decode(&entry.signature)
-            .map_err(|_| ManifestError::InvalidSignature)?;
-        let signature =
-            Signature::from_slice(&bytes).map_err(|_| ManifestError::InvalidSignature)?;
-        key.verify_strict(&message, &signature)
-            .map_err(|_| ManifestError::InvalidSignature)?;
+        match (entry.algorithm, key) {
+            (ApprovalSignatureAlgorithm::Ed25519V1, ApprovalVerificationKey::Ed25519(key)) => {
+                let bytes = STANDARD
+                    .decode(&entry.signature)
+                    .map_err(|_| ManifestError::InvalidSignature)?;
+                let signature =
+                    Signature::from_slice(&bytes).map_err(|_| ManifestError::InvalidSignature)?;
+                key.verify_strict(&message, &signature)
+                    .map_err(|_| ManifestError::InvalidSignature)?;
+            }
+            (
+                ApprovalSignatureAlgorithm::SshEd25519SshsigV1,
+                ApprovalVerificationKey::SshEd25519(key),
+            ) => {
+                let signature = SshSig::from_pem(entry.signature.as_bytes())
+                    .map_err(|_| ManifestError::InvalidSignature)?;
+                if signature.algorithm() != SshAlgorithm::Ed25519 {
+                    return Err(ManifestError::InvalidSignature);
+                }
+                key.verify(SSH_SIGNATURE_NAMESPACE, &message, &signature)
+                    .map_err(|_| ManifestError::InvalidSignature)?;
+            }
+            _ => return Err(ManifestError::InvalidSignature),
+        }
     }
     if signers.len() < threshold {
         return Err(ManifestError::Threshold);
@@ -368,6 +512,11 @@ fn decode_envelope(
         return Err(ManifestError::Version);
     }
     if envelope.signatures.len() > MAX_SIGNATURES {
+        return Err(ManifestError::Limit);
+    }
+    if envelope.signatures.iter().any(|signature| {
+        signature.key_id.is_empty() || signature.signature.len() > MAX_SIGNATURE_BYTES
+    }) {
         return Err(ManifestError::Limit);
     }
     let payload = STANDARD
@@ -470,6 +619,22 @@ fn pae(payload_type: &[u8], payload: &[u8]) -> Result<Vec<u8>, ManifestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        env, fs,
+        io::{self, Write},
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        process::{Command, Stdio},
+    };
+
+    const SSH_ED25519_PRIVATE_KEY: &str = "-----BEGIN_OPENSSH_PRIVATE_KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+QyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYgAAAJgAIAxdACAM\n\
+XQAAAAtzc2gtZWQyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYg\n\
+AAAEC2BsIi0QwW2uFscKTUUXNHLsYX4FxlaSDSblbAj7WR7bM+rvN+ot98qgEN796jTiQf\n\
+ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
+-----END_OPENSSH_PRIVATE_KEY-----\n";
+    const SSH_ED25519_PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti user@example.com";
 
     fn manifest() -> TargetManifestV2 {
         let digest = "0".repeat(64);
@@ -508,11 +673,26 @@ mod tests {
     fn trust(keys: &[&ApprovalSigningKey]) -> TrustedKeys {
         let mut trusted = TrustedKeys::new();
         for key in keys {
+            let public = key
+                .encode_public()
+                .unwrap_or_else(|error| unreachable!("{error}"));
             trusted
-                .insert_encoded(&key.encode_public())
+                .insert_encoded(&public)
                 .unwrap_or_else(|error| unreachable!("{error}"));
         }
         trusted
+    }
+
+    fn ssh_keygen_path(required: bool) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+        let candidate = env::var_os("PATH").and_then(|paths| {
+            env::split_paths(&paths)
+                .map(|directory| directory.join("ssh-keygen"))
+                .find(|candidate| candidate.is_file())
+        });
+        if candidate.is_none() && required {
+            return Err("ssh-keygen is required for SSHSIG interoperability tests".into());
+        }
+        Ok(candidate)
     }
 
     #[test]
@@ -531,6 +711,130 @@ mod tests {
             .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(verified.manifest, manifest);
         assert_eq!(verified.signers.len(), 2);
+    }
+
+    #[test]
+    fn verifies_openssh_ed25519_sshsig_and_normalizes_comments() {
+        let key = ApprovalSigningKey::parse(&SSH_ED25519_PRIVATE_KEY.replace('_', " "))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let manifest = manifest();
+        let envelope =
+            sign_manifest(&manifest, &key).unwrap_or_else(|error| unreachable!("{error}"));
+
+        assert_eq!(
+            envelope.signatures[0].algorithm,
+            ApprovalSignatureAlgorithm::SshEd25519SshsigV1
+        );
+        assert!(
+            envelope.signatures[0]
+                .signature
+                .starts_with("-----BEGIN SSH SIGNATURE-----\n")
+        );
+        assert_eq!(
+            key.encode_public()
+                .unwrap_or_else(|error| unreachable!("{error}")),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti"
+        );
+        assert!(key.matches_public_key(SSH_ED25519_PUBLIC_KEY));
+
+        let mut trusted = TrustedKeys::new();
+        trusted
+            .insert_encoded(SSH_ED25519_PUBLIC_KEY)
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let verified = verify(&envelope, &trusted, 1, &expected(&manifest))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(verified.manifest, manifest);
+
+        let mut wrong_algorithm = envelope;
+        wrong_algorithm.signatures[0].algorithm = ApprovalSignatureAlgorithm::Ed25519V1;
+        assert_eq!(
+            verify(&wrong_algorithm, &trusted, 1, &expected(&manifest)),
+            Err(ManifestError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn sshsig_interoperates_with_openssh_when_required() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(ssh_keygen) =
+            ssh_keygen_path(env::var_os("NIX_SEAL_REQUIRE_SSHSIG_INTEROP").is_some())?
+        else {
+            return Ok(());
+        };
+        let private = SSH_ED25519_PRIVATE_KEY.replace('_', " ");
+        let key = ApprovalSigningKey::parse(&private)?;
+        let manifest = manifest();
+        let envelope = sign_manifest(&manifest, &key)?;
+        let (_, _, message) = decode_envelope(&envelope)?;
+        let temporary = tempfile::tempdir()?;
+        let private_path = temporary.path().join("id_ed25519");
+        let allowed_signers = temporary.path().join("allowed-signers");
+        let message_path = temporary.path().join("message");
+        let signature_path = temporary.path().join("nix-seal.sshsig");
+
+        fs::write(&private_path, private.as_bytes())?;
+        fs::set_permissions(&private_path, fs::Permissions::from_mode(0o600))?;
+        fs::write(
+            &allowed_signers,
+            format!("release {SSH_ED25519_PUBLIC_KEY}\n"),
+        )?;
+        fs::write(&message_path, &message)?;
+        fs::write(&signature_path, envelope.signatures[0].signature.as_bytes())?;
+
+        let mut verify = Command::new(&ssh_keygen)
+            .args([
+                "-Y",
+                "verify",
+                "-f",
+                allowed_signers
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("non-UTF-8 test path"))?,
+                "-I",
+                "release",
+                "-n",
+                SSH_SIGNATURE_NAMESPACE,
+                "-s",
+                signature_path
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("non-UTF-8 test path"))?,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        verify
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("SSH verification stdin unavailable"))?
+            .write_all(&message)?;
+        assert!(verify.wait()?.success());
+
+        let signed = Command::new(&ssh_keygen)
+            .args([
+                "-Y",
+                "sign",
+                "-f",
+                private_path
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("non-UTF-8 test path"))?,
+                "-n",
+                SSH_SIGNATURE_NAMESPACE,
+                message_path
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("non-UTF-8 test path"))?,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        assert!(signed.success());
+        let openssh_signature = fs::read_to_string(message_path.with_extension("sig"))?;
+        let openssh_signature = SshSig::from_pem(openssh_signature.as_bytes())
+            .map_err(|_| io::Error::other("OpenSSH produced an invalid SSHSIG"))?;
+        let public = SshPublicKey::from_openssh(SSH_ED25519_PUBLIC_KEY)
+            .map_err(|_| io::Error::other("invalid SSH test public key"))?;
+        public
+            .verify(SSH_SIGNATURE_NAMESPACE, &message, &openssh_signature)
+            .map_err(|_| io::Error::other("OpenSSH SSHSIG verification failed"))?;
+        Ok(())
     }
 
     #[test]
@@ -669,9 +973,17 @@ mod tests {
     #[test]
     fn private_encoding_round_trips_without_debug_exposure() {
         let key = ApprovalSigningKey::generate().unwrap_or_else(|error| unreachable!("{error}"));
-        let encoded = key.encode_private();
+        let encoded = key
+            .encode_private()
+            .unwrap_or_else(|error| unreachable!("{error}"));
         let reparsed =
             ApprovalSigningKey::parse(&encoded).unwrap_or_else(|error| unreachable!("{error}"));
-        assert_eq!(key.encode_public(), reparsed.encode_public());
+        assert_eq!(
+            key.encode_public()
+                .unwrap_or_else(|error| unreachable!("{error}")),
+            reparsed
+                .encode_public()
+                .unwrap_or_else(|error| unreachable!("{error}"))
+        );
     }
 }
