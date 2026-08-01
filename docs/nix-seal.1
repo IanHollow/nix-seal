@@ -26,6 +26,14 @@ The \fBsecret create\fR, \fBsecret import\fR, \fBsecret edit\fR, and
 \fBdotenv\fR to validate a bounded logical collection before it is encrypted.
 The original bytes are retained. dotenv validation accepts only unique
 shell-compatible \fBKEY=VALUE\fR entries and does not evaluate shell syntax.
+.PP
+Generator prompts are non-interactive by default and must be supplied through
+owner-only \fB--prompt-file ID=PATH\fR inputs. The explicit
+\fBgenerate --interactive\fR mode reads missing prompts only from a verified
+controlling \fB/dev/tty\fR, masks hidden prompts with terminal settings restored
+on failure, bounds responses to 1 MiB, and never places prompt values in argv,
+the environment, the plan, or logs. Single-line prompts finish with Enter;
+multiline prompts finish with Ctrl-D.
 .SH COMMANDS
 .TP
 .B init
