@@ -164,6 +164,11 @@ Rotation requires `--yes` and deliberately invalidates old artifacts, so it
 reports that rekeying and approval are required. Nix-emitted plan sources are
 validation inputs and are never rewritten by these commands.
 
+`nix-seal group add|list|remove` uses the same transaction path for named
+administrator or consumer groups. Group creation requires explicit members;
+removal requires `--yes` and fails while another group or a secret's
+administrator/consumer policy still references it.
+
 ## Built-in generation
 
 `nix-seal generate` follows the public plan, derives the canonical recipients,
