@@ -4,10 +4,10 @@ Status: accepted; rekey/cache transaction and Nix import bridge implemented
 
 Target artifacts live in a content-addressed XDG cache and ciphertext-only Nix
 store imports, never Git by default. Rekey is an explicit impure preparation
-step; Nix evaluation fails safely when an expected object is absent. Transactions use
-private same-filesystem temporary files, locks, fsync, content verification, and
-atomic rename. Cache export/import carries ciphertext and public signed
-metadata.
+step; Nix evaluation fails safely when an expected object is absent.
+Transactions use private same-filesystem temporary files, locks, fsync, content
+verification, and atomic rename. Cache export/import carries ciphertext and
+public signed metadata.
 
 The v1 implementation streams administrator plaintext directly from the age
 decryptor into target age encryption. It copies canonical ciphertext into a
