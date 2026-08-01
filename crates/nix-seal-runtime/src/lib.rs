@@ -2318,6 +2318,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn rejects_hard_linked_artifact_before_decryption() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = fixture()?;
+        let link = fixture.temporary.path().join("linked.age");
+        std::fs::hard_link(&fixture.ciphertext, &link)?;
+        let artifact = owned_artifact(&fixture, &link, &fixture.secret_id);
+        let request = ActivationRequest {
+            runtime_root: &fixture.runtime,
+            runtime_generation: Some(1),
+            plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
+            target_id: &fixture.target_id,
+            recipient_fingerprint: &fixture.fingerprint,
+            tool_version: "0.1.0-alpha.1",
+            now: 101,
+            allowed_clock_skew: 0,
+            target_identity: &fixture.target_identity,
+            artifacts: std::slice::from_ref(&artifact),
+            templates: &[],
+            post_switch: None,
+        };
+        assert!(matches!(
+            activate(&request),
+            Err(RuntimeError::UnsafeSource)
+        ));
+        assert!(!fixture.runtime.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rejects_symlinked_runtime_roots_and_current_target_traversal()
     -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::symlink;
