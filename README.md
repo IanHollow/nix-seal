@@ -198,6 +198,8 @@ nix-seal migrate agenix --directory ./secrets --json
 nix-seal migrate ragenix --directory ./secrets --json
 # inspect structured SOPS JSON metadata without decrypting values or invoking SOPS
 nix-seal migrate sops-json --directory ./secrets --json
+# inventory Clan's documented per-machine output leaves without reading values
+nix-seal migrate clan-vars --directory ./vars/per-machine --json
 # First inspect the mutation; then add --execute to stream-reencrypt it.
 nix-seal migrate ciphertext --source legacy/token.age --destination secrets/token.age \
   --identity /absolute/path/to/administrator.age --recipient age1... --json
@@ -249,6 +251,14 @@ groups, then reports public provider types. It does not decrypt or authenticate
 the document values; structured extraction and SOPS invocation remain an
 explicit later migration step. YAML, dotenv, INI, and binary SOPS inputs are not
 silently treated as JSON.
+
+`migrate clan-vars` recognizes only the documented
+`vars/per-machine/<machine>/<generator>/<output>/value` leaves. It validates the
+complete filesystem walk without following links, reports paths and byte counts,
+and never reads, decrypts, prints, or passes a value to another process. Clan
+storage backend, secret/public classification, target authorization, and runtime
+policy are not encoded by those leaves, so they must be supplied in a reviewed
+mapping before import.
 
 ## Development
 

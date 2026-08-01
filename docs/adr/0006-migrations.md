@@ -20,6 +20,11 @@ cleartext metadata (including provider and age-recipient declarations) without
 decrypting values or invoking SOPS. Structured extraction and mutation remain
 separate, explicit operations.
 
+Clan Vars inspection recognizes the documented per-machine output layout and
+never reads values. Because the filesystem leaves do not authoritatively encode
+the storage backend, secrecy classification, target selection, or runtime
+policy, importing a value requires an explicit reviewed mapping.
+
 Adapters for agenix-rekey metadata, SOPS/sops-nix, and Clan Vars/Facts remain
 planned. Their format-specific policy mapping must be reviewed before any
 mutation path is added. Removal of a source manager is a separate explicit

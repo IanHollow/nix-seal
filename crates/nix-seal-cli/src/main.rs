@@ -403,6 +403,12 @@ enum MigrateCommand {
         #[arg(long, default_value = "secrets")]
         directory: PathBuf,
     },
+    /// Inspect Clan Vars per-machine output leaves without reading their values.
+    ClanVars {
+        /// Clan's `vars/per-machine` directory.
+        #[arg(long, default_value = "vars/per-machine")]
+        directory: PathBuf,
+    },
     /// Stream one legacy age ciphertext into explicit new recipients.
     Ciphertext {
         /// Existing repository root; source and destination must remain below it.
@@ -794,6 +800,7 @@ fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
         MigrateCommand::Agenix { directory } => migrate_agenix_tree(&directory, "agenix", json),
         MigrateCommand::Ragenix { directory } => migrate_agenix_tree(&directory, "ragenix", json),
         MigrateCommand::SopsJson { directory } => migrate_sops_json_tree(&directory, json),
+        MigrateCommand::ClanVars { directory } => migrate_clan_vars_tree(&directory, json),
         MigrateCommand::Ciphertext {
             repository_root,
             source,
@@ -1197,6 +1204,165 @@ fn inspect_sops_json(path: &Path) -> Result<SopsJsonInventory> {
         path: path.to_owned(),
         providers,
         age_recipient_count,
+    })
+}
+
+struct ClanVarInventory {
+    path: PathBuf,
+    machine: String,
+    generator: String,
+    output: String,
+    bytes: u64,
+}
+
+/// Inventories Clan Vars' documented `machine/generator/file/value` leaves
+/// without opening a value for reading. A Clan store may use SOPS, a password
+/// store, or a custom backend, so byte content is intentionally opaque here.
+fn migrate_clan_vars_tree(directory: &Path, json: bool) -> Result<()> {
+    let supplied_metadata = fs::symlink_metadata(directory)
+        .context("could not inspect Clan Vars per-machine directory")?;
+    if supplied_metadata.file_type().is_symlink() || !supplied_metadata.file_type().is_dir() {
+        bail!("Clan Vars root must be a non-symlink directory");
+    }
+    let root = directory
+        .canonicalize()
+        .context("could not resolve Clan Vars per-machine directory")?;
+    let mut values = Vec::new();
+    let mut auxiliary_files = 0_u64;
+    scan_clan_vars_files(&root, &root, &mut values, &mut auxiliary_files)?;
+    if values.is_empty() {
+        bail!("Clan Vars per-machine directory contains no output value files");
+    }
+    let mut seen_ids = BTreeSet::new();
+    let mappings = values
+        .iter()
+        .map(|entry| {
+            let id = migrated_id(&format!(
+                "clan-vars/{}/{}/{}",
+                entry.machine, entry.generator, entry.output
+            ))?;
+            if !seen_ids.insert(id.clone()) {
+                bail!("Clan Vars paths collide after nix-seal ID normalization");
+            }
+            let relative = entry
+                .path
+                .strip_prefix(&root)
+                .context("Clan Vars value escaped its canonical root")?;
+            Ok(serde_json::json!({
+                "legacyId":format!("{}/{}/{}", entry.machine, entry.generator, entry.output),
+                "nixSealId":id,
+                "source":relative,
+                "valueBytes":entry.bytes,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let warnings = vec![
+        "dry run only: no value, configuration, or source manager was changed",
+        "Clan Vars storage backend and secret/public classification are not recoverable from an output leaf; provide explicit target, recipient, runtime, and public-output mappings before import",
+        "output values were never read, decrypted, emitted, or passed to an external process",
+        "auxiliary regular files were ignored after link/type validation; only machine/generator/output/value leaves are migration candidates",
+    ];
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.migration-report.v1",
+                "source":"clan-vars",
+                "dryRun":true,
+                "values":mappings,
+                "auxiliaryFileCount":auxiliary_files,
+                "warnings":warnings
+            })
+        );
+    } else {
+        println!("clan-vars dry-run: {} value leaves mapped", mappings.len());
+        for warning in warnings {
+            eprintln!("warning: {warning}");
+        }
+        for mapping in mappings {
+            println!(
+                "{} -> {} ({})",
+                mapping["legacyId"].as_str().unwrap_or("unknown"),
+                mapping["nixSealId"].as_str().unwrap_or("unknown"),
+                mapping["source"].as_str().unwrap_or("unknown"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn scan_clan_vars_files(
+    root: &Path,
+    directory: &Path,
+    values: &mut Vec<ClanVarInventory>,
+    auxiliary_files: &mut u64,
+) -> Result<()> {
+    if values.len() >= 10_000 || *auxiliary_files >= 10_000 {
+        bail!("Clan Vars tree exceeds the 10000-file safety limit");
+    }
+    let mut entries = fs::read_dir(directory)
+        .with_context(|| format!("could not read Clan Vars directory {}", directory.display()))?
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            bail!("Clan Vars tree contains a symlink");
+        }
+        let relative = path.strip_prefix(root)?;
+        if relative.components().count() > 4 {
+            bail!("Clan Vars path nesting exceeds the documented layout");
+        }
+        if metadata.file_type().is_dir() {
+            scan_clan_vars_files(root, &path, values, auxiliary_files)?;
+        } else if metadata.file_type().is_file() {
+            if entry.file_name() == "value" && relative.components().count() == 4 {
+                values.push(inspect_clan_var_value(&path, relative)?);
+            } else {
+                *auxiliary_files = auxiliary_files
+                    .checked_add(1)
+                    .context("Clan Vars auxiliary file count overflow")?;
+            }
+        } else {
+            bail!("Clan Vars tree contains a non-regular entry");
+        }
+    }
+    Ok(())
+}
+
+fn inspect_clan_var_value(path: &Path, relative: &Path) -> Result<ClanVarInventory> {
+    const LIMIT: u64 = 64 * 1024 * 1024;
+    let input = open_public_ciphertext(path).with_context(|| {
+        format!(
+            "Clan Vars value {} has unsafe filesystem metadata",
+            path.display()
+        )
+    })?;
+    let bytes = input.metadata()?.len();
+    if bytes > LIMIT {
+        bail!("Clan Vars value exceeds the 64 MiB safety limit");
+    }
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str().map(ToOwned::to_owned),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .context("Clan Vars value has an unsafe or non-UTF-8 path")?;
+    let [machine, generator, output, value] = components.as_slice() else {
+        bail!("Clan Vars value has an invalid path layout");
+    };
+    if value != "value" || machine.is_empty() || generator.is_empty() || output.is_empty() {
+        bail!("Clan Vars value has an invalid path layout");
+    }
+    Ok(ClanVarInventory {
+        path: path.to_owned(),
+        machine: machine.clone(),
+        generator: generator.clone(),
+        output: output.clone(),
+        bytes,
     })
 }
 
@@ -3880,6 +4046,35 @@ mod tests {
 
         std::fs::write(directory.join("not-sops.json"), b"{}")?;
         assert!(scan_sops_json_files(&canonical, &canonical, &mut Vec::new()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn clan_vars_migration_inventories_value_leaves_without_reading_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("vars/per-machine");
+        let value = root.join("desktop/service-token/api-token/value");
+        std::fs::create_dir_all(value.parent().ok_or("value parent")?)?;
+        std::fs::write(&value, b"opaque-clan-var-fixture")?;
+        std::fs::write(
+            root.join("desktop/service-token/.validation.json"),
+            b"public auxiliary metadata",
+        )?;
+        let canonical = root.canonicalize()?;
+        let mut discovered = Vec::new();
+        let mut auxiliary = 0;
+        scan_clan_vars_files(&canonical, &canonical, &mut discovered, &mut auxiliary)?;
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(auxiliary, 1);
+        assert_eq!(discovered[0].machine, "desktop");
+        assert_eq!(discovered[0].generator, "service-token");
+        assert_eq!(discovered[0].output, "api-token");
+        assert_eq!(discovered[0].bytes, 23);
+        assert_eq!(
+            migrated_id("clan-vars/desktop/service-token/api-token")?.as_str(),
+            "clan-vars/desktop/service-token/api-token"
+        );
         Ok(())
     }
 
