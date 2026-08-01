@@ -10,16 +10,25 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4.12"
 nix-seal-core = { path = "../crates/nix-seal-core" }
+nix-seal-cache = { path = "../crates/nix-seal-cache" }
 nix-seal-crypto = { path = "../crates/nix-seal-crypto" }
 nix-seal-manifest = { path = "../crates/nix-seal-manifest" }
 nix-seal-policy = { path = "../crates/nix-seal-policy" }
 nix-seal-runtime = { path = "../crates/nix-seal-runtime" }
 secrecy = "0.10"
 serde_json = "1.0"
+tempfile = "3"
 
 [[bin]]
 name = "plan-v1"
 path = "fuzz_targets/plan_v1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cache-state-v1"
+path = "fuzz_targets/cache_state_v1.rs"
 test = false
 doc = false
 bench = false
