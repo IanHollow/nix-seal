@@ -625,12 +625,17 @@ impl Generation {
         gid: u32,
     ) -> Result<File, RuntimeError> {
         validate_mode(mode)?;
-        let path = self.transaction.path().join(id.as_str());
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-            validate_private_ancestors(self.transaction.path(), parent)?;
-        }
-        let file = create_exclusive_secret_file(&path)?;
+        #[cfg(unix)]
+        let file = create_secret_file_relative(self.transaction.path(), id.as_str())?;
+        #[cfg(not(unix))]
+        let file = {
+            let path = self.transaction.path().join(id.as_str());
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+                validate_private_ancestors(self.transaction.path(), parent)?;
+            }
+            create_exclusive_secret_file(&path)?
+        };
         set_file_owner(&file, uid, gid)?;
         set_file_mode(&file, mode)?;
         Ok(file)
@@ -1366,6 +1371,7 @@ fn validate_runtime_root_identity(root: &Path) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn validate_private_ancestors(root: &Path, leaf: &Path) -> Result<(), RuntimeError> {
     let relative = leaf
         .strip_prefix(root)
@@ -1380,6 +1386,88 @@ fn validate_private_ancestors(root: &Path, leaf: &Path) -> Result<(), RuntimeErr
         set_mode(&current, 0o700)?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn create_secret_file_relative(transaction: &Path, relative: &str) -> Result<File, RuntimeError> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
+
+    let mut parent = open(
+        transaction,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| RuntimeError::Io(error.into()))
+    .and_then(|descriptor| {
+        let metadata = fstat(&descriptor).map_err(|error| RuntimeError::Io(error.into()))?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
+            || metadata.st_uid != rustix::process::geteuid().as_raw()
+        {
+            return Err(RuntimeError::UnsafeSource);
+        }
+        Ok(File::from(descriptor))
+    })?;
+
+    let mut components = relative.split('/');
+    let leaf = components
+        .next_back()
+        .ok_or(RuntimeError::InvalidDestination)?;
+    for component in components {
+        parent = open_or_create_private_directory(&parent, component)?;
+    }
+    let descriptor = openat(
+        &parent,
+        leaf,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+            RuntimeError::InvalidDestination
+        } else {
+            RuntimeError::Io(error.into())
+        }
+    })?;
+    let metadata = fstat(&descriptor).map_err(|error| RuntimeError::Io(error.into()))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+        || metadata.st_nlink != 1
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(RuntimeError::UnsafeSource);
+    }
+    Ok(File::from(descriptor))
+}
+
+#[cfg(unix)]
+fn open_or_create_private_directory(parent: &File, name: &str) -> Result<File, RuntimeError> {
+    use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, mkdirat, openat};
+
+    match mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(error) => return Err(RuntimeError::Io(error.into())),
+    }
+    let descriptor = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+            RuntimeError::InvalidDestination
+        } else {
+            RuntimeError::Io(error.into())
+        }
+    })?;
+    let metadata = fstat(&descriptor).map_err(|error| RuntimeError::Io(error.into()))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(RuntimeError::UnsafeSource);
+    }
+    fchmod(&descriptor, Mode::from_raw_mode(0o700))
+        .map_err(|error| RuntimeError::Io(error.into()))?;
+    Ok(File::from(descriptor))
 }
 
 fn sync_tree(root: &Path) -> Result<(), RuntimeError> {
