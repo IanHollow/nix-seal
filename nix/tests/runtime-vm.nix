@@ -1,5 +1,4 @@
 {
-  inputs,
   self,
   system,
   pkgs,
@@ -14,18 +13,16 @@ in
 pkgs.testers.nixosTest {
   name = "nix-seal-runtime-activation";
 
-  nodes.machine =
-    { pkgs, ... }:
-    {
-      environment.systemPackages = [
-        nixSeal
-        pkgs.coreutils
-        pkgs.gnugrep
-        pkgs.jq
-      ];
-      virtualisation.memorySize = 1024;
-      system.stateVersion = "26.05";
-    };
+  nodes.machine = { pkgs, ... }: {
+    environment.systemPackages = [
+      nixSeal
+      pkgs.coreutils
+      pkgs.gnugrep
+      pkgs.jq
+    ];
+    virtualisation.memorySize = 1024;
+    system.stateVersion = "26.05";
+  };
 
   testScript = ''
     start_all()
