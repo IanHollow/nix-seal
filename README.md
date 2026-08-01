@@ -98,15 +98,16 @@ nix-seal secret list --plan plan.v1.json --due
 ```
 
 `create`, `import`, `rotate`, and `edit` accept `--format json`,
-`--format toml`, or `--format dotenv` to validate a logical collection before it
-is encrypted. The original bytes are retained, so formatting and ordering are
-not rewritten. Structured input is limited to 64 MiB and must be valid UTF-8.
-dotenv validation accepts only unique shell-compatible `KEY=VALUE` entries (with
-an optional `export ` prefix); it does not evaluate shell syntax. An edit that
-fails its declared format check never replaces the existing ciphertext. This
-validation is an authoring guardrail, not field-level secret splitting: each
-canonical source remains one independent standard age file. Keep any plaintext
-input file private and remove it according to your local storage policy.
+`--format toml`, `--format yaml`, or `--format dotenv` to validate a logical
+collection before it is encrypted. The original bytes are retained, so
+formatting and ordering are not rewritten. Structured input is limited to 64 MiB
+and must be valid UTF-8. dotenv validation accepts only unique shell-compatible
+`KEY=VALUE` entries (with an optional `export ` prefix); it does not evaluate
+shell syntax. An edit that fails its declared format check never replaces the
+existing ciphertext. This validation is an authoring guardrail, not field-level
+secret splitting: each canonical source remains one independent standard age
+file. Keep any plaintext input file private and remove it according to your
+local storage policy.
 
 The plan determines canonical administrator/recovery recipients. Direct mode
 additionally includes authorized target recipients and emits a history-exposure

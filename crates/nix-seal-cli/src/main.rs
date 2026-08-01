@@ -537,6 +537,8 @@ enum SecretFormat {
     Json,
     /// Validate stdin as a strict TOML document before encrypting its original bytes.
     Toml,
+    /// Validate stdin as a bounded YAML document before encrypting its original bytes.
+    Yaml,
     /// Validate stdin as a bounded dotenv collection before encrypting its original bytes.
     Dotenv,
 }
@@ -5787,6 +5789,10 @@ fn validate_structured_secret_bytes(input: &[u8], format: Option<SecretFormat>) 
             let _: toml::Value =
                 toml::from_str(text).context("structured TOML secret input is malformed")?;
         }
+        SecretFormat::Yaml => {
+            let _: yaml_serde::Value =
+                yaml_serde::from_str(text).context("structured YAML secret input is malformed")?;
+        }
         SecretFormat::Dotenv => validate_dotenv(text)?,
     }
     Ok(())
@@ -6636,6 +6642,10 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             validate_structured_secret_bytes(b"token = 'value'", Some(SecretFormat::Toml)).is_ok()
         );
         assert!(validate_structured_secret_bytes(b"token =", Some(SecretFormat::Toml)).is_err());
+        assert!(
+            validate_structured_secret_bytes(b"token: value\n", Some(SecretFormat::Yaml)).is_ok()
+        );
+        assert!(validate_structured_secret_bytes(b"token: [", Some(SecretFormat::Yaml)).is_err());
     }
 
     #[test]
