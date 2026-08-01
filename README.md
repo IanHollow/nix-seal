@@ -376,10 +376,10 @@ private scalar in the standard WireGuard base64 format and accepts no
 parameters; UUID accepts none. `builtin:passphrase` uses 12–64 uniformly
 selected, hyphen-separated words from an embedded 64-word list (default 16, 96
 bits of selection entropy). `builtin:argon2id-password-hash` accepts exactly one
-declared single-line hidden prompt and emits one Argon2id PHC
-string. It defaults to 64 MiB, three iterations, one lane, and a 32-byte output;
-public bounds are 19–512 MiB, 2–10 iterations, and 16–64 output bytes. The
-private prompt value is never put in the plan, arguments, environment, or logs.
+declared single-line hidden prompt and emits one Argon2id PHC string. It
+defaults to 64 MiB, three iterations, one lane, and a 32-byte output; public
+bounds are 19–512 MiB, 2–10 iterations, and 16–64 output bytes. The private
+prompt value is never put in the plan, arguments, environment, or logs.
 `builtin:ssh-ed25519` produces one standard unencrypted OpenSSH Ed25519 private
 key, which is immediately encrypted through the normal canonical-secret
 transaction; its public key is derivable from that secret. Generation is
@@ -412,8 +412,8 @@ files below `$NIX_SEAL_PROMPT_DIR` in the private workspace. Prompt values never
 enter the plan, command arguments, environment, or logs. A prompt marked
 `persistent = true` may be initialized from an explicit `--prompt-file`; after a
 successful generation its response is atomically retained in the owner-only
-repository state path `.nix-seal/prompt-state/v1/<generator>/<prompt>`, and later
-runs may use that stored response without passing it again. Nonpersistent
+repository state path `.nix-seal/prompt-state/v1/<generator>/<prompt>`, and
+later runs may use that stored response without passing it again. Nonpersistent
 prompts are never retained. Persistent state is plaintext and must be protected
 like any other local credential; it is not part of Git, the Nix store, or the
 public plan. Terminal prompting remains unavailable until a separately reviewed
