@@ -2,9 +2,12 @@
 //! Command-line interface. Plaintext output is limited to `secret reveal`.
 
 use anyhow::{Context, Result, bail};
+use argon2::{Algorithm, Argon2, Params, PasswordHasher, Version, password_hash::SaltString};
 use base64::{
     Engine as _,
-    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+    engine::general_purpose::{
+        STANDARD as BASE64_STANDARD, STANDARD_NO_PAD as BASE64_STANDARD_NO_PAD, URL_SAFE_NO_PAD,
+    },
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
@@ -4130,6 +4133,9 @@ fn generate_generator_values(
     prompts: &[SecretBox<Vec<u8>>],
 ) -> Result<Vec<SecretBox<Vec<u8>>>> {
     if generator.executable.starts_with("builtin:") {
+        if generator.executable == "builtin:argon2id-password-hash" {
+            return Ok(vec![generate_argon2id_password_hash(generator, prompts)?]);
+        }
         if !prompts.is_empty() {
             bail!("built-in generators do not accept prompts");
         }
@@ -4341,6 +4347,9 @@ fn generate_builtin_value(generator: &nix_seal_core::Generator) -> Result<Secret
             )))
         }
         "builtin:passphrase" => generate_passphrase(generator),
+        "builtin:argon2id-password-hash" => {
+            bail!("builtin:argon2id-password-hash requires its declared hidden password prompt")
+        }
         "builtin:ssh-ed25519" => generate_ssh_ed25519_private_key(generator),
         "builtin:wireguard-private-key" => {
             if !generator.parameters.is_empty() {
@@ -4376,9 +4385,82 @@ fn generate_builtin_value(generator: &nix_seal_core::Generator) -> Result<Secret
             Ok(SecretBox::new(Box::new(output)))
         }
         _ => bail!(
-            "generator executable is unsupported; v1 accepts builtin:random, builtin:hex, builtin:base64, builtin:token, builtin:passphrase, builtin:ssh-ed25519, builtin:wireguard-private-key, or builtin:uuid"
+            "generator executable is unsupported; v1 accepts builtin:random, builtin:hex, builtin:base64, builtin:token, builtin:passphrase, builtin:argon2id-password-hash, builtin:ssh-ed25519, builtin:wireguard-private-key, or builtin:uuid"
         ),
     }
+}
+
+/// Produces one self-describing Argon2id PHC password hash. The input is read
+/// only from the explicitly declared private prompt file; the hash remains a
+/// secret output and follows the normal age authoring transaction.
+fn generate_argon2id_password_hash(
+    generator: &nix_seal_core::Generator,
+    prompts: &[SecretBox<Vec<u8>>],
+) -> Result<SecretBox<Vec<u8>>> {
+    if generator.outputs.len() != 1
+        || generator.prompts.len() != 1
+        || prompts.len() != 1
+        || !matches!(
+            generator.prompts[0].mode,
+            nix_seal_core::GeneratorPromptMode::Hidden
+        )
+        || generator.prompts[0].multiline
+        || generator.prompts[0].persistent
+    {
+        bail!(
+            "builtin:argon2id-password-hash requires one single-line hidden prompt and one secret output"
+        );
+    }
+    if prompts[0].expose_secret().is_empty() || prompts[0].expose_secret().len() > 1024 {
+        bail!("builtin:argon2id-password-hash password input must be 1 to 1024 bytes");
+    }
+    if generator
+        .parameters
+        .keys()
+        .any(|key| !matches!(key.as_str(), "memory-kib" | "iterations" | "output-length"))
+    {
+        bail!(
+            "builtin:argon2id-password-hash accepts only memory-kib, iterations, and output-length parameters"
+        );
+    }
+    let memory_kib = generator_u32_parameter(generator, "memory-kib", 65_536)?;
+    let iterations = generator_u32_parameter(generator, "iterations", 3)?;
+    let output_length = generator_u32_parameter(generator, "output-length", 32)?;
+    if !(19_456..=524_288).contains(&memory_kib)
+        || !(2..=10).contains(&iterations)
+        || !(16..=64).contains(&output_length)
+    {
+        bail!(
+            "builtin:argon2id-password-hash parameters require memory-kib 19456..524288, iterations 2..10, and output-length 16..64"
+        );
+    }
+    let output_length = usize::try_from(output_length).context("invalid Argon2id output length")?;
+    let params = Params::new(memory_kib, iterations, 1, Some(output_length))
+        .map_err(|_| anyhow::anyhow!("invalid bounded Argon2id parameters"))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let salt_bytes = nix_seal_crypto::random_bytes(16)?;
+    let salt_encoded = BASE64_STANDARD_NO_PAD.encode(salt_bytes.expose_secret());
+    let salt = SaltString::from_b64(&salt_encoded)
+        .map_err(|_| anyhow::anyhow!("could not encode Argon2id salt"))?;
+    let encoded = Zeroizing::new(
+        argon2
+            .hash_password(prompts[0].expose_secret(), &salt)
+            .map_err(|_| anyhow::anyhow!("Argon2id password hashing failed"))?
+            .to_string(),
+    );
+    Ok(SecretBox::new(Box::new(encoded.as_bytes().to_vec())))
+}
+
+fn generator_u32_parameter(
+    generator: &nix_seal_core::Generator,
+    name: &str,
+    default: u32,
+) -> Result<u32> {
+    generator.parameters.get(name).map_or(Ok(default), |value| {
+        value
+            .parse::<u32>()
+            .with_context(|| format!("builtin:argon2id-password-hash {name} must be an integer"))
+    })
 }
 
 fn generate_passphrase(generator: &nix_seal_core::Generator) -> Result<SecretBox<Vec<u8>>> {
@@ -5670,6 +5752,7 @@ fn completions(shell: CompletionShell) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argon2::{PasswordVerifier, password_hash::PasswordHash};
     use nix_seal_manifest::{ARTIFACT_SCHEMA, TargetManifestV2};
     use std::collections::BTreeMap;
 
@@ -6389,6 +6472,57 @@ mod tests {
                 parameters: BTreeMap::from([("words".to_owned(), "11".to_owned())]),
                 ..generator
             })
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn argon2id_password_hash_generator_uses_a_hidden_prompt_and_bounded_parameters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let generator = nix_seal_core::Generator {
+            executable: "builtin:argon2id-password-hash".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            outputs: vec![nix_seal_core::Id::parse("application/password-hash")?],
+            prompts: vec![nix_seal_core::GeneratorPrompt {
+                id: nix_seal_core::Id::parse("password")?,
+                mode: nix_seal_core::GeneratorPromptMode::Hidden,
+                message: "Password".to_owned(),
+                multiline: false,
+                persistent: false,
+            }],
+            parameters: BTreeMap::from([
+                ("memory-kib".to_owned(), "19456".to_owned()),
+                ("iterations".to_owned(), "2".to_owned()),
+                ("output-length".to_owned(), "16".to_owned()),
+            ]),
+            validation: None,
+        };
+        let password = SecretBox::new(Box::new(b"argon2id-test-password".to_vec()));
+        let generated = generate_generator_values(&generator, &[password])?;
+        let encoded = std::str::from_utf8(generated[0].expose_secret())?;
+        assert!(encoded.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
+        let parsed = PasswordHash::new(encoded)
+            .map_err(|_| "generated Argon2id output is not a valid PHC hash")?;
+        Argon2::default()
+            .verify_password(b"argon2id-test-password", &parsed)
+            .map_err(|_| "generated Argon2id output did not verify")?;
+        let visible = nix_seal_core::Generator {
+            prompts: vec![nix_seal_core::GeneratorPrompt {
+                mode: nix_seal_core::GeneratorPromptMode::Visible,
+                ..generator.prompts[0].clone()
+            }],
+            ..generator
+        };
+        assert!(
+            generate_generator_values(
+                &visible,
+                &[SecretBox::new(Box::new(b"argon2id-test-password".to_vec()))]
+            )
             .is_err()
         );
         Ok(())

@@ -55,6 +55,11 @@ criteria = "safe-to-deploy"
 version = "1.9.2"
 criteria = "safe-to-deploy"
 
+[[exemptions.argon2]]
+version = "0.5.3"
+criteria = "safe-to-deploy"
+notes = "Dependency-audit backlog; constrain use to Argon2id PHC generation and replace with a trusted or local audit before 1.0."
+
 [[exemptions.arrayref]]
 version = "0.3.9"
 criteria = "safe-to-deploy"
@@ -98,6 +103,11 @@ criteria = "safe-to-deploy"
 [[exemptions.bitflags]]
 version = "2.13.1"
 criteria = "safe-to-deploy"
+
+[[exemptions.blake2]]
+version = "0.10.6"
+criteria = "safe-to-deploy"
+notes = "Transitive Argon2 dependency-audit backlog; replace with a trusted or local audit before 1.0."
 
 [[exemptions.blake3]]
 version = "1.8.5"
@@ -534,6 +544,11 @@ criteria = "safe-to-deploy"
 [[exemptions.parking_lot_core]]
 version = "0.9.12"
 criteria = "safe-to-deploy"
+
+[[exemptions.password-hash]]
+version = "0.5.0"
+criteria = "safe-to-deploy"
+notes = "Transitive Argon2 dependency-audit backlog; replace with a trusted or local audit before 1.0."
 
 [[exemptions.pbkdf2]]
 version = "0.12.2"

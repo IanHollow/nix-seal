@@ -2,8 +2,8 @@
 //! Strict loading, merging, validation, and canonicalization of public plans.
 
 use nix_seal_core::{
-    ActivationPhase, ApprovalPolicy, DeliveryMode, Id, IdentityKind, PLAN_SCHEMA, PlanV1,
-    RuntimeSettings, TargetKind, TemplatePlaceholder,
+    ActivationPhase, ApprovalPolicy, DeliveryMode, Generator, GeneratorPromptMode, Id,
+    IdentityKind, PLAN_SCHEMA, PlanV1, RuntimeSettings, TargetKind, TemplatePlaceholder,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -935,6 +935,7 @@ fn validate_generator_execution(
             | "builtin:base64"
             | "builtin:token"
             | "builtin:passphrase"
+            | "builtin:argon2id-password-hash"
             | "builtin:ssh-ed25519"
             | "builtin:wireguard-private-key"
             | "builtin:uuid"
@@ -966,7 +967,51 @@ fn validate_generator_execution(
             "generator {generator_id} has invalid constrained-execution settings"
         )));
     }
+    if generator.executable == "builtin:argon2id-password-hash" {
+        validate_argon2id_password_hash_generator(generator_id, generator)?;
+    }
     Ok(())
+}
+
+fn validate_argon2id_password_hash_generator(
+    generator_id: &Id,
+    generator: &Generator,
+) -> Result<(), PolicyError> {
+    if generator.outputs.len() != 1
+        || generator.prompts.len() != 1
+        || !matches!(generator.prompts[0].mode, GeneratorPromptMode::Hidden)
+        || generator.prompts[0].multiline
+        || generator
+            .parameters
+            .keys()
+            .any(|key| !matches!(key.as_str(), "memory-kib" | "iterations" | "output-length"))
+    {
+        return Err(PolicyError::Violation(format!(
+            "Argon2id password-hash generator {generator_id} requires one single-line hidden prompt, one output, and bounded hash parameters"
+        )));
+    }
+    let memory_kib = argon2id_parameter(generator, "memory-kib", 65_536)?;
+    let iterations = argon2id_parameter(generator, "iterations", 3)?;
+    let output_length = argon2id_parameter(generator, "output-length", 32)?;
+    if !(19_456..=524_288).contains(&memory_kib)
+        || !(2..=10).contains(&iterations)
+        || !(16..=64).contains(&output_length)
+    {
+        return Err(PolicyError::Violation(format!(
+            "Argon2id password-hash generator {generator_id} parameters are outside the supported security bounds"
+        )));
+    }
+    Ok(())
+}
+
+fn argon2id_parameter(generator: &Generator, name: &str, default: u32) -> Result<u32, PolicyError> {
+    generator.parameters.get(name).map_or(Ok(default), |value| {
+        value.parse::<u32>().map_err(|_| {
+            PolicyError::Violation(format!(
+                "Argon2id password-hash generator parameter {name} must be an integer"
+            ))
+        })
+    })
 }
 
 fn valid_store_executable(value: &str) -> bool {
@@ -1134,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn passphrase_and_ssh_are_admitted_builtin_generators() -> Result<(), PolicyError> {
+    fn passphrase_ssh_and_argon2id_are_admitted_builtin_generators() -> Result<(), PolicyError> {
         let generator = nix_seal_core::Generator {
             executable: "builtin:passphrase".to_owned(),
             arguments: Vec::new(),
@@ -1159,6 +1204,42 @@ mod tests {
             &Id::parse("ssh").map_err(|error| PolicyError::Violation(error.to_string()))?,
             &ssh,
         )?;
+        let argon2id = nix_seal_core::Generator {
+            executable: "builtin:argon2id-password-hash".to_owned(),
+            outputs: vec![
+                Id::parse("password-hash")
+                    .map_err(|error| PolicyError::Violation(error.to_string()))?,
+            ],
+            prompts: vec![nix_seal_core::GeneratorPrompt {
+                id: Id::parse("password")
+                    .map_err(|error| PolicyError::Violation(error.to_string()))?,
+                mode: nix_seal_core::GeneratorPromptMode::Hidden,
+                message: "Password".to_owned(),
+                multiline: false,
+                persistent: false,
+            }],
+            parameters: BTreeMap::from([
+                ("memory-kib".to_owned(), "19456".to_owned()),
+                ("iterations".to_owned(), "2".to_owned()),
+            ]),
+            ..ssh
+        };
+        validate_generator_execution(
+            &Id::parse("argon2id").map_err(|error| PolicyError::Violation(error.to_string()))?,
+            &argon2id,
+        )?;
+        let invalid_argon2id = nix_seal_core::Generator {
+            parameters: BTreeMap::from([("memory-kib".to_owned(), "19455".to_owned())]),
+            ..argon2id
+        };
+        assert!(
+            validate_generator_execution(
+                &Id::parse("invalid-argon2id")
+                    .map_err(|error| PolicyError::Violation(error.to_string()))?,
+                &invalid_argon2id,
+            )
+            .is_err()
+        );
         Ok(())
     }
 
