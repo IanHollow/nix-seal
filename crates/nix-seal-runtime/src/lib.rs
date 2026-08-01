@@ -630,7 +630,7 @@ impl Generation {
             std::fs::create_dir_all(parent)?;
             validate_private_ancestors(self.transaction.path(), parent)?;
         }
-        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        let file = create_exclusive_secret_file(&path)?;
         set_file_owner(&file, uid, gid)?;
         set_file_mode(&file, mode)?;
         Ok(file)
@@ -1486,6 +1486,34 @@ fn open_regular_nofollow(path: &Path) -> Result<File, RuntimeError> {
         return Err(RuntimeError::UnsafeSource);
     }
     Ok(File::from(descriptor))
+}
+
+#[cfg(unix)]
+fn create_exclusive_secret_file(path: &Path) -> Result<File, RuntimeError> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
+    let descriptor = open(
+        path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|error| {
+        if error == rustix::io::Errno::LOOP {
+            RuntimeError::UnsafeSource
+        } else {
+            RuntimeError::Io(error.into())
+        }
+    })?;
+    let metadata = fstat(&descriptor).map_err(|error| RuntimeError::Io(error.into()))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile || metadata.st_nlink != 1
+    {
+        return Err(RuntimeError::UnsafeSource);
+    }
+    Ok(File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn create_exclusive_secret_file(path: &Path) -> Result<File, RuntimeError> {
+    Ok(OpenOptions::new().write(true).create_new(true).open(path)?)
 }
 
 #[cfg(unix)]
