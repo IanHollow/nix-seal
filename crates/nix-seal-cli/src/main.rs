@@ -5377,11 +5377,15 @@ fn read_structured_secret_input(format: Option<SecretFormat>) -> Result<SecretBo
     )
     .read_to_end(input.expose_secret_mut())
     .context("secret input exceeds the 64 MiB safety limit")?;
+    validate_structured_secret_bytes(input.expose_secret(), format)?;
+    Ok(input)
+}
+
+fn validate_structured_secret_bytes(input: &[u8], format: Option<SecretFormat>) -> Result<()> {
     let Some(format) = format else {
-        return Ok(input);
+        return Ok(());
     };
-    let text = std::str::from_utf8(input.expose_secret())
-        .context("structured secret input must be valid UTF-8")?;
+    let text = std::str::from_utf8(input).context("structured secret input must be valid UTF-8")?;
     match format {
         SecretFormat::Json => {
             let _: serde_json::Value =
@@ -5393,7 +5397,7 @@ fn read_structured_secret_input(format: Option<SecretFormat>) -> Result<SecretBo
         }
         SecretFormat::Dotenv => validate_dotenv(text)?,
     }
-    Ok(input)
+    Ok(())
 }
 
 fn validate_dotenv(input: &str) -> Result<()> {
@@ -5463,15 +5467,26 @@ fn run_secret_edit(arguments: SecretEditArgs, json: bool) -> Result<()> {
             "warning: direct mode allows matching target keys to decrypt current and historical Git ciphertext"
         );
     }
-    let result = nix_seal_authoring::edit_secret(&nix_seal_authoring::EditRequest {
-        repository_root: &root,
-        relative_destination: Path::new(&secret.source),
-        identity: &identity,
-        recipients: &recipients,
-        editor: &arguments.editor,
-        editor_arguments: &arguments.editor_arguments,
-        workspace_root: &workspace_root,
-    })?;
+    let format = arguments.secret.format;
+    let result = nix_seal_authoring::edit_secret_checked(
+        &nix_seal_authoring::EditRequest {
+            repository_root: &root,
+            relative_destination: Path::new(&secret.source),
+            identity: &identity,
+            recipients: &recipients,
+            editor: &arguments.editor,
+            editor_arguments: &arguments.editor_arguments,
+            workspace_root: &workspace_root,
+        },
+        |plaintext| {
+            let mut input = SecretBox::new(Box::new(Vec::new()));
+            BoundedReader::new(plaintext, EXTERNAL_MIGRATION_MAX_PLAINTEXT_BYTES)
+                .read_to_end(input.expose_secret_mut())
+                .map_err(|_| nix_seal_authoring::AuthoringError::InvalidEditedContent)?;
+            validate_structured_secret_bytes(input.expose_secret(), format)
+                .map_err(|_| nix_seal_authoring::AuthoringError::InvalidEditedContent)
+        },
+    )?;
     if json {
         println!(
             "{}",
@@ -6181,6 +6196,20 @@ mod tests {
         assert!(validate_dotenv("TOKEN=one\nTOKEN=two\n").is_err());
         assert!(validate_dotenv("1TOKEN=value\n").is_err());
         assert!(validate_dotenv("TOKEN\n").is_err());
+    }
+
+    #[test]
+    fn structured_validation_preserves_raw_mode_and_rejects_malformed_documents() {
+        assert!(validate_structured_secret_bytes(b"arbitrary\0bytes", None).is_ok());
+        assert!(
+            validate_structured_secret_bytes(br#"{"token":"value"}"#, Some(SecretFormat::Json))
+                .is_ok()
+        );
+        assert!(validate_structured_secret_bytes(b"{", Some(SecretFormat::Json)).is_err());
+        assert!(
+            validate_structured_secret_bytes(b"token = 'value'", Some(SecretFormat::Toml)).is_ok()
+        );
+        assert!(validate_structured_secret_bytes(b"token =", Some(SecretFormat::Toml)).is_err());
     }
 
     #[test]

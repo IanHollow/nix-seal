@@ -30,6 +30,11 @@ transaction then re-encrypts it. The workspace is removed on every return path.
 Editors remain in the threat model: a malicious editor can read plaintext and
 may deliberately copy it elsewhere.
 
+When the caller declares a JSON, TOML, or strict dotenv collection format, the
+private edited file is bounded and validated before it is encrypted; validation
+failure likewise preserves the previous ciphertext. Format validation retains
+the original bytes and is not a field-level encrypted collection format.
+
 Delete is deliberately recoverable and non-interactive. It requires an explicit
 `--yes`, validates the plan-derived source without following links, hashes the
 ciphertext, writes and synchronizes a versioned public tombstone, then

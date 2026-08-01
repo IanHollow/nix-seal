@@ -20,6 +20,12 @@ Secret values are never accepted through command-line arguments or ordinary
 environment variables. JSON output never contains plaintext. The explicitly
 named \fBsecret reveal\fR operation is the sole command that writes plaintext
 to standard output.
+.PP
+The \fBsecret create\fR, \fBsecret import\fR, \fBsecret edit\fR, and
+\fBrotate\fR commands accept \fB--format json\fR, \fBtoml\fR, or
+\fBdotenv\fR to validate a bounded logical collection before it is encrypted.
+The original bytes are retained. dotenv validation accepts only unique
+shell-compatible \fBKEY=VALUE\fR entries and does not evaluate shell syntax.
 .SH COMMANDS
 .TP
 .B init

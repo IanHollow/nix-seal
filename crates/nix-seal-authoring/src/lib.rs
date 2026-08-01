@@ -113,6 +113,9 @@ pub enum AuthoringError {
     /// Editor path, exit status, or edited plaintext file was unsafe.
     #[error("explicit editor transaction failed or produced unsafe output")]
     Editor,
+    /// The caller rejected edited plaintext before any ciphertext replacement.
+    #[error("edited plaintext failed the declared format validation")]
+    InvalidEditedContent,
     /// The atomic change completed but directory durability could not be confirmed.
     #[error("ciphertext changed atomically but filesystem durability could not be confirmed")]
     DurabilityUnknown,
@@ -453,6 +456,20 @@ fn restore_batch(
 
 /// Decrypts into a private ephemeral workspace, invokes an explicit editor, and replaces atomically.
 pub fn edit_secret(request: &EditRequest<'_>) -> Result<AuthoringResult, AuthoringError> {
+    edit_secret_checked(request, |_| Ok(()))
+}
+
+/// Edits canonical ciphertext while validating the private edited file before it
+/// is encrypted or committed. The validator must consume only bounded input and
+/// return a redacted error. A validation failure leaves the old ciphertext in
+/// place.
+pub fn edit_secret_checked<F>(
+    request: &EditRequest<'_>,
+    validate_edited: F,
+) -> Result<AuthoringResult, AuthoringError>
+where
+    F: FnOnce(&mut File) -> Result<(), AuthoringError>,
+{
     if !request.editor.is_absolute() || !request.workspace_root.is_absolute() {
         return Err(AuthoringError::Editor);
     }
@@ -493,7 +510,9 @@ pub fn edit_secret(request: &EditRequest<'_>) -> Result<AuthoringResult, Authori
     if !status.success() {
         return Err(AuthoringError::Editor);
     }
-    let plaintext = open_private_edited(&plaintext_path)?;
+    let mut plaintext = open_private_edited(&plaintext_path)?;
+    validate_edited(&mut plaintext)?;
+    plaintext.rewind().map_err(AuthoringError::Io)?;
     write_secret(
         request.repository_root,
         request.relative_destination,
@@ -928,6 +947,23 @@ mod tests {
         assert_eq!(plaintext, b"edited-value");
 
         let before_failure = std::fs::read(&edited.path)?;
+        assert!(matches!(
+            edit_secret_checked(
+                &EditRequest {
+                    repository_root: &root,
+                    relative_destination: destination,
+                    identity: &identity,
+                    recipients: &recipients,
+                    editor: &copy_editor,
+                    editor_arguments: &[editor_value.to_string_lossy().into_owned()],
+                    workspace_root: &root,
+                },
+                |_| Err(AuthoringError::InvalidEditedContent),
+            ),
+            Err(AuthoringError::InvalidEditedContent)
+        ));
+        assert_eq!(std::fs::read(&edited.path)?, before_failure);
+
         let failing_editor = find_test_executable("false")?;
         assert!(matches!(
             edit_secret(&EditRequest {
