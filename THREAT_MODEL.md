@@ -35,6 +35,14 @@ atomic transactions, fsync, link/path checks, and fail-closed generation switch.
 Plaintext is excluded from store, argv, ordinary environment, JSON, diagnostics,
 logs, and CI. External processes receive a minimal environment, explicit file
 descriptors, deadlines, output bounds, and the least required secret set.
+Generator prompt input is non-interactive by default. Explicit interactive input
+uses only a verified controlling terminal, masks hidden values with guaranteed
+terminal-mode restoration, bounds bytes, and zeroizes transient read buffers. On
+Linux, a Rust worker attempts a fresh network namespace before launching an
+external generator. If the kernel or container denies that operation, execution
+falls back once with a diagnostic warning. macOS and other platforms warn
+because network isolation is unavailable. Generator executables and declared
+runtime inputs remain trusted-code boundaries on every platform.
 
 Security tests cover traversal, symlink/hardlink/TOCTOU races, malformed crypto
 and signatures, replay and target substitution, disk exhaustion, crashes,
@@ -58,3 +66,8 @@ Every cryptography, signing, manifest, activation, plugin, migration, or trust
 root change updates this document and its ADR. Release candidates include an
 attack-path review. The security team reviews the model at least once per minor
 release and after every incident.
+
+The operational procedures in [`docs/runbooks.md`](docs/runbooks.md) are part of
+the threat-model control set. They must be exercised for administrator-key,
+target-key, signer, cache-loss, rollback, and recovery scenarios before a 1.0
+release and after any material trust-root change.

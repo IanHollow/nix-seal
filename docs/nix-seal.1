@@ -22,10 +22,18 @@ named \fBsecret reveal\fR operation is the sole command that writes plaintext
 to standard output.
 .PP
 The \fBsecret create\fR, \fBsecret import\fR, \fBsecret edit\fR, and
-\fBrotate\fR commands accept \fB--format json\fR, \fBtoml\fR, or
+\fBrotate\fR commands accept \fB--format json\fR, \fBtoml\fR, \fByaml\fR, or
 \fBdotenv\fR to validate a bounded logical collection before it is encrypted.
 The original bytes are retained. dotenv validation accepts only unique
 shell-compatible \fBKEY=VALUE\fR entries and does not evaluate shell syntax.
+.PP
+Generator prompts are non-interactive by default and must be supplied through
+owner-only \fB--prompt-file ID=PATH\fR inputs. The explicit
+\fBgenerate --interactive\fR mode reads missing prompts only from a verified
+controlling \fB/dev/tty\fR, masks hidden prompts with terminal settings restored
+on failure, bounds responses to 1 MiB, and never places prompt values in argv,
+the environment, the plan, or logs. Single-line prompts finish with Enter;
+multiline prompts finish with Ctrl-D.
 .SH COMMANDS
 .TP
 .B init
@@ -36,9 +44,14 @@ Compile, inspect, validate, and diagnose public policy.
 .TP
 .B key, identity, group
 Manage identities and public policy metadata.
+The optional \fBkey generate --passphrase\fR mode writes a standard age
+scrypt-encrypted human recovery identity after protected terminal prompts;
+passphrases are never read from argv, stdin, or the environment.
 .TP
 .B secret, rotate
-Create, import, edit, reveal, inspect, delete, and rotate canonical secrets.
+Create, import, edit, reveal, inspect, delete, recipient-rekey, and rotate
+canonical secrets. Recipient rekey is dry-run by default and requires an
+explicit \fB--yes\fR for atomic replacement; it does not rotate the value.
 .TP
 .B rekey, artifact, provision, cache
 Create, verify, exchange, and garbage-collect signed ciphertext-only artifacts.

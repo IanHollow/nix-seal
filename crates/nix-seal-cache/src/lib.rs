@@ -4,7 +4,7 @@
 use fs2::FileExt;
 use std::{
     collections::BTreeSet,
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -219,12 +219,25 @@ impl Cache {
     /// Opens or creates a v1 cache root with restrictive permissions.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, CacheError> {
         let root = root.into();
-        std::fs::create_dir_all(&root)?;
-        let metadata = std::fs::symlink_metadata(&root)?;
-        if !metadata.file_type().is_dir() {
-            return Err(CacheError::UnsafeMetadata);
+        match std::fs::symlink_metadata(&root) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() {
+                    return Err(CacheError::UnsafeMetadata);
+                }
+                validate_owner(&metadata)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&root)?;
+                let metadata = std::fs::symlink_metadata(&root)?;
+                if !metadata.file_type().is_dir() {
+                    return Err(CacheError::UnsafeMetadata);
+                }
+                validate_owner(&metadata)?;
+            }
+            Err(error) => return Err(error.into()),
         }
         set_private_permissions(&root, true)?;
+        validate_private_metadata(&std::fs::symlink_metadata(&root)?, true)?;
         Ok(Self { root })
     }
     /// Returns an object's content address.
@@ -235,16 +248,9 @@ impl Cache {
     /// Atomically stores bytes under their digest while holding the cache lock.
     pub fn put(&self, bytes: &[u8]) -> Result<String, CacheError> {
         let digest = Self::digest(bytes);
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.root.join(".lock"))?;
-        lock.lock_exclusive()?;
+        let lock = self.lock()?;
         let objects = self.root.join("objects");
-        std::fs::create_dir_all(&objects)?;
-        set_private_permissions(&objects, true)?;
+        ensure_private_directory(&objects)?;
         let destination = objects.join(&digest);
         match std::fs::symlink_metadata(&destination) {
             Ok(_) => {
@@ -656,21 +662,14 @@ impl Cache {
     }
 
     fn lock(&self) -> Result<File, CacheError> {
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.root.join(".lock"))?;
-        set_private_permissions(&self.root.join(".lock"), false)?;
+        let lock = open_cache_lock(&self.root.join(".lock"))?;
         lock.lock_exclusive()?;
         Ok(lock)
     }
 
     fn artifacts_directory(&self) -> Result<PathBuf, CacheError> {
         let artifacts = self.root.join("artifacts");
-        std::fs::create_dir_all(&artifacts)?;
-        set_private_permissions(&artifacts, true)?;
+        ensure_private_directory(&artifacts)?;
         Ok(artifacts)
     }
 
@@ -768,6 +767,7 @@ fn open_private_regular(path: &Path) -> Result<File, CacheError> {
     let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
     if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
         || metadata.st_nlink != 1
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
         || metadata.st_mode & 0o077 != 0
     {
         return Err(CacheError::UnsafeMetadata);
@@ -785,9 +785,92 @@ fn open_private_regular(path: &Path) -> Result<File, CacheError> {
 }
 
 fn create_private_file(path: &Path) -> Result<File, CacheError> {
-    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    set_private_permissions(path, false)?;
-    Ok(file)
+    #[cfg(unix)]
+    {
+        use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, open};
+        let descriptor = open(
+            path,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(std::io::Error::from)?;
+        let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+            || metadata.st_nlink != 1
+            || metadata.st_uid != rustix::process::geteuid().as_raw()
+        {
+            return Err(CacheError::UnsafeMetadata);
+        }
+        fchmod(&descriptor, Mode::from_raw_mode(0o600)).map_err(std::io::Error::from)?;
+        Ok(File::from(descriptor))
+    }
+    #[cfg(not(unix))]
+    {
+        use std::fs::OpenOptions;
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        set_private_permissions(path, false)?;
+        Ok(file)
+    }
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), CacheError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() {
+                return Err(CacheError::UnsafeMetadata);
+            }
+            validate_owner(&metadata)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)?;
+            let metadata = std::fs::symlink_metadata(path)?;
+            if !metadata.file_type().is_dir() {
+                return Err(CacheError::UnsafeMetadata);
+            }
+            validate_owner(&metadata)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    set_private_permissions(path, true)?;
+    validate_private_metadata(&std::fs::symlink_metadata(path)?, true)
+}
+
+#[cfg(unix)]
+fn open_cache_lock(path: &Path) -> Result<File, CacheError> {
+    use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, open};
+    let descriptor = open(
+        path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(std::io::Error::from)?;
+    let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+        || metadata.st_nlink != 1
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(CacheError::UnsafeMetadata);
+    }
+    fchmod(&descriptor, Mode::from_raw_mode(0o600)).map_err(std::io::Error::from)?;
+    Ok(File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn open_cache_lock(path: &Path) -> Result<File, CacheError> {
+    use std::fs::OpenOptions;
+    let metadata = std::fs::symlink_metadata(path);
+    if metadata
+        .as_ref()
+        .is_ok_and(|value| !value.file_type().is_file())
+    {
+        return Err(CacheError::UnsafeMetadata);
+    }
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?)
 }
 
 fn copy_and_hash_bounded<R: Read, W: Write>(
@@ -838,7 +921,10 @@ fn validate_private_metadata(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.mode() & 0o077 != 0 || (!directory && metadata.nlink() != 1) {
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o077 != 0
+            || (!directory && metadata.nlink() != 1)
+        {
             return Err(CacheError::UnsafeMetadata);
         }
     }
@@ -846,12 +932,44 @@ fn validate_private_metadata(
 }
 
 #[cfg(unix)]
+fn validate_owner(metadata: &std::fs::Metadata) -> Result<(), CacheError> {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(CacheError::UnsafeMetadata);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_owner(_metadata: &std::fs::Metadata) -> Result<(), CacheError> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn set_private_permissions(path: &Path, directory: bool) -> Result<(), std::io::Error> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(
-        path,
-        std::fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 }),
+    use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, open};
+    let flags = if directory {
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+    } else {
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+    };
+    let descriptor = open(path, flags, Mode::empty()).map_err(std::io::Error::from)?;
+    let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
+    if (directory && FileType::from_raw_mode(metadata.st_mode) != FileType::Directory)
+        || (!directory && FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile)
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+        || (!directory && metadata.st_nlink != 1)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unsafe cache metadata",
+        ));
+    }
+    fchmod(
+        &descriptor,
+        Mode::from_raw_mode(if directory { 0o700 } else { 0o600 }),
     )
+    .map_err(std::io::Error::from)
 }
 #[cfg(not(unix))]
 fn set_private_permissions(_path: &Path, _directory: bool) -> Result<(), std::io::Error> {
@@ -968,11 +1086,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn rejects_symlinked_cache_root_before_directory_creation() -> Result<(), CacheError> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let target = temporary.path().join("target");
+        std::fs::create_dir(&target)?;
+        let root = temporary.path().join("cache");
+        symlink(&target, &root)?;
+        assert!(matches!(
+            Cache::open(&root),
+            Err(CacheError::UnsafeMetadata)
+        ));
+        assert!(!target.join("objects").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rejects_link_substitution_for_objects_and_artifacts() -> Result<(), CacheError> {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir()?;
         let cache = Cache::open(temp.path())?;
+        let lock_target = temp.path().join("outside-lock");
+        std::fs::write(&lock_target, b"not-cache-lock")?;
+        symlink(&lock_target, temp.path().join(".lock"))?;
+        assert!(matches!(
+            cache.put(b"rejected lock substitution"),
+            Err(CacheError::Io(_))
+        ));
+        std::fs::remove_file(temp.path().join(".lock"))?;
         let digest = cache.put(b"ciphertext only")?;
         let object = cache.root().join("objects").join(&digest);
         let outside = temp.path().join("outside");

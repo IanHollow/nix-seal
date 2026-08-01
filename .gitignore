@@ -3,3 +3,4 @@
 /result
 *.age.tmp
 *.identity
+/.nix-seal/

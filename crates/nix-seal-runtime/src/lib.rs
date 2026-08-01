@@ -9,7 +9,7 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -625,12 +625,17 @@ impl Generation {
         gid: u32,
     ) -> Result<File, RuntimeError> {
         validate_mode(mode)?;
-        let path = self.transaction.path().join(id.as_str());
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-            validate_private_ancestors(self.transaction.path(), parent)?;
-        }
-        let file = create_exclusive_secret_file(&path)?;
+        #[cfg(unix)]
+        let file = create_secret_file_relative(self.transaction.path(), id.as_str())?;
+        #[cfg(not(unix))]
+        let file = {
+            let path = self.transaction.path().join(id.as_str());
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+                validate_private_ancestors(self.transaction.path(), parent)?;
+            }
+            create_exclusive_secret_file(&path)?
+        };
         set_file_owner(&file, uid, gid)?;
         set_file_mode(&file, mode)?;
         Ok(file)
@@ -736,7 +741,7 @@ impl Generation {
         }
         let source = self.transaction.keep();
         std::fs::rename(source, &destination)?;
-        File::open(&self.root)?.sync_all()?;
+        open_directory_nofollow(&self.root)?.sync_all()?;
 
         let pending_result = if actions.is_some() {
             write_pending(&self.root, &destination, plan_hash)
@@ -853,15 +858,12 @@ fn write_pending(root: &Path, generation: &Path, plan_hash: &str) -> Result<(), 
         let _ = open_regular_nofollow(&next)?;
         std::fs::remove_file(&next)?;
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&next)?;
+    let mut file = create_exclusive_secret_file(&next)?;
     set_file_mode(&file, 0o600)?;
     file.write_all(pending_payload(generation, plan_hash)?.as_bytes())?;
     file.sync_all()?;
     std::fs::rename(next, root.join(PENDING_MARKER))?;
-    File::open(root)?.sync_all()?;
+    open_directory_nofollow(root)?.sync_all()?;
     Ok(())
 }
 
@@ -870,7 +872,7 @@ fn clear_pending(root: &Path) -> Result<(), RuntimeError> {
         let marker = root.join(PENDING_MARKER);
         let _ = open_regular_nofollow(&marker)?;
         std::fs::remove_file(marker)?;
-        File::open(root)?.sync_all()?;
+        open_directory_nofollow(root)?.sync_all()?;
     }
     Ok(())
 }
@@ -1369,6 +1371,7 @@ fn validate_runtime_root_identity(root: &Path) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn validate_private_ancestors(root: &Path, leaf: &Path) -> Result<(), RuntimeError> {
     let relative = leaf
         .strip_prefix(root)
@@ -1383,6 +1386,88 @@ fn validate_private_ancestors(root: &Path, leaf: &Path) -> Result<(), RuntimeErr
         set_mode(&current, 0o700)?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn create_secret_file_relative(transaction: &Path, relative: &str) -> Result<File, RuntimeError> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
+
+    let mut parent = open(
+        transaction,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| RuntimeError::Io(error.into()))
+    .and_then(|descriptor| {
+        let metadata = fstat(&descriptor).map_err(|error| RuntimeError::Io(error.into()))?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
+            || metadata.st_uid != rustix::process::geteuid().as_raw()
+        {
+            return Err(RuntimeError::UnsafeSource);
+        }
+        Ok(File::from(descriptor))
+    })?;
+
+    let mut components = relative.split('/');
+    let leaf = components
+        .next_back()
+        .ok_or(RuntimeError::InvalidDestination)?;
+    for component in components {
+        parent = open_or_create_private_directory(&parent, component)?;
+    }
+    let descriptor = openat(
+        &parent,
+        leaf,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+            RuntimeError::InvalidDestination
+        } else {
+            RuntimeError::Io(error.into())
+        }
+    })?;
+    let metadata = fstat(&descriptor).map_err(|error| RuntimeError::Io(error.into()))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+        || metadata.st_nlink != 1
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(RuntimeError::UnsafeSource);
+    }
+    Ok(File::from(descriptor))
+}
+
+#[cfg(unix)]
+fn open_or_create_private_directory(parent: &File, name: &str) -> Result<File, RuntimeError> {
+    use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, mkdirat, openat};
+
+    match mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(error) => return Err(RuntimeError::Io(error.into())),
+    }
+    let descriptor = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+            RuntimeError::InvalidDestination
+        } else {
+            RuntimeError::Io(error.into())
+        }
+    })?;
+    let metadata = fstat(&descriptor).map_err(|error| RuntimeError::Io(error.into()))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(RuntimeError::UnsafeSource);
+    }
+    fchmod(&descriptor, Mode::from_raw_mode(0o700))
+        .map_err(|error| RuntimeError::Io(error.into()))?;
+    Ok(File::from(descriptor))
 }
 
 fn sync_tree(root: &Path) -> Result<(), RuntimeError> {
@@ -1403,7 +1488,7 @@ fn sync_tree(root: &Path) -> Result<(), RuntimeError> {
         }
     }
     for directory in directories.iter().rev() {
-        File::open(directory)?.sync_all()?;
+        open_directory_nofollow(directory)?.sync_all()?;
     }
     Ok(())
 }
@@ -1436,7 +1521,7 @@ fn switch_current(root: &Path, generation: u64) -> Result<(), RuntimeError> {
     }
     symlink(format!("generation-{generation}"), &next)?;
     std::fs::rename(&next, &current)?;
-    File::open(root)?.sync_all()?;
+    open_directory_nofollow(root)?.sync_all()?;
     Ok(())
 }
 
@@ -1489,6 +1574,30 @@ fn open_regular_nofollow(path: &Path) -> Result<File, RuntimeError> {
 }
 
 #[cfg(unix)]
+fn open_directory_nofollow(path: &Path) -> Result<File, RuntimeError> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+            RuntimeError::InvalidDestination
+        } else {
+            RuntimeError::Io(error.into())
+        }
+    })?;
+    let metadata = fstat(&descriptor).map_err(|error| RuntimeError::Io(error.into()))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(RuntimeError::InvalidDestination);
+    }
+    Ok(File::from(descriptor))
+}
+
+#[cfg(unix)]
 fn create_exclusive_secret_file(path: &Path) -> Result<File, RuntimeError> {
     use rustix::fs::{FileType, Mode, OFlags, fstat, open};
     let descriptor = open(
@@ -1513,6 +1622,7 @@ fn create_exclusive_secret_file(path: &Path) -> Result<File, RuntimeError> {
 
 #[cfg(not(unix))]
 fn create_exclusive_secret_file(path: &Path) -> Result<File, RuntimeError> {
+    use std::fs::OpenOptions;
     Ok(OpenOptions::new().write(true).create_new(true).open(path)?)
 }
 
@@ -1543,6 +1653,7 @@ fn open_activation_lock(path: &Path) -> Result<File, RuntimeError> {
 
 #[cfg(not(unix))]
 fn open_activation_lock(path: &Path) -> Result<File, RuntimeError> {
+    use std::fs::OpenOptions;
     let metadata = std::fs::symlink_metadata(path);
     if metadata.is_ok_and(|value| !value.file_type().is_file()) {
         return Err(RuntimeError::UnsafeSource);
@@ -1560,6 +1671,15 @@ fn open_regular_nofollow(path: &Path) -> Result<File, RuntimeError> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
         return Err(RuntimeError::UnsafeSource);
+    }
+    Ok(File::open(path)?)
+}
+
+#[cfg(not(unix))]
+fn open_directory_nofollow(path: &Path) -> Result<File, RuntimeError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(RuntimeError::InvalidDestination);
     }
     Ok(File::open(path)?)
 }
@@ -2416,6 +2536,22 @@ mod tests {
             generation.create_file(&secret, 0o400),
             Err(RuntimeError::InvalidDestination)
         ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_pending_transaction() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("runtime");
+        std::fs::create_dir(&root)?;
+        let outside = temporary.path().join("outside");
+        std::fs::write(&outside, b"must remain unchanged")?;
+        symlink(&outside, root.join(".post-switch-next"))?;
+        assert!(write_pending(&root, &root.join("generation-1"), PLAN_HASH).is_err());
+        assert_eq!(std::fs::read(&outside)?, b"must remain unchanged");
         Ok(())
     }
 

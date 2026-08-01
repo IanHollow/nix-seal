@@ -53,7 +53,12 @@ Runtime owner and group names are resolved before a plaintext transaction is
 created. The runtime applies the resulting numeric IDs with descriptor-based
 `fchown`, then reapplies the restrictive mode with descriptor-based `fchmod` so
 ownership changes cannot clear the intended final permission bits or introduce a
-path-resolution race.
+path-resolution race. On Unix, destination directories are opened and created
+relative to a no-follow transaction directory descriptor with
+`openat`/`mkdirat`; the final file uses exclusive `openat` creation with
+`O_NOFOLLOW|O_CLOEXEC`. This keeps parent-directory resolution bound to
+descriptors instead of relying on a path re-check between `create_dir_all` and
+file creation.
 
 Before publishing, activation compares the complete candidate generation with
 the active generation using bounded in-memory hashes plus owner, group, and mode

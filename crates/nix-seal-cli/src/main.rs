@@ -15,6 +15,7 @@ use fs2::FileExt;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -23,10 +24,14 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const EXTERNAL_MIGRATION_MAX_PLAINTEXT_BYTES: u64 = 64 * 1024 * 1024;
 const EXTERNAL_MIGRATION_TIMEOUT: Duration = Duration::from_mins(2);
+#[cfg_attr(any(not(target_os = "linux"), test), allow(dead_code))]
+const GENERATOR_WORKER_MAGIC: &[u8] = b"nix-seal-generator-worker-v1\n";
+#[cfg_attr(any(not(target_os = "linux"), test), allow(dead_code))]
+const GENERATOR_WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const PASSPHRASE_WORDS: [&str; 64] = [
     "amber", "anchor", "april", "arch", "aspen", "atlas", "aurora", "bamboo", "beacon", "birch",
     "blue", "brisk", "canyon", "cedar", "cinder", "cobalt", "comet", "coral", "crystal", "dawn",
@@ -65,6 +70,8 @@ struct GeneratorStateV1 {
     generator_id: nix_seal_core::Id,
     validation: String,
     outputs: Vec<nix_seal_core::Id>,
+    #[serde(default)]
+    public_outputs: Vec<nix_seal_core::Id>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,6 +194,12 @@ enum Command {
     /// Internal authenticated runtime activation entrypoint.
     #[command(hide = true)]
     Activate(ActivateArgs),
+    /// Internal isolated age-plugin worker. This is not a stable user command.
+    #[command(name = "__plugin-worker", hide = true)]
+    PluginWorker,
+    /// Internal Linux network-isolation worker. This is not a stable user command.
+    #[command(name = "__generator-worker", hide = true)]
+    GeneratorWorker(GeneratorWorkerArgs),
     /// Secret authoring operations.
     #[command(subcommand)]
     Secret(SecretCommand),
@@ -223,6 +236,10 @@ enum KeyCommand {
     Generate {
         #[arg(long)]
         identity_out: PathBuf,
+        /// Protect the recovery identity with an interactive age scrypt
+        /// passphrase. Never use this mode for unattended automation.
+        #[arg(long)]
+        passphrase: bool,
     },
     /// Print the public recipient for an age `X25519` identity file.
     Inspect {
@@ -490,6 +507,50 @@ struct GenerateArgs {
     /// Private response file bound to one declared generator prompt as `ID=PATH`.
     #[arg(long = "prompt-file", value_name = "ID=PATH")]
     prompt_files: Vec<String>,
+    /// Read missing prompt responses from the controlling terminal. This is
+    /// explicit because interactive input is never appropriate for automation.
+    #[arg(long)]
+    interactive: bool,
+}
+
+#[derive(Args)]
+struct GeneratorWorkerArgs {
+    /// Absolute declared generator executable.
+    #[arg(long)]
+    executable: PathBuf,
+    /// One public argument passed directly to the declared executable.
+    #[arg(long = "generator-arg", allow_hyphen_values = true)]
+    generator_args: Vec<OsString>,
+    /// Sanitized runtime-input PATH assembled by the parent.
+    #[arg(long)]
+    runtime_path: Option<OsString>,
+    /// Private generator workspace.
+    #[arg(long)]
+    workspace: PathBuf,
+    /// Private secret output directory.
+    #[arg(long)]
+    output_directory: PathBuf,
+    /// Private public output directory.
+    #[arg(long)]
+    public_output_directory: PathBuf,
+    /// Private prompt directory.
+    #[arg(long)]
+    prompt_directory: PathBuf,
+    /// Number of declared prompt files.
+    #[arg(long)]
+    prompt_count: usize,
+    /// Private canonical-secret dependency directory.
+    #[arg(long)]
+    secret_directory: PathBuf,
+    /// Number of declared secret dependencies.
+    #[arg(long)]
+    secret_count: usize,
+    /// Number of secret outputs.
+    #[arg(long)]
+    output_count: usize,
+    /// Number of public outputs.
+    #[arg(long)]
+    public_output_count: usize,
 }
 
 #[derive(Args)]
@@ -513,6 +574,8 @@ enum SecretCommand {
     Import(SecretWriteArgs),
     /// Edit through an explicit executable in a private ephemeral workspace.
     Edit(SecretEditArgs),
+    /// Re-encrypt canonical ciphertext to the current recipient policy without changing its value.
+    Rekey(SecretRekeyArgs),
     /// Move canonical ciphertext into a private recoverable quarantine.
     Delete(SecretDeleteArgs),
     /// Decrypt to stdout. This is the only command that emits plaintext.
@@ -535,6 +598,8 @@ enum SecretFormat {
     Json,
     /// Validate stdin as a strict TOML document before encrypting its original bytes.
     Toml,
+    /// Validate stdin as a bounded YAML document before encrypting its original bytes.
+    Yaml,
     /// Validate stdin as a bounded dotenv collection before encrypting its original bytes.
     Dotenv,
 }
@@ -562,6 +627,22 @@ struct SecretWriteArgs {
     /// Optional logical collection format to validate before encryption.
     #[arg(long, value_enum)]
     format: Option<SecretFormat>,
+}
+
+#[derive(Args)]
+struct SecretRekeyArgs {
+    #[command(flatten)]
+    policy: SecretPlanArgs,
+    /// Repository root used to resolve the plan's canonical ciphertext source.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Administrator/recovery identity used to decrypt and verify the replacement.
+    /// It is read only when --yes is supplied.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Required non-interactive acknowledgement for in-place canonical replacement.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Args)]
@@ -636,41 +717,150 @@ enum CacheCommand {
     },
 }
 
+#[derive(Args)]
+struct AgeTreeMigrationArgs {
+    /// Existing directory containing canonical `*.age` ciphertext files.
+    #[arg(long, default_value = "secrets")]
+    directory: PathBuf,
+    /// Repository root containing both the legacy and destination trees.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Repository-relative destination tree for a side-by-side import.
+    #[arg(long)]
+    destination: Option<PathBuf>,
+    /// Private identity authorized to decrypt every legacy ciphertext.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Explicit replacement recipient; repeat for each recipient.
+    #[arg(long = "recipient")]
+    recipients: Vec<String>,
+    /// Replace existing destination ciphertexts; omission is create-only.
+    #[arg(long)]
+    replace: bool,
+    /// Commit the complete preflighted migration. Without this flag the
+    /// command reports the mapping and never reads the private identity.
+    #[arg(long)]
+    execute: bool,
+}
+
+#[derive(Args)]
+struct AgenixRekeyMigrationArgs {
+    /// Public agenix-rekey export produced by `nixSeal.lib.agenixRekeyMigrationExport`.
+    #[arg(long)]
+    metadata: PathBuf,
+    /// Repository root containing the legacy rekey files and destination tree.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Repository-relative destination tree for a side-by-side import.
+    #[arg(long)]
+    destination: Option<PathBuf>,
+    /// Private administrator/recovery identity that can decrypt every source file.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Explicit replacement recipient; repeat for each recipient.
+    #[arg(long = "recipient")]
+    recipients: Vec<String>,
+    /// Replace existing destination ciphertexts; omission is create-only.
+    #[arg(long)]
+    replace: bool,
+    /// Commit the complete preflighted migration. Without this flag the command
+    /// reports the mapping and never reads the private identity.
+    #[arg(long)]
+    execute: bool,
+}
+
+#[derive(Args)]
+struct ClanVarsMigrationArgs {
+    /// Clan's existing `vars/per-machine` directory.
+    #[arg(long, default_value = "vars/per-machine")]
+    directory: PathBuf,
+    /// Repository root containing the legacy Vars tree and destination tree.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Repository-relative destination tree for a side-by-side import.
+    #[arg(long)]
+    destination: Option<PathBuf>,
+    /// Private identity authorized to verify every replacement ciphertext.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Explicit replacement recipient; repeat for each recipient.
+    #[arg(long = "recipient")]
+    recipients: Vec<String>,
+    /// Replace existing destination ciphertexts; omission is create-only.
+    #[arg(long)]
+    replace: bool,
+    /// Commit the complete preflighted migration. Without this flag the
+    /// command reports the mapping and never reads legacy values.
+    #[arg(long)]
+    execute: bool,
+}
+
+#[derive(Args)]
+struct ClanFactsMigrationArgs {
+    /// Clan's existing `machines/<machine>/facts` tree.
+    #[arg(long, default_value = "machines")]
+    directory: PathBuf,
+    /// Repository root containing the legacy Facts tree and destination tree.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Repository-relative destination tree for a side-by-side public import.
+    #[arg(long)]
+    destination: Option<PathBuf>,
+    /// Replace existing destination files; omission is create-only.
+    #[arg(long)]
+    replace: bool,
+    /// Commit the complete preflighted migration. Without this flag the
+    /// command reports the mapping and never reads legacy values.
+    #[arg(long)]
+    execute: bool,
+}
+
+#[derive(Args)]
+struct SecretctlMigrationArgs {
+    /// `nix eval --json .#secretIndex` output saved to a public JSON file.
+    #[arg(long)]
+    index: PathBuf,
+    /// Write a new canonical public `plan.v1.json` candidate; refuses to overwrite.
+    #[arg(long)]
+    plan_output: Option<PathBuf>,
+    /// Required target-system mapping for a candidate plan as `LEGACY_TARGET=SYSTEM`.
+    #[arg(long = "target-system", value_name = "LEGACY_TARGET=SYSTEM")]
+    target_systems: Vec<String>,
+    /// Trusted approval signer for a candidate plan as `ID=PUBLIC_KEY`; repeat as needed.
+    #[arg(long = "signer", value_name = "ID=PUBLIC_KEY")]
+    signers: Vec<String>,
+    /// Repository root containing the legacy secretctl ciphertexts and destination tree.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Repository-relative destination tree for a side-by-side import.
+    #[arg(long)]
+    destination: Option<PathBuf>,
+    /// Private identity authorized to decrypt every legacy ciphertext.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    /// Explicit replacement recipient; repeat for each recipient.
+    #[arg(long = "recipient")]
+    recipients: Vec<String>,
+    /// Replace existing destination ciphertexts; omission is create-only.
+    #[arg(long)]
+    replace: bool,
+    /// Commit the complete preflighted import. Without this flag no ciphertext is opened.
+    #[arg(long)]
+    execute: bool,
+}
+
 #[derive(Subcommand)]
 enum MigrateCommand {
-    /// Inspect a public secretctl `secretIndex` JSON export and optionally write a new candidate plan.
-    Secretctl {
-        /// `nix eval --json .#secretIndex` output saved to a public JSON file.
-        #[arg(long)]
-        index: PathBuf,
-        /// Write a new canonical public `plan.v1.json` candidate; refuses to overwrite.
-        #[arg(long)]
-        plan_output: Option<PathBuf>,
-        /// Required target-system mapping for a candidate plan as `LEGACY_TARGET=SYSTEM`.
-        #[arg(long = "target-system", value_name = "LEGACY_TARGET=SYSTEM")]
-        target_systems: Vec<String>,
-        /// Trusted approval signer for a candidate plan as `ID=PUBLIC_KEY`; repeat as needed.
-        #[arg(long = "signer", value_name = "ID=PUBLIC_KEY")]
-        signers: Vec<String>,
-    },
-    /// Inspect an agenix ciphertext tree without changing files or decrypting data.
-    Agenix {
-        /// Existing directory containing canonical `*.age` ciphertext files.
-        #[arg(long, default_value = "secrets")]
-        directory: PathBuf,
-    },
-    /// Inspect a ragenix ciphertext tree; its ciphertext layout is agenix-compatible.
-    Ragenix {
-        /// Existing directory containing canonical `*.age` ciphertext files.
-        #[arg(long, default_value = "secrets")]
-        directory: PathBuf,
-    },
-    /// Inspect a strict public agenix-rekey configuration export without decrypting data.
-    AgenixRekey {
-        /// JSON produced by `nixSeal.lib.agenixRekeyMigrationExport`.
-        #[arg(long)]
-        metadata: PathBuf,
-    },
+    /// Inspect or bulk-import a public secretctl `secretIndex` JSON export.
+    Secretctl(SecretctlMigrationArgs),
+    /// Inspect or bulk-rekey an agenix ciphertext tree. The legacy tree is
+    /// never modified; import writes a side-by-side destination tree.
+    Agenix(AgeTreeMigrationArgs),
+    /// Inspect or bulk-rekey a ragenix ciphertext tree; its ciphertext layout
+    /// is agenix-compatible.
+    Ragenix(AgeTreeMigrationArgs),
+    /// Inspect or bulk-rekey a strict public agenix-rekey configuration export.
+    AgenixRekey(AgenixRekeyMigrationArgs),
     /// Inspect structured SOPS JSON files without decrypting values or invoking SOPS.
     SopsJson {
         /// Existing directory containing SOPS-encrypted `*.json` files.
@@ -737,18 +927,10 @@ enum MigrateCommand {
         #[arg(long)]
         execute: bool,
     },
-    /// Inspect Clan Vars per-machine output leaves without reading their values.
-    ClanVars {
-        /// Clan's `vars/per-machine` directory.
-        #[arg(long, default_value = "vars/per-machine")]
-        directory: PathBuf,
-    },
-    /// Inspect Clan Facts public leaves without reading their values.
-    ClanFacts {
-        /// Clan `machines` directory containing per-machine `facts` directories.
-        #[arg(long, default_value = "machines")]
-        directory: PathBuf,
-    },
+    /// Inspect or bulk-import Clan Vars per-machine output leaves.
+    ClanVars(ClanVarsMigrationArgs),
+    /// Inspect or bulk-import Clan Facts public leaves.
+    ClanFacts(ClanFactsMigrationArgs),
     /// Stream one legacy age ciphertext into explicit new recipients.
     Ciphertext {
         /// Existing repository root; source and destination must remain below it.
@@ -867,6 +1049,8 @@ fn run(cli: Cli) -> Result<()> {
         Command::Provision(arguments) => run_provision(arguments, cli.json)?,
         Command::Generate(arguments) => run_generate(&arguments, cli.json)?,
         Command::Activate(arguments) => run_activate(&arguments, cli.json)?,
+        Command::PluginWorker => run_plugin_worker()?,
+        Command::GeneratorWorker(arguments) => run_generator_worker_main(&arguments)?,
         Command::Secret(command) => run_secret(command, cli.json)?,
         Command::Rotate(arguments) => run_secret_write(
             &arguments,
@@ -980,7 +1164,7 @@ fn run_plan(
 ) -> Result<()> {
     let plan = load_plan(toml, nix_plan)?;
     nix_seal_policy::validate(&plan)?;
-    validate_plan_identity_material(&plan, false)?;
+    validate_plan_identity_material(&plan)?;
     let plan_hash = nix_seal_policy::plan_hash(&plan)?;
     if let Some(target) = target {
         let policy = nix_seal_policy::target_policy(&plan, &target)?;
@@ -1038,7 +1222,7 @@ fn run_check(
 ) -> Result<()> {
     let plan = load_plan(toml, nix_plan)?;
     nix_seal_policy::validate(&plan)?;
-    validate_plan_identity_material(&plan, false)?;
+    validate_plan_identity_material(&plan)?;
     validate_plan_templates(&plan, toml)?;
     let hash = nix_seal_policy::plan_hash(&plan)?;
     if deep {
@@ -1109,6 +1293,17 @@ fn run_doctor(
                 .to_owned(),
         );
     }
+    let recovery_identity_count = plan
+        .identities
+        .values()
+        .filter(|identity| matches!(identity.kind, nix_seal_core::IdentityKind::Recovery))
+        .count();
+    if !plan.secrets.is_empty() && recovery_identity_count < 2 {
+        warnings.push(
+            "fewer than two recovery identities are declared; add independent recovery paths before relying on this plan"
+                .to_owned(),
+        );
+    }
     if stale_artifacts > 0 {
         warnings.push(format!(
             "{stale_artifacts} cache artifact(s) do not match the current authenticated plan and are garbage-collection candidates"
@@ -1129,6 +1324,7 @@ fn run_doctor(
                 "planHash":plan_hash,
                 "secrets":plan.secrets.len(),
                 "targets":plan.targets.len(),
+                "recoveryIdentities":recovery_identity_count,
                 "cache":{
                     "root":cache.root(),
                     "objects":inventory.object_count,
@@ -1204,14 +1400,13 @@ fn run_template_render(
         .with_context(|| format!("public template source for {template_id} is invalid"))?;
 
     let identity = read_identity(identity_path)?;
-    let public = nix_seal_crypto::recipient_from_identity(&identity)?;
     let mut secret_paths = BTreeMap::new();
     for placeholder in template.placeholders.values() {
         let recipients = nix_seal_policy::secret_recipients(&plan, &placeholder.secret)?;
         if !recipients
             .recipients
             .values()
-            .any(|recipient| recipient == &public)
+            .any(|recipient| nix_seal_crypto::identity_matches_recipient(&identity, recipient))
         {
             bail!(
                 "render identity is not authorized by canonical recipient policy for {}",
@@ -1431,21 +1626,10 @@ struct ValidatedSecretctlSecrets {
 
 fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
     match command {
-        MigrateCommand::Secretctl {
-            index,
-            plan_output,
-            target_systems,
-            signers,
-        } => migrate_secretctl(
-            &index,
-            plan_output.as_deref(),
-            &target_systems,
-            &signers,
-            json,
-        ),
-        MigrateCommand::Agenix { directory } => migrate_agenix_tree(&directory, "agenix", json),
-        MigrateCommand::Ragenix { directory } => migrate_agenix_tree(&directory, "ragenix", json),
-        MigrateCommand::AgenixRekey { metadata } => migrate_agenix_rekey_export(&metadata, json),
+        MigrateCommand::Secretctl(arguments) => migrate_secretctl(&arguments, json),
+        MigrateCommand::Agenix(arguments) => migrate_agenix_tree(&arguments, "agenix", json),
+        MigrateCommand::Ragenix(arguments) => migrate_agenix_tree(&arguments, "ragenix", json),
+        MigrateCommand::AgenixRekey(arguments) => migrate_agenix_rekey_export(&arguments, json),
         MigrateCommand::SopsJson { directory } => migrate_sops_json_tree(&directory, json),
         MigrateCommand::Sops {
             repository_root,
@@ -1491,8 +1675,8 @@ fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
             execute,
             json,
         ),
-        MigrateCommand::ClanVars { directory } => migrate_clan_vars_tree(&directory, json),
-        MigrateCommand::ClanFacts { directory } => migrate_clan_facts_tree(&directory, json),
+        MigrateCommand::ClanVars(arguments) => migrate_clan_vars_tree(&arguments, json),
+        MigrateCommand::ClanFacts(arguments) => migrate_clan_facts_tree(&arguments, json),
         MigrateCommand::Ciphertext {
             repository_root,
             source,
@@ -1653,6 +1837,7 @@ fn migrate_sops_document(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .env_clear();
+    isolate_child_process_group(&mut command);
     if let Some(path) = &sops_age_key_file {
         command.env("SOPS_AGE_KEY_FILE", path);
     }
@@ -1673,7 +1858,7 @@ fn migrate_sops_document(
             && let Ok(mut child) = watchdog_child.lock()
             && child.try_wait().ok().flatten().is_none()
         {
-            let _ = child.kill();
+            terminate_child_process_tree(&mut child);
         }
     });
     let result = nix_seal_authoring::write_secret_checked(
@@ -1767,6 +1952,7 @@ fn migrate_pgp_document(
     };
 
     let mut command = pgp_decrypt_command(&gpg, &gnupg_home, &source);
+    isolate_child_process_group(&mut command);
     let mut child = command
         .spawn()
         .context("could not start the explicit GnuPG migration executable")?;
@@ -1784,7 +1970,7 @@ fn migrate_pgp_document(
             && let Ok(mut child) = watchdog_child.lock()
             && child.try_wait().ok().flatten().is_none()
         {
-            let _ = child.kill();
+            terminate_child_process_tree(&mut child);
         }
     });
     let result = nix_seal_authoring::write_secret_checked(
@@ -1895,9 +2081,114 @@ fn wait_for_external_migration(
 
 fn terminate_external_migration(child: &Arc<Mutex<Child>>) {
     if let Ok(mut child) = child.lock() {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_child_process_tree(&mut child);
     }
+}
+
+/// Starts an explicitly declared external executable in its own process group.
+///
+/// A generator or migration helper is an untrusted process boundary. Keeping
+/// descendants in a private group lets the timeout path terminate the complete
+/// tree instead of leaving a helper behind with access to staged plaintext.
+#[cfg(unix)]
+fn isolate_child_process_group(command: &mut ProcessCommand) {
+    use std::os::unix::process::CommandExt;
+
+    // `process_group(0)` asks the child to become the leader of a new group
+    // whose ID is its own PID. This is a safe std API and does not require a
+    // pre-exec hook (which would require an unsafe block).
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_child_process_group(_command: &mut ProcessCommand) {}
+
+fn terminate_child_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // Avoid signalling a reused process-group ID after the child already
+        // exited. `try_wait` also makes the subsequent wait deterministic.
+        let running = child.try_wait().ok().flatten().is_none();
+        if running && let Some(pid) = rustix::process::Pid::from_raw(child.id().cast_signed()) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn resolve_migration_repository_root(path: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "could not inspect migration repository root {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        bail!("migration repository root must be a non-symlink directory");
+    }
+    path.canonicalize()
+        .context("could not canonicalize migration repository root")
+}
+
+fn validate_migration_relative_path(path: &Path, label: &str) -> Result<()> {
+    if path.is_absolute()
+        || path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("migration {label} must be a non-empty repository-relative normal path");
+    }
+    Ok(())
+}
+
+fn resolve_migration_directory(repository_root: &Path, relative: &Path) -> Result<PathBuf> {
+    let root = resolve_migration_repository_root(repository_root)?;
+    let directory = if relative.as_os_str().is_empty() || relative == Path::new(".") {
+        root.clone()
+    } else {
+        validate_migration_relative_path(relative, "directory")?;
+        let mut current = root.clone();
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                bail!("migration directory must be a normal repository-relative path");
+            };
+            current.push(name);
+            let metadata = fs::symlink_metadata(&current).with_context(|| {
+                format!(
+                    "could not inspect migration directory {}",
+                    current.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                bail!("migration directory contains a symlink or non-directory entry");
+            }
+        }
+        current
+    };
+    let canonical = directory
+        .canonicalize()
+        .context("could not canonicalize migration directory")?;
+    if !canonical.starts_with(&root) {
+        bail!("migration directory escaped the repository root");
+    }
+    Ok(canonical)
+}
+
+fn normalize_migration_recipients(recipients: &[String]) -> Result<Vec<String>> {
+    if recipients.is_empty() || recipients.len() > 256 {
+        bail!("bulk migration requires between one and 256 replacement recipients");
+    }
+    let mut normalized = BTreeSet::new();
+    for recipient in recipients {
+        let recipient = nix_seal_crypto::normalize_recipient(recipient)
+            .context("bulk migration recipient is invalid")?;
+        if !normalized.insert(recipient) {
+            bail!("bulk migration recipients must be distinct");
+        }
+    }
+    Ok(normalized.into_iter().collect())
 }
 
 fn resolve_migration_regular_file(repository_root: &Path, relative: &Path) -> Result<PathBuf> {
@@ -1949,15 +2240,35 @@ fn resolve_external_executable(path: &Path) -> Result<PathBuf> {
         .context("could not canonicalize external migration executable")
 }
 
-fn migrate_agenix_tree(directory: &Path, source: &str, json: bool) -> Result<()> {
-    let supplied_metadata = fs::symlink_metadata(directory)
-        .with_context(|| format!("could not inspect {source} ciphertext directory"))?;
-    if supplied_metadata.file_type().is_symlink() || !supplied_metadata.file_type().is_dir() {
-        bail!("{source} ciphertext root must be a non-symlink directory");
-    }
-    let root = directory
-        .canonicalize()
-        .with_context(|| format!("could not resolve {source} ciphertext directory"))?;
+#[allow(clippy::too_many_lines)]
+fn migrate_agenix_tree(arguments: &AgeTreeMigrationArgs, source: &str, json: bool) -> Result<()> {
+    let directory = &arguments.directory;
+    let import_requested = arguments.destination.is_some()
+        || arguments.identity.is_some()
+        || !arguments.recipients.is_empty()
+        || arguments.replace
+        || arguments.execute;
+    let repository_root_for_import = if import_requested {
+        let repository_root = resolve_migration_repository_root(&arguments.repository_root)?;
+        if directory.is_absolute() {
+            bail!("bulk {source} migration requires --directory to be repository-relative");
+        }
+        Some(repository_root)
+    } else {
+        None
+    };
+    let root = if let Some(repository_root) = &repository_root_for_import {
+        resolve_migration_directory(repository_root, directory)?
+    } else {
+        let supplied_metadata = fs::symlink_metadata(directory)
+            .with_context(|| format!("could not inspect {source} ciphertext directory"))?;
+        if supplied_metadata.file_type().is_symlink() || !supplied_metadata.file_type().is_dir() {
+            bail!("{source} ciphertext root must be a non-symlink directory");
+        }
+        directory
+            .canonicalize()
+            .with_context(|| format!("could not resolve {source} ciphertext directory"))?
+    };
     let metadata = fs::symlink_metadata(&root)?;
     if !metadata.file_type().is_dir() {
         bail!("{source} ciphertext root is not a directory");
@@ -1967,43 +2278,148 @@ fn migrate_agenix_tree(directory: &Path, source: &str, json: bool) -> Result<()>
     if ciphertexts.is_empty() {
         bail!("{source} ciphertext directory contains no .age files");
     }
+    let (repository_root, source_relative_root, destination_root, replacement_recipients) =
+        if import_requested {
+            let repository_root = repository_root_for_import
+                .clone()
+                .context("bulk migration repository root was not initialized")?;
+            let source_relative_root = root
+                .strip_prefix(&repository_root)
+                .context("legacy ciphertext directory escaped repository root")?
+                .to_owned();
+            let destination = arguments
+                .destination
+                .as_deref()
+                .context("bulk migration requires --destination")?;
+            validate_migration_relative_path(destination, "destination")?;
+            let destination_root = destination.to_owned();
+            let destination_lexical = repository_root.join(&destination_root);
+            if destination_lexical.starts_with(&root) || root.starts_with(&destination_lexical) {
+                bail!("bulk migration destination must be side-by-side with the legacy tree");
+            }
+            let identity = arguments
+                .identity
+                .as_deref()
+                .context("bulk migration requires --identity")?;
+            if !identity.is_absolute() {
+                bail!("bulk migration identity must be an absolute private path");
+            }
+            let replacement_recipients = normalize_migration_recipients(&arguments.recipients)?;
+            (
+                repository_root,
+                source_relative_root,
+                destination_root,
+                replacement_recipients,
+            )
+        } else {
+            (PathBuf::new(), PathBuf::new(), PathBuf::new(), Vec::new())
+        };
+    let mut entries = Vec::with_capacity(ciphertexts.len());
     let mappings = ciphertexts
         .iter()
         .map(|path| {
             let relative = path
                 .strip_prefix(&root)
-                .context("agenix ciphertext escaped its canonical root")?;
+                .context("agenix ciphertext escaped its canonical root")?
+                .to_owned();
             let stem = relative.with_extension("");
             let legacy_id = stem
                 .to_str()
                 .context("agenix ciphertext path is not UTF-8")?;
-            Ok(serde_json::json!({
+            let nix_seal_id = migrated_id(&format!("{source}/{legacy_id}"))?;
+            let mut mapping = serde_json::json!({
                 "legacyId":legacy_id,
-                "nixSealId":migrated_id(&format!("{source}/{legacy_id}"))?,
+                "nixSealId":nix_seal_id,
                 "source":relative,
-            }))
+            });
+            if import_requested {
+                let source_relative = source_relative_root.join(&relative);
+                let destination = destination_root.join(&relative);
+                mapping["destination"] = serde_json::json!(destination);
+                entries.push((source_relative, destination));
+            }
+            Ok(mapping)
         })
         .collect::<Result<Vec<_>>>()?;
-    let warnings = vec![
-        "dry run only: no ciphertext, configuration, or source manager was changed",
-        "ciphertext headers were validated but recipient policy is not encoded in agenix ciphertext paths; supply an explicit nix-seal recipient and target mapping before import",
-        "only regular .age files were accepted; symlinks and non-regular entries are rejected",
-    ];
+    let warnings = if import_requested {
+        vec![
+            if arguments.execute {
+                "side-by-side migration committed only after every source was staged and round-trip verified"
+            } else {
+                "dry run only: no ciphertext, configuration, or source manager was changed"
+            },
+            "recipient policy is explicit for every migrated ciphertext; the legacy tree remains available for rollback and comparison",
+            "only regular .age files were accepted; symlinks and non-regular entries are rejected",
+        ]
+    } else {
+        vec![
+            "dry run only: no ciphertext, configuration, or source manager was changed",
+            "ciphertext headers were validated but recipient policy is not encoded in agenix ciphertext paths; provide an explicit nix-seal recipient and target mapping before import",
+            "only regular .age files were accepted; symlinks and non-regular entries are rejected",
+        ]
+    };
+    let mut mappings = mappings;
+    if import_requested && arguments.execute {
+        let identity_path = arguments
+            .identity
+            .as_deref()
+            .context("bulk migration identity was not provided")?;
+        let identity = read_identity(identity_path)?;
+        let writes = entries
+            .iter()
+            .map(
+                |(relative_source, destination)| nix_seal_authoring::BatchRekeyWrite {
+                    relative_source,
+                    relative_destination: destination,
+                    recipients: &replacement_recipients,
+                },
+            )
+            .collect::<Vec<_>>();
+        let results = nix_seal_authoring::rekey_secret_batch(
+            &repository_root,
+            &writes,
+            &identity,
+            if arguments.replace {
+                nix_seal_authoring::WriteMode::Replace
+            } else {
+                nix_seal_authoring::WriteMode::Create
+            },
+        )?;
+        for (mapping, result) in mappings.iter_mut().zip(results) {
+            mapping["ciphertextHash"] = serde_json::json!(result.ciphertext_hash);
+            mapping["plaintextBytes"] = serde_json::json!(result.plaintext_bytes);
+        }
+    }
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "schema":"nix-seal.migration-report.v1",
                 "source":source,
-                "dryRun":true,
+                "dryRun":!import_requested || !arguments.execute,
+                "recipientPolicy":if import_requested { serde_json::json!({"recipients":&replacement_recipients}) } else { serde_json::Value::Null },
                 "secrets":mappings,
                 "warnings":warnings
             })
         );
     } else {
-        println!("{source} dry-run: {} ciphertexts mapped", mappings.len());
+        println!(
+            "{source} {}: {} ciphertexts mapped",
+            if import_requested && arguments.execute {
+                "migration"
+            } else {
+                "dry-run"
+            },
+            mappings.len()
+        );
         for warning in warnings {
             eprintln!("warning: {warning}");
+        }
+        if import_requested {
+            eprintln!(
+                "replacement recipient policy: {} recipient(s)",
+                replacement_recipients.len()
+            );
         }
         for mapping in mappings {
             println!(
@@ -2017,8 +2433,9 @@ fn migrate_agenix_tree(directory: &Path, source: &str, json: bool) -> Result<()>
     Ok(())
 }
 
-fn migrate_agenix_rekey_export(metadata: &Path, json: bool) -> Result<()> {
-    let input = open_public_ciphertext(metadata)
+#[allow(clippy::too_many_lines)]
+fn migrate_agenix_rekey_export(arguments: &AgenixRekeyMigrationArgs, json: bool) -> Result<()> {
+    let input = open_public_ciphertext(&arguments.metadata)
         .context("agenix-rekey metadata must be a regular non-symlink file")?;
     let export: AgenixRekeyExportV1 = serde_json::from_reader(input)
         .context("agenix-rekey metadata is not a valid strict JSON export")?;
@@ -2054,26 +2471,111 @@ fn migrate_agenix_rekey_export(metadata: &Path, json: bool) -> Result<()> {
     if masters.len() != export.master_recipients.len() {
         bail!("agenix-rekey metadata contains duplicate master recipients");
     }
+    let import_requested = arguments.destination.is_some()
+        || arguments.identity.is_some()
+        || !arguments.recipients.is_empty()
+        || arguments.replace
+        || arguments.execute;
     let mut mappings = Vec::with_capacity(export.secrets.len());
-    for (legacy_id, secret) in export.secrets {
-        let source = validate_agenix_rekey_source(&secret.rekey_file)?;
-        mappings.push(serde_json::json!({
-            "legacyId":legacy_id,
-            "nixSealId":migrated_id(&legacy_id)?,
-            "source":source,
-            "consumers":if secret.intermediary { Vec::<String>::new() } else { vec![target_id.to_string()] },
-            "repositoryOnly":secret.intermediary,
-        }));
+    let mut entries = Vec::with_capacity(export.secrets.len());
+    let mut replacement_recipients = Vec::new();
+    if import_requested {
+        let repository_root = resolve_migration_repository_root(&arguments.repository_root)?;
+        let destination = arguments
+            .destination
+            .as_deref()
+            .context("bulk agenix-rekey migration requires --destination")?;
+        validate_migration_relative_path(destination, "destination")?;
+        if destination == Path::new(".") {
+            bail!("bulk agenix-rekey destination must be a separate repository tree");
+        }
+        replacement_recipients = normalize_migration_recipients(&arguments.recipients)?;
+        let identity_path = arguments
+            .identity
+            .as_deref()
+            .context("bulk agenix-rekey migration requires --identity")?;
+        if !identity_path.is_absolute() {
+            bail!("bulk agenix-rekey migration identity must be an absolute private path");
+        }
+        let destination_root = repository_root.join(destination);
+        for (legacy_id, secret) in &export.secrets {
+            let relative_source = PathBuf::from(validate_agenix_rekey_source(&secret.rekey_file)?);
+            let source = resolve_migration_regular_file(&repository_root, &relative_source)?;
+            if destination_root.starts_with(&source) || source.starts_with(&destination_root) {
+                bail!("bulk agenix-rekey destination must not overlap a legacy source");
+            }
+            let relative_destination = destination.join(&relative_source);
+            let nix_id = migrated_id(legacy_id)?;
+            mappings.push(serde_json::json!({
+                "legacyId":legacy_id,
+                "nixSealId":nix_id,
+                "source":relative_source,
+                "destination":relative_destination,
+                "consumers":if secret.intermediary { Vec::<String>::new() } else { vec![target_id.to_string()] },
+                "repositoryOnly":secret.intermediary,
+            }));
+            entries.push((relative_source, relative_destination));
+        }
+        if arguments.execute {
+            let identity = read_identity(identity_path)?;
+            let writes = entries
+                .iter()
+                .map(|(relative_source, relative_destination)| {
+                    nix_seal_authoring::BatchRekeyWrite {
+                        relative_source,
+                        relative_destination,
+                        recipients: &replacement_recipients,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let results = nix_seal_authoring::rekey_secret_batch(
+                &repository_root,
+                &writes,
+                &identity,
+                if arguments.replace {
+                    nix_seal_authoring::WriteMode::Replace
+                } else {
+                    nix_seal_authoring::WriteMode::Create
+                },
+            )?;
+            for (mapping, result) in mappings.iter_mut().zip(results) {
+                mapping["ciphertextHash"] = serde_json::json!(result.ciphertext_hash);
+                mapping["plaintextBytes"] = serde_json::json!(result.plaintext_bytes);
+            }
+        }
+    } else {
+        for (legacy_id, secret) in export.secrets {
+            let source = validate_agenix_rekey_source(&secret.rekey_file)?;
+            mappings.push(serde_json::json!({
+                "legacyId":legacy_id,
+                "nixSealId":migrated_id(&legacy_id)?,
+                "source":source,
+                "consumers":if secret.intermediary { Vec::<String>::new() } else { vec![target_id.to_string()] },
+                "repositoryOnly":secret.intermediary,
+            }));
+        }
     }
-    let warnings = vec![
-        "dry run only: no ciphertext, configuration, cache, or source manager was changed",
-        "the export establishes rekeyed administrator-to-target semantics, but runtime ownership, lifecycle, templates, and approval policy require reviewed nix-seal mappings",
-        "intermediary secrets are repository-only and must not be given target consumers without an explicit policy decision",
-    ];
+    let warnings = if import_requested {
+        vec![
+            if arguments.execute {
+                "side-by-side migration committed only after every source was staged and round-trip verified"
+            } else {
+                "dry run only: no ciphertext, configuration, or source manager was changed"
+            },
+            "the export establishes rekeyed administrator-to-target semantics; runtime ownership, lifecycle, templates, and approval policy still require reviewed nix-seal mappings",
+            "intermediary secrets remain repository-only in the mapping and require an explicit policy decision before delivery",
+        ]
+    } else {
+        vec![
+            "dry run only: no ciphertext, configuration, cache, or source manager was changed",
+            "the export establishes rekeyed administrator-to-target semantics, but runtime ownership, lifecycle, templates, and approval policy require reviewed nix-seal mappings",
+            "intermediary secrets are repository-only and must not be given target consumers without an explicit policy decision",
+        ]
+    };
     let report = serde_json::json!({
         "schema":"nix-seal.migration-report.v1",
         "source":"agenix-rekey",
-        "dryRun":true,
+        "dryRun":!import_requested || !arguments.execute,
         "target":{
             "legacyId":export.target.id,
             "nixSealId":target_id,
@@ -2083,6 +2585,7 @@ fn migrate_agenix_rekey_export(metadata: &Path, json: bool) -> Result<()> {
             "storageMode":export.target.storage_mode,
         },
         "masterRecipientCount":masters.len(),
+        "recipientPolicy":if import_requested { serde_json::json!({"recipients":&replacement_recipients}) } else { serde_json::Value::Null },
         "secrets":mappings,
         "warnings":warnings,
     });
@@ -2090,11 +2593,30 @@ fn migrate_agenix_rekey_export(metadata: &Path, json: bool) -> Result<()> {
         println!("{report}");
     } else {
         println!(
-            "agenix-rekey dry-run: {} secrets mapped",
+            "agenix-rekey {}: {} secrets mapped",
+            if import_requested && arguments.execute {
+                "migration"
+            } else {
+                "dry-run"
+            },
             report["secrets"].as_array().map_or(0, Vec::len)
         );
         for warning in warnings {
             eprintln!("warning: {warning}");
+        }
+        if import_requested {
+            eprintln!(
+                "replacement recipient policy: {} recipient(s)",
+                replacement_recipients.len()
+            );
+        }
+        for mapping in report["secrets"].as_array().into_iter().flatten() {
+            println!(
+                "{} -> {} ({})",
+                mapping["legacyId"].as_str().unwrap_or("unknown"),
+                mapping["nixSealId"].as_str().unwrap_or("unknown"),
+                mapping["source"].as_str().unwrap_or("unknown"),
+            );
         }
     }
     Ok(())
@@ -2367,24 +2889,76 @@ struct ClanVarInventory {
 }
 
 /// Inventories Clan Vars' documented `machine/generator/file/value` leaves
-/// without opening a value for reading. A Clan store may use SOPS, a password
-/// store, or a custom backend, so byte content is intentionally opaque here.
-fn migrate_clan_vars_tree(directory: &Path, json: bool) -> Result<()> {
-    let supplied_metadata = fs::symlink_metadata(directory)
-        .context("could not inspect Clan Vars per-machine directory")?;
-    if supplied_metadata.file_type().is_symlink() || !supplied_metadata.file_type().is_dir() {
-        bail!("Clan Vars root must be a non-symlink directory");
+/// without opening a value for reading. An explicit import streams each value
+/// directly into a side-by-side native age ciphertext tree; the source manager
+/// remains untouched for rollback and comparison.
+#[allow(clippy::too_many_lines)]
+fn migrate_clan_vars_tree(arguments: &ClanVarsMigrationArgs, json: bool) -> Result<()> {
+    let import_requested = arguments.destination.is_some()
+        || arguments.identity.is_some()
+        || !arguments.recipients.is_empty()
+        || arguments.replace
+        || arguments.execute;
+    let repository_root = if import_requested {
+        Some(resolve_migration_repository_root(
+            &arguments.repository_root,
+        )?)
+    } else {
+        None
+    };
+    if import_requested && arguments.directory.is_absolute() {
+        bail!("bulk Clan Vars migration requires --directory to be repository-relative");
     }
-    let root = directory
-        .canonicalize()
-        .context("could not resolve Clan Vars per-machine directory")?;
+    let root = if let Some(repository_root) = &repository_root {
+        resolve_migration_directory(repository_root, &arguments.directory)?
+    } else {
+        let supplied_metadata = fs::symlink_metadata(&arguments.directory)
+            .context("could not inspect Clan Vars per-machine directory")?;
+        if supplied_metadata.file_type().is_symlink() || !supplied_metadata.file_type().is_dir() {
+            bail!("Clan Vars root must be a non-symlink directory");
+        }
+        arguments
+            .directory
+            .canonicalize()
+            .context("could not resolve Clan Vars per-machine directory")?
+    };
     let mut values = Vec::new();
     let mut auxiliary_files = 0_u64;
     scan_clan_vars_files(&root, &root, &mut values, &mut auxiliary_files)?;
     if values.is_empty() {
         bail!("Clan Vars per-machine directory contains no output value files");
     }
+    let (destination, replacement_recipients, identity_path) = if import_requested {
+        let repository_root = repository_root
+            .as_ref()
+            .context("bulk Clan Vars migration repository root was not initialized")?;
+        let destination = arguments
+            .destination
+            .as_deref()
+            .context("bulk Clan Vars migration requires --destination")?;
+        validate_migration_relative_path(destination, "destination")?;
+        let destination_root = repository_root.join(destination);
+        if destination_root.starts_with(&root) || root.starts_with(&destination_root) {
+            bail!("bulk Clan Vars destination must be side-by-side with the legacy tree");
+        }
+        let recipients = normalize_migration_recipients(&arguments.recipients)?;
+        let identity = arguments
+            .identity
+            .as_deref()
+            .context("bulk Clan Vars migration requires --identity")?;
+        if !identity.is_absolute() {
+            bail!("bulk Clan Vars migration identity must be an absolute private path");
+        }
+        (
+            Some(destination.to_owned()),
+            recipients,
+            Some(identity.to_owned()),
+        )
+    } else {
+        (None, Vec::new(), None)
+    };
     let mut seen_ids = BTreeSet::new();
+    let mut entries = Vec::with_capacity(values.len());
     let mappings = values
         .iter()
         .map(|entry| {
@@ -2399,36 +2973,118 @@ fn migrate_clan_vars_tree(directory: &Path, json: bool) -> Result<()> {
                 .path
                 .strip_prefix(&root)
                 .context("Clan Vars value escaped its canonical root")?;
+            let relative_destination = destination.as_ref().and_then(|destination| {
+                relative
+                    .parent()
+                    .map(|parent| destination.join(parent).with_extension("age"))
+            });
+            if let Some(repository_root) = &repository_root {
+                let relative_source = entry
+                    .path
+                    .strip_prefix(repository_root)
+                    .context("Clan Vars value escaped the migration repository root")?
+                    .to_owned();
+                entries.push((
+                    relative_source,
+                    relative_destination
+                        .clone()
+                        .context("Clan Vars destination was not initialized")?,
+                ));
+            }
             Ok(serde_json::json!({
                 "legacyId":format!("{}/{}/{}", entry.machine, entry.generator, entry.output),
                 "nixSealId":id,
                 "source":relative,
                 "valueBytes":entry.bytes,
+                "destination":relative_destination,
             }))
         })
         .collect::<Result<Vec<_>>>()?;
-    let warnings = vec![
-        "dry run only: no value, configuration, or source manager was changed",
-        "Clan Vars storage backend and secret/public classification are not recoverable from an output leaf; provide explicit target, recipient, runtime, and public-output mappings before import",
-        "output values were never read, decrypted, emitted, or passed to an external process",
-        "auxiliary regular files were ignored after link/type validation; only machine/generator/output/value leaves are migration candidates",
-    ];
+    let mut mappings = mappings;
+    if import_requested && arguments.execute {
+        let repository_root = repository_root
+            .as_ref()
+            .context("bulk Clan Vars migration repository root was not initialized")?;
+        let identity = read_identity(
+            identity_path
+                .as_deref()
+                .context("bulk Clan Vars migration identity was not initialized")?,
+        )?;
+        let writes = entries
+            .iter()
+            .map(|(relative_source, relative_destination)| {
+                nix_seal_authoring::BatchPlaintextFileWrite {
+                    relative_source,
+                    relative_destination,
+                    recipients: &replacement_recipients,
+                }
+            })
+            .collect::<Vec<_>>();
+        let results = nix_seal_authoring::write_secret_file_batch(
+            repository_root,
+            &writes,
+            &identity,
+            if arguments.replace {
+                nix_seal_authoring::WriteMode::Replace
+            } else {
+                nix_seal_authoring::WriteMode::Create
+            },
+        )?;
+        for (mapping, result) in mappings.iter_mut().zip(results) {
+            mapping["ciphertextHash"] = serde_json::json!(result.ciphertext_hash);
+            mapping["plaintextBytes"] = serde_json::json!(result.plaintext_bytes);
+        }
+    }
+    let warnings = if import_requested {
+        vec![
+            if arguments.execute {
+                "side-by-side migration committed only after every value was streamed and round-trip verified"
+            } else {
+                "dry run only: no value, configuration, or source manager was changed"
+            },
+            "Clan Vars storage backend and secret/public classification are not recoverable from an output leaf; review target, runtime, lifecycle, and public-output mappings before activation",
+            "legacy values remain untouched for side-by-side rollback and comparison",
+            "auxiliary regular files were ignored after link/type validation; only machine/generator/output/value leaves are migration candidates",
+        ]
+    } else {
+        vec![
+            "dry run only: no value, configuration, or source manager was changed",
+            "Clan Vars storage backend and secret/public classification are not recoverable from an output leaf; provide explicit target, recipient, runtime, and public-output mappings before import",
+            "output values were never read, decrypted, emitted, or passed to an external process",
+            "auxiliary regular files were ignored after link/type validation; only machine/generator/output/value leaves are migration candidates",
+        ]
+    };
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "schema":"nix-seal.migration-report.v1",
                 "source":"clan-vars",
-                "dryRun":true,
+                "dryRun":!import_requested || !arguments.execute,
+                "recipientPolicy":if import_requested { serde_json::json!({"recipients":&replacement_recipients}) } else { serde_json::Value::Null },
                 "values":mappings,
                 "auxiliaryFileCount":auxiliary_files,
                 "warnings":warnings
             })
         );
     } else {
-        println!("clan-vars dry-run: {} value leaves mapped", mappings.len());
+        println!(
+            "clan-vars {}: {} value leaves mapped",
+            if import_requested && arguments.execute {
+                "migration"
+            } else {
+                "dry-run"
+            },
+            mappings.len()
+        );
         for warning in warnings {
             eprintln!("warning: {warning}");
+        }
+        if import_requested {
+            eprintln!(
+                "replacement recipient policy: {} recipient(s)",
+                replacement_recipients.len()
+            );
         }
         for mapping in mappings {
             println!(
@@ -2520,14 +3176,35 @@ fn inspect_clan_var_value(path: &Path, relative: &Path) -> Result<ClanVarInvento
 /// Inventories Clan Facts' documented `machines/<machine>/facts/<fact>` public
 /// leaves without opening their contents. Secret facts deliberately have a
 /// configurable store/path function and cannot be inferred safely from disk.
-fn migrate_clan_facts_tree(directory: &Path, json: bool) -> Result<()> {
-    let metadata = fs::symlink_metadata(directory).context("could not inspect Clan Facts root")?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-        bail!("Clan Facts root must be a non-symlink directory");
-    }
-    let root = directory
-        .canonicalize()
-        .context("could not resolve Clan Facts root")?;
+/// An explicit destination enables a side-by-side public import; the legacy
+/// tree remains untouched for rollback and comparison.
+#[allow(clippy::too_many_lines)]
+fn migrate_clan_facts_tree(arguments: &ClanFactsMigrationArgs, json: bool) -> Result<()> {
+    let import_requested =
+        arguments.destination.is_some() || arguments.replace || arguments.execute;
+    let repository_root = if import_requested {
+        if arguments.directory.is_absolute() {
+            bail!("bulk Clan Facts migration requires --directory to be repository-relative");
+        }
+        Some(resolve_migration_repository_root(
+            &arguments.repository_root,
+        )?)
+    } else {
+        None
+    };
+    let root = if let Some(repository_root) = &repository_root {
+        resolve_migration_directory(repository_root, &arguments.directory)?
+    } else {
+        let metadata = fs::symlink_metadata(&arguments.directory)
+            .context("could not inspect Clan Facts root")?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            bail!("Clan Facts root must be a non-symlink directory");
+        }
+        arguments
+            .directory
+            .canonicalize()
+            .context("could not resolve Clan Facts root")?
+    };
     let mut entries = fs::read_dir(&root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(fs::DirEntry::file_name);
     let mut facts = Vec::new();
@@ -2576,23 +3253,113 @@ fn migrate_clan_facts_tree(directory: &Path, json: bool) -> Result<()> {
     if facts.is_empty() {
         bail!("Clan Facts root contains no documented public fact leaves");
     }
+    let (destination, entries) = if import_requested {
+        let repository_root = repository_root
+            .as_ref()
+            .context("bulk Clan Facts migration repository root was not initialized")?;
+        let destination = arguments
+            .destination
+            .as_deref()
+            .context("bulk Clan Facts migration requires --destination")?;
+        validate_migration_relative_path(destination, "destination")?;
+        let destination_root = repository_root.join(destination);
+        if destination_root.starts_with(&root) || root.starts_with(&destination_root) {
+            bail!("bulk Clan Facts destination must be side-by-side with the legacy tree");
+        }
+        let mut entries = Vec::with_capacity(facts.len());
+        for (_, _, _, path) in &facts {
+            let relative_source = path
+                .strip_prefix(repository_root)
+                .context("Clan Facts value escaped the migration repository root")?
+                .to_owned();
+            let relative = path
+                .strip_prefix(&root)
+                .context("Clan Facts value escaped its canonical root")?;
+            entries.push((relative_source, destination.join(relative)));
+        }
+        (Some(destination.to_owned()), entries)
+    } else {
+        (None, Vec::new())
+    };
     let mut seen = BTreeSet::new();
-    let mappings = facts.iter().map(|(machine, name, bytes, path)| {
-        let id = migrated_id(&format!("clan-facts/{machine}/{name}"))?;
-        if !seen.insert(id.clone()) { bail!("Clan Facts paths collide after nix-seal ID normalization"); }
-        Ok(serde_json::json!({"legacyId":format!("{machine}/{name}"),"nixSealId":id,"source":path.strip_prefix(&root)?,"valueBytes":bytes}))
-    }).collect::<Result<Vec<_>>>()?;
-    let warnings = vec![
-        "dry run only: no value, configuration, or source manager was changed",
-        "only documented public facts were inventoried without reading them; secret facts use configurable stores and require an explicit reviewed export",
-    ];
+    let mut mappings = facts
+        .iter()
+        .enumerate()
+        .map(|(index, (machine, name, bytes, path))| {
+            let id = migrated_id(&format!("clan-facts/{machine}/{name}"))?;
+            if !seen.insert(id.clone()) {
+                bail!("Clan Facts paths collide after nix-seal ID normalization");
+            }
+            let relative = path
+                .strip_prefix(&root)
+                .context("Clan Facts value escaped its canonical root")?;
+            Ok(serde_json::json!({
+                "legacyId":format!("{machine}/{name}"),
+                "nixSealId":id,
+                "source":relative,
+                "valueBytes":bytes,
+                "destination":destination.as_ref().map(|_| entries[index].1.clone()),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if import_requested && arguments.execute {
+        let repository_root = repository_root
+            .as_ref()
+            .context("bulk Clan Facts migration repository root was not initialized")?;
+        let writes = entries
+            .iter()
+            .map(|(relative_source, relative_destination)| {
+                nix_seal_authoring::BatchPublicFileWrite {
+                    relative_source,
+                    relative_destination,
+                }
+            })
+            .collect::<Vec<_>>();
+        let results = nix_seal_authoring::write_public_file_batch(
+            repository_root,
+            &writes,
+            if arguments.replace {
+                nix_seal_authoring::WriteMode::Replace
+            } else {
+                nix_seal_authoring::WriteMode::Create
+            },
+        )?;
+        for (mapping, result) in mappings.iter_mut().zip(results) {
+            mapping["contentHash"] = serde_json::json!(result.content_hash);
+            mapping["plaintextBytes"] = serde_json::json!(result.plaintext_bytes);
+        }
+    }
+    let warnings = if import_requested {
+        vec![
+            if arguments.execute {
+                "side-by-side public migration committed only after every fact was streamed and verified"
+            } else {
+                "dry run only: no value, configuration, or source manager was changed"
+            },
+            "Clan Facts leaves are public outputs; secret facts use configurable stores and require an explicit reviewed export",
+            "legacy facts remain untouched for side-by-side rollback and comparison",
+        ]
+    } else {
+        vec![
+            "dry run only: no value, configuration, or source manager was changed",
+            "only documented public facts were inventoried without reading them; secret facts use configurable stores and require an explicit reviewed export",
+        ]
+    };
     if json {
         println!(
             "{}",
-            serde_json::json!({"schema":"nix-seal.migration-report.v1","source":"clan-facts","dryRun":true,"facts":mappings,"warnings":warnings})
+            serde_json::json!({"schema":"nix-seal.migration-report.v1","source":"clan-facts","dryRun":!import_requested || !arguments.execute,"facts":mappings,"warnings":warnings})
         );
     } else {
-        println!("clan-facts dry-run: {} public facts mapped", mappings.len());
+        println!(
+            "clan-facts {}: {} public facts mapped",
+            if import_requested && arguments.execute {
+                "migration"
+            } else {
+                "dry-run"
+            },
+            mappings.len()
+        );
         for warning in warnings {
             eprintln!("warning: {warning}");
         }
@@ -2600,29 +3367,101 @@ fn migrate_clan_facts_tree(directory: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn migrate_secretctl(
-    index_path: &Path,
-    plan_output: Option<&Path>,
-    target_systems: &[String],
-    signers: &[String],
-    json: bool,
-) -> Result<()> {
+#[allow(clippy::too_many_lines)]
+fn migrate_secretctl(arguments: &SecretctlMigrationArgs, json: bool) -> Result<()> {
     let index: SecretctlIndexV1 =
-        read_json_bounded(index_path).context("invalid strict secretctl secretIndex JSON")?;
+        read_json_bounded(&arguments.index).context("invalid strict secretctl secretIndex JSON")?;
     let report = build_secretctl_migration_report(&index)?;
-    let candidate_plan = if let Some(output) = plan_output {
-        let plan = build_secretctl_candidate_plan(&index, target_systems, signers)?;
+    let candidate_plan = if let Some(output) = arguments.plan_output.as_deref() {
+        let plan =
+            build_secretctl_candidate_plan(&index, &arguments.target_systems, &arguments.signers)?;
         let canonical = nix_seal_policy::canonical_json(&plan)?;
         emit_canonical_public_json(Some(output), &canonical)?;
         Some(output)
     } else {
-        if !target_systems.is_empty() || !signers.is_empty() {
+        if !arguments.target_systems.is_empty() || !arguments.signers.is_empty() {
             bail!("--target-system and --signer require --plan-output");
         }
         None
     };
+    let import_requested = arguments.destination.is_some()
+        || arguments.identity.is_some()
+        || !arguments.recipients.is_empty()
+        || arguments.replace
+        || arguments.execute;
+    let (repository_root, replacement_recipients, entries) = if import_requested {
+        let repository_root = resolve_migration_repository_root(&arguments.repository_root)?;
+        let destination = arguments
+            .destination
+            .as_deref()
+            .context("bulk secretctl migration requires --destination")?;
+        validate_migration_relative_path(destination, "destination")?;
+        let identity = arguments
+            .identity
+            .as_deref()
+            .context("bulk secretctl migration requires --identity")?;
+        if !identity.is_absolute() {
+            bail!("bulk secretctl migration identity must be an absolute private path");
+        }
+        let replacement_recipients = normalize_migration_recipients(&arguments.recipients)?;
+        let destination_root = repository_root.join(destination);
+        let mut entries = Vec::with_capacity(index.secrets.len());
+        for secret in index.secrets.values() {
+            let relative_source = PathBuf::from(migrate_secretctl_source(&secret.file)?);
+            let source = resolve_migration_regular_file(&repository_root, &relative_source)?;
+            if destination_root.starts_with(&source) || source.starts_with(&destination_root) {
+                bail!("bulk secretctl destination must be side-by-side with the legacy tree");
+            }
+            entries.push((relative_source.clone(), destination.join(relative_source)));
+        }
+        (repository_root, replacement_recipients, entries)
+    } else {
+        (PathBuf::new(), Vec::new(), Vec::new())
+    };
+    let mut mappings = report.secrets;
+    if import_requested {
+        for (mapping, (_, destination)) in mappings.iter_mut().zip(&entries) {
+            mapping["destination"] = serde_json::json!(destination);
+        }
+    }
+    if import_requested && arguments.execute {
+        let identity = read_identity(
+            arguments
+                .identity
+                .as_deref()
+                .context("bulk secretctl migration identity was not initialized")?,
+        )?;
+        let writes = entries
+            .iter()
+            .map(
+                |(relative_source, relative_destination)| nix_seal_authoring::BatchRekeyWrite {
+                    relative_source,
+                    relative_destination,
+                    recipients: &replacement_recipients,
+                },
+            )
+            .collect::<Vec<_>>();
+        let results = nix_seal_authoring::rekey_secret_batch(
+            &repository_root,
+            &writes,
+            &identity,
+            if arguments.replace {
+                nix_seal_authoring::WriteMode::Replace
+            } else {
+                nix_seal_authoring::WriteMode::Create
+            },
+        )?;
+        for (mapping, result) in mappings.iter_mut().zip(results) {
+            mapping["ciphertextHash"] = serde_json::json!(result.ciphertext_hash);
+            mapping["plaintextBytes"] = serde_json::json!(result.plaintext_bytes);
+        }
+    }
     let mut warnings = vec![
-        "dry run only: no ciphertext, configuration, or source manager was changed".to_owned(),
+        if import_requested && arguments.execute {
+            "side-by-side migration committed only after every source was staged and round-trip verified".to_owned()
+        } else {
+            "dry run only: no ciphertext, configuration, or source manager was changed".to_owned()
+        },
         "secretctl uses SSH recipients; native age is preferred, while unencrypted OpenSSH identities are available only for reviewed migration compatibility".to_owned(),
         "the reported legacy group memberships and direct-recipient sets were cross-checked; review normalized IDs and scope selectors before generating a nix-seal plan".to_owned(),
     ];
@@ -2631,26 +3470,37 @@ fn migrate_secretctl(
             "candidate plans retain legacy direct delivery and use default root-only runtime settings; review runtime ownership, phases, templates, lifecycle metadata, and a rekeyed administrator/recovery policy before activation".to_owned(),
         );
     }
+    if import_requested {
+        warnings.push(
+            "legacy secretctl ciphertexts remain untouched for side-by-side rollback; runtime, lifecycle, templates, and approval mappings still require review".to_owned(),
+        );
+    }
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "schema":"nix-seal.migration-report.v1",
                 "source":"secretctl",
-                "dryRun":true,
+                "dryRun":!import_requested || !arguments.execute,
                 "groups":report.groups,
-                "secrets":report.secrets,
+                "secrets":mappings,
                 "targets":report.targets,
                 "sshRecipientCount":report.ssh_recipient_count,
+                "recipientPolicy":if import_requested { serde_json::json!({"recipients":&replacement_recipients}) } else { serde_json::Value::Null },
                 "candidatePlan":candidate_plan,
                 "warnings":warnings
             })
         );
     } else {
         println!(
-            "secretctl dry-run: {} groups, {} secrets, and {} targets mapped; {} SSH recipients require a reviewed migration path",
+            "secretctl {}: {} groups, {} secrets, and {} targets mapped; {} SSH recipients require a reviewed migration path",
+            if import_requested && arguments.execute {
+                "migration"
+            } else {
+                "dry-run"
+            },
             report.groups.len(),
-            report.secrets.len(),
+            mappings.len(),
             report.targets.len(),
             report.ssh_recipient_count,
         );
@@ -2663,7 +3513,13 @@ fn migrate_secretctl(
                 path.display()
             );
         }
-        for mapping in report.secrets {
+        if import_requested {
+            eprintln!(
+                "replacement recipient policy: {} recipient(s)",
+                replacement_recipients.len()
+            );
+        }
+        for mapping in mappings {
             println!(
                 "{} -> {} ({})",
                 mapping["legacyId"].as_str().unwrap_or("unknown"),
@@ -2743,6 +3599,8 @@ fn build_secretctl_candidate_plan(
                     .with_context(|| format!("missing target-system mapping for {legacy_id}"))?,
                 identity: identity_id,
                 username,
+                configuration: None,
+                environment: None,
                 tags: Vec::new(),
             },
         );
@@ -2788,10 +3646,12 @@ fn build_secretctl_candidate_plan(
                 delivery: nix_seal_core::DeliveryMode::Direct,
                 administrators: Vec::new(),
                 consumers,
+                selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
     }
@@ -3118,17 +3978,36 @@ fn run_key(command: KeyCommand, json: bool) -> Result<()> {
                 }
             }
         }
-        KeyCommand::Generate { identity_out } => {
+        KeyCommand::Generate {
+            identity_out,
+            passphrase,
+        } => {
             let (identity, recipient) = nix_seal_crypto::generate_x25519();
-            write_new_private(&identity_out, identity.expose_secret().as_bytes())?;
+            let private = if passphrase {
+                let passphrase = read_identity_passphrase(true)?;
+                nix_seal_crypto::encrypt_passphrase_identity(&identity, &passphrase)?
+            } else {
+                let mut private = identity.expose_secret().as_bytes().to_vec();
+                private.push(b'\n');
+                private
+            };
+            write_new_private(&identity_out, &private)?;
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"schema":"nix-seal.output.v1","recipient":recipient,"identityPath":identity_out})
+                    serde_json::json!({"schema":"nix-seal.output.v1","recipient":recipient,"identityPath":identity_out,"passphraseProtected":passphrase})
                 );
             } else {
                 println!("{recipient}");
-                eprintln!("private identity written to {}", identity_out.display());
+                eprintln!(
+                    "{} identity written to {}",
+                    if passphrase {
+                        "passphrase-protected private"
+                    } else {
+                        "private"
+                    },
+                    identity_out.display()
+                );
             }
         }
         KeyCommand::Inspect { identity } => {
@@ -3762,17 +4641,37 @@ fn ensure_rekey_identity_authorized(
 ) -> Result<()> {
     let identity = identity
         .context("--identity is required to rekey administrator-encrypted canonical ciphertext")?;
-    let actual = nix_seal_crypto::recipient_from_identity(identity)?;
     let recipients = nix_seal_policy::secret_recipients(plan, secret)?;
-    let authorized = recipients.recipients.values().any(|candidate| {
-        nix_seal_crypto::normalize_recipient(candidate).is_ok_and(|candidate| candidate == actual)
-    });
+    let authorized = recipients
+        .recipients
+        .iter()
+        .any(|(identity_id, candidate)| {
+            plan.identities.get(identity_id).is_some_and(|declared| {
+                matches!(
+                    declared.kind,
+                    nix_seal_core::IdentityKind::Administrator
+                        | nix_seal_core::IdentityKind::Recovery
+                ) && nix_seal_crypto::identity_matches_recipient(identity, candidate)
+            })
+        });
     if !authorized {
         bail!(
             "identity is not an authorized administrator or recovery recipient for secret {secret}"
         );
     }
     Ok(())
+}
+
+/// Canonical authoring is an administrator/recovery operation, even when the
+/// ciphertext is configured for advanced direct delivery. Target identities
+/// are deliberately excluded here: they may decrypt an authorized artifact,
+/// but must never be able to create or replace repository ciphertext.
+fn ensure_canonical_authoring_identity_authorized(
+    plan: &nix_seal_core::PlanV1,
+    secret: &nix_seal_core::Id,
+    identity: &SecretString,
+) -> Result<()> {
+    ensure_rekey_identity_authorized(plan, secret, Some(identity))
 }
 
 fn issue_time(expires_at: Option<u64>) -> Result<u64> {
@@ -4091,6 +4990,11 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
         plaintext: SecretBox<Vec<u8>>,
         recipients: Vec<String>,
     }
+    struct GeneratedPublic {
+        id: nix_seal_core::Id,
+        destination: String,
+        plaintext: SecretBox<Vec<u8>>,
+    }
 
     let plan = read_plan_bounded(&arguments.plan)?;
     let identity = read_identity(&arguments.identity)?;
@@ -4101,7 +5005,22 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
         &mut BTreeSet::new(),
         &mut order,
     )?;
-    let prompt_files = validate_generator_prompt_files(&plan, &order, &arguments.prompt_files)?;
+    for generator_id in &order {
+        let generator = plan
+            .generators
+            .get(generator_id)
+            .context("generator disappeared from validated plan")?;
+        for output in &generator.outputs {
+            ensure_canonical_authoring_identity_authorized(&plan, output, &identity)?;
+        }
+    }
+    let prompt_files = validate_generator_prompt_files(
+        &plan,
+        &order,
+        &arguments.prompt_files,
+        &arguments.repository_root,
+        arguments.interactive,
+    )?;
     let mut outputs = Vec::new();
     for generator_id in order {
         let generator = plan
@@ -4128,17 +5047,39 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                     "action":"unchanged"
                 }));
             }
+            for public_output in &generator.public_outputs {
+                let path = existing_public_output_path(
+                    &arguments.repository_root,
+                    &public_output.destination,
+                )?;
+                outputs.push(serde_json::json!({
+                    "generator":generator_id,
+                    "publicOutputId":public_output.id,
+                    "path":path,
+                    "action":"unchanged"
+                }));
+            }
             continue;
         }
         let prompt_values = read_generator_prompts(generator, &prompt_files)?;
-        let generated_values = generate_generator_values(generator, &prompt_values)?;
-        if generated_values.len() != generator.outputs.len() {
+        let generated_values = generate_generator_values(
+            generator,
+            &prompt_values,
+            GeneratorSecretInputs::Plan {
+                plan: &plan,
+                repository_root: &arguments.repository_root,
+                identity: &identity,
+            },
+        )?;
+        if generated_values.secrets.len() != generator.outputs.len()
+            || generated_values.public.len() != generator.public_outputs.len()
+        {
             bail!("generator produced an unexpected output count");
         }
         let generated = generator
             .outputs
             .iter()
-            .zip(generated_values)
+            .zip(generated_values.secrets)
             .map(|(secret_id, plaintext)| {
                 let secret = plan
                     .secrets
@@ -4153,6 +5094,16 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let generated_public = generator
+            .public_outputs
+            .iter()
+            .zip(generated_values.public)
+            .map(|(output, plaintext)| GeneratedPublic {
+                id: output.id.clone(),
+                destination: output.destination.clone(),
+                plaintext,
+            })
+            .collect::<Vec<_>>();
         let writes = generated
             .iter()
             .map(|output| nix_seal_authoring::BatchSecretWrite {
@@ -4161,16 +5112,30 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                 recipients: &output.recipients,
             })
             .collect::<Vec<_>>();
+        let public_writes = generated_public
+            .iter()
+            .map(|output| nix_seal_authoring::BatchPublicWrite {
+                relative_destination: Path::new(&output.destination),
+                plaintext: output.plaintext.expose_secret(),
+            })
+            .collect::<Vec<_>>();
         let mode = match action {
             GeneratorAction::Create => nix_seal_authoring::WriteMode::Create,
             GeneratorAction::Replace => nix_seal_authoring::WriteMode::Replace,
             GeneratorAction::Unchanged => bail!("unchanged generator reached write transaction"),
         };
-        let results = nix_seal_authoring::write_secret_batch(
+        let results = nix_seal_authoring::write_secret_and_public_batch(
             &arguments.repository_root,
             &writes,
+            &public_writes,
             &identity,
             mode,
+        )?;
+        persist_generator_prompts(
+            &arguments.repository_root,
+            &generator_id,
+            generator,
+            &prompt_values,
         )?;
         if let Some(validation) = &generator.validation {
             write_generator_state(
@@ -4178,16 +5143,31 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                 &generator_id,
                 validation,
                 &generator.outputs,
+                &generator
+                    .public_outputs
+                    .iter()
+                    .map(|output| output.id.clone())
+                    .collect::<Vec<_>>(),
             )?;
         } else {
             remove_generator_state(&arguments.repository_root, &generator_id)?;
         }
-        for (output, result) in generated.iter().zip(results) {
+        for (output, result) in generated.iter().zip(results.secrets) {
             outputs.push(serde_json::json!({
                 "generator":generator_id,
                 "secretId":output.id,
                 "ciphertextPath":result.path,
                 "ciphertextHash":result.ciphertext_hash,
+                "plaintextBytes":result.plaintext_bytes,
+                "action":match action { GeneratorAction::Create => "created", GeneratorAction::Replace => "replaced", GeneratorAction::Unchanged => "unchanged" }
+            }));
+        }
+        for (output, result) in generated_public.iter().zip(results.public_outputs) {
+            outputs.push(serde_json::json!({
+                "generator":generator_id,
+                "publicOutputId":output.id,
+                "path":result.path,
+                "contentHash":result.content_hash,
                 "plaintextBytes":result.plaintext_bytes,
                 "action":match action { GeneratorAction::Create => "created", GeneratorAction::Replace => "replaced", GeneratorAction::Unchanged => "unchanged" }
             }));
@@ -4204,11 +5184,18 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
         );
     } else {
         for output in outputs {
-            println!(
-                "generated {} -> {}",
-                output["secretId"].as_str().unwrap_or("unknown"),
-                output["ciphertextPath"].as_str().unwrap_or("unknown")
-            );
+            if let (Some(secret_id), Some(path)) = (
+                output["secretId"].as_str(),
+                output["ciphertextPath"].as_str(),
+            ) {
+                println!("generated {secret_id} -> {path}");
+            } else if let (Some(output_id), Some(path)) =
+                (output["publicOutputId"].as_str(), output["path"].as_str())
+            {
+                println!("generated public output {output_id} -> {path}");
+            } else {
+                bail!("generation result omitted a stable output identifier or path");
+            }
         }
     }
     Ok(())
@@ -4244,27 +5231,54 @@ fn generator_action(
             }
         })
         .collect::<Result<Vec<_>>>()?;
+    let public_present = generator
+        .public_outputs
+        .iter()
+        .map(
+            |output| match existing_public_output_path(repository_root, &output.destination) {
+                Ok(_) => Ok(Some(output)),
+                Err(error) if is_missing_canonical_ciphertext(&error) => Ok(None),
+                Err(error) => Err(error),
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
     let present_count = present.iter().flatten().count();
-    if present_count != 0 && present_count != generator.outputs.len() {
-        bail!(
-            "generator {generator_id} has a partial canonical-output set; repair it with --replace"
-        );
+    let public_present_count = public_present.iter().flatten().count();
+    let total_outputs = generator
+        .outputs
+        .len()
+        .checked_add(generator.public_outputs.len())
+        .context("generator output count overflow")?;
+    let total_present = present_count
+        .checked_add(public_present_count)
+        .context("generator output count overflow")?;
+    if total_present != 0 && total_present != total_outputs {
+        bail!("generator {generator_id} has a partial output set; repair it with --replace");
     }
     let Some(validation) = generator.validation.as_deref() else {
         return Ok(GeneratorAction::Create);
     };
     let state = read_generator_state(repository_root, generator_id)?;
     match state {
-        Some(state) if state.validation == validation && state.outputs == generator.outputs => {
-            if present_count == generator.outputs.len() {
+        Some(state)
+            if state.validation == validation
+                && state.outputs == generator.outputs
+                && state.public_outputs
+                    == generator
+                        .public_outputs
+                        .iter()
+                        .map(|output| output.id.clone())
+                        .collect::<Vec<_>>() =>
+        {
+            if total_present == total_outputs {
                 Ok(GeneratorAction::Unchanged)
             } else {
                 Ok(GeneratorAction::Create)
             }
         }
-        Some(_) if present_count == generator.outputs.len() => Ok(GeneratorAction::Replace),
+        Some(_) if total_present == total_outputs => Ok(GeneratorAction::Replace),
         Some(_) => Ok(GeneratorAction::Create),
-        None if present_count == 0 => Ok(GeneratorAction::Create),
+        None if total_present == 0 => Ok(GeneratorAction::Create),
         None => bail!(
             "generator {generator_id} outputs exist without validation state; pass --replace to establish an explicit validation baseline"
         ),
@@ -4361,6 +5375,7 @@ fn write_generator_state(
     generator_id: &nix_seal_core::Id,
     validation: &str,
     outputs: &[nix_seal_core::Id],
+    public_outputs: &[nix_seal_core::Id],
 ) -> Result<()> {
     let path = generator_state_path(repository_root, generator_id)?;
     let parent = path
@@ -4371,6 +5386,7 @@ fn write_generator_state(
         generator_id: generator_id.clone(),
         validation: validation.to_owned(),
         outputs: outputs.to_vec(),
+        public_outputs: public_outputs.to_vec(),
     })?;
     let mut staged = tempfile::NamedTempFile::new_in(parent)
         .context("could not stage generator validation state")?;
@@ -4405,51 +5421,220 @@ fn remove_generator_state(repository_root: &Path, generator_id: &nix_seal_core::
     }
 }
 
+/// Resolves the owner-only repository state path for a persistent prompt.
+///
+/// Prompt values are deliberately kept outside the public plan and outside
+/// canonical ciphertext. The private state tree is created component by
+/// component so an attacker cannot replace an ancestor with a symlink between
+/// runs. IDs are already validated by the policy layer and therefore provide
+/// safe relative components here.
+fn generator_prompt_state_path(
+    repository_root: &Path,
+    generator_id: &nix_seal_core::Id,
+    prompt_id: &nix_seal_core::Id,
+) -> Result<PathBuf> {
+    let root = repository_root
+        .canonicalize()
+        .context("repository root must exist for persistent prompt state")?;
+    let mut directory = root;
+    for component in [".nix-seal", "prompt-state", "v1"] {
+        directory.push(component);
+        ensure_private_directory(&directory)?;
+    }
+    for component in generator_id.as_str().split('/') {
+        directory.push(component);
+        ensure_private_directory(&directory)?;
+    }
+    let mut prompt_components = prompt_id.as_str().split('/').peekable();
+    while let Some(component) = prompt_components.next() {
+        directory.push(component);
+        if prompt_components.peek().is_some() {
+            ensure_private_directory(&directory)?;
+        }
+    }
+    Ok(directory)
+}
+
+/// Stores declared persistent prompts only after all generated ciphertext
+/// outputs have committed. A failed generation therefore cannot update the
+/// remembered response. The replacement is staged and durable before rename.
+fn persist_generator_prompts(
+    repository_root: &Path,
+    generator_id: &nix_seal_core::Id,
+    generator: &nix_seal_core::Generator,
+    prompts: &[SecretBox<Vec<u8>>],
+) -> Result<()> {
+    if prompts.len() != generator.prompts.len() {
+        bail!("generator prompt count changed during generation");
+    }
+    for (prompt, value) in generator.prompts.iter().zip(prompts) {
+        if prompt.persistent {
+            let path = generator_prompt_state_path(repository_root, generator_id, &prompt.id)?;
+            write_private_bytes_atomic(&path, value.expose_secret())?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => set_private_directory(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        bail!("persistent prompt state directory has unsafe type");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+            bail!("persistent prompt state directory has unsafe ownership or permissions");
+        }
+    }
+    Ok(())
+}
+
+fn write_private_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("persistent prompt state path has no parent")?;
+    ensure_private_directory(parent)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            // Reject links and hard links before allowing replacement. The
+            // rename below replaces the directory entry, never follows a
+            // symlink.
+            open_private_identity(path)
+                .context("persistent prompt state file has unsafe metadata")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .context("could not stage persistent prompt state")?;
+    set_private_file(staged.path())?;
+    staged
+        .write_all(bytes)
+        .and_then(|()| staged.as_file().sync_all())
+        .context("could not write persistent prompt state")?;
+    staged
+        .persist(path)
+        .map_err(|error| error.error)
+        .context("could not atomically publish persistent prompt state")?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .context("persistent prompt state changed but directory durability is unknown")?;
+    Ok(())
+}
+
 fn validate_generator_prompt_files(
     plan: &nix_seal_core::PlanV1,
     order: &[nix_seal_core::Id],
     values: &[String],
-) -> Result<BTreeMap<nix_seal_core::Id, PathBuf>> {
-    let prompt_files = parse_prompt_files(values)?;
-    let declared_prompts = order
-        .iter()
-        .flat_map(|generator_id| {
-            plan.generators[generator_id]
-                .prompts
-                .iter()
-                .map(|prompt| prompt.id.clone())
-        })
-        .collect::<BTreeSet<_>>();
-    if prompt_files.keys().collect::<BTreeSet<_>>() != declared_prompts.iter().collect() {
-        bail!("prompt files must match the declared prompts exactly");
+    repository_root: &Path,
+    interactive: bool,
+) -> Result<BTreeMap<nix_seal_core::Id, Option<PathBuf>>> {
+    let explicit = parse_prompt_files(values)?;
+    let mut declared = BTreeMap::new();
+    for generator_id in order {
+        for prompt in &plan.generators[generator_id].prompts {
+            if declared
+                .insert(prompt.id.clone(), (generator_id.clone(), prompt.persistent))
+                .is_some()
+            {
+                bail!("prompt IDs must be unique across the selected generator graph");
+            }
+        }
     }
-    Ok(prompt_files)
+    if explicit
+        .keys()
+        .any(|prompt_id| !declared.contains_key(prompt_id))
+    {
+        bail!("prompt files must refer only to prompts declared by the selected generator graph");
+    }
+    let mut resolved = BTreeMap::new();
+    for (prompt_id, (generator_id, persistent)) in declared {
+        if let Some(path) = explicit.get(&prompt_id) {
+            resolved.insert(prompt_id, Some(path.clone()));
+        } else if persistent {
+            let path = generator_prompt_state_path(repository_root, &generator_id, &prompt_id)?;
+            if path.exists() {
+                resolved.insert(prompt_id, Some(path));
+            } else if interactive {
+                resolved.insert(prompt_id, None);
+            } else {
+                bail!(
+                    "persistent prompt {prompt_id} has no stored response; initialize it with --prompt-file {prompt_id}=PATH or pass --interactive"
+                );
+            }
+        } else if interactive {
+            resolved.insert(prompt_id, None);
+        } else {
+            bail!(
+                "prompt {prompt_id} requires an explicit private response file (--prompt-file {prompt_id}=PATH) or --interactive"
+            );
+        }
+    }
+    Ok(resolved)
+}
+
+#[derive(Clone, Copy)]
+enum GeneratorSecretInputs<'a> {
+    /// Materialize explicitly declared canonical sources from this validated plan.
+    Plan {
+        plan: &'a nix_seal_core::PlanV1,
+        repository_root: &'a Path,
+        identity: &'a SecretString,
+    },
+    /// Test-only or built-in invocation without private canonical inputs.
+    #[allow(dead_code)]
+    // Used by the in-process generator tests; production always has a plan.
+    None,
+}
+
+struct GeneratedValues {
+    secrets: Vec<SecretBox<Vec<u8>>>,
+    public: Vec<SecretBox<Vec<u8>>>,
 }
 
 fn generate_generator_values(
     generator: &nix_seal_core::Generator,
     prompts: &[SecretBox<Vec<u8>>],
-) -> Result<Vec<SecretBox<Vec<u8>>>> {
+    secret_inputs: GeneratorSecretInputs<'_>,
+) -> Result<GeneratedValues> {
     if generator.executable.starts_with("builtin:") {
         if generator.executable == "builtin:argon2id-password-hash" {
-            return Ok(vec![generate_argon2id_password_hash(generator, prompts)?]);
+            return Ok(GeneratedValues {
+                secrets: vec![generate_argon2id_password_hash(generator, prompts)?],
+                public: Vec::new(),
+            });
         }
         if !prompts.is_empty() {
             bail!("built-in generators do not accept prompts");
         }
-        return generator
-            .outputs
-            .iter()
-            .map(|_| generate_builtin_value(generator))
-            .collect();
+        if !generator.secret_dependencies.is_empty() {
+            bail!("built-in generators do not accept secret dependencies");
+        }
+        return Ok(GeneratedValues {
+            secrets: generator
+                .outputs
+                .iter()
+                .map(|_| generate_builtin_value(generator))
+                .collect::<Result<Vec<_>>>()?,
+            public: Vec::new(),
+        });
     }
-    generate_external_values(generator, prompts)
+    generate_external_values(generator, prompts, secret_inputs)
 }
 
+#[allow(clippy::too_many_lines)]
 fn generate_external_values(
     generator: &nix_seal_core::Generator,
     prompts: &[SecretBox<Vec<u8>>],
-) -> Result<Vec<SecretBox<Vec<u8>>>> {
+    secret_inputs: GeneratorSecretInputs<'_>,
+) -> Result<GeneratedValues> {
     let workspace = tempfile::Builder::new()
         .prefix("nix-seal-generator-")
         .tempdir()
@@ -4459,6 +5644,10 @@ fn generate_external_values(
     fs::create_dir(&output_directory)
         .context("could not create private generator output directory")?;
     set_private_directory(&output_directory)?;
+    let public_output_directory = workspace.path().join("public-outputs");
+    fs::create_dir(&public_output_directory)
+        .context("could not create private generator public-output directory")?;
+    set_private_directory(&public_output_directory)?;
     let prompt_directory = workspace.path().join("prompts");
     fs::create_dir(&prompt_directory)
         .context("could not create private generator prompt directory")?;
@@ -4469,6 +5658,11 @@ fn generate_external_values(
             value.expose_secret(),
         )?;
     }
+    let secret_directory = workspace.path().join("secrets");
+    fs::create_dir(&secret_directory)
+        .context("could not create private generator secret directory")?;
+    set_private_directory(&secret_directory)?;
+    materialize_generator_secret_dependencies(generator, secret_inputs, &secret_directory)?;
     let runtime_path = std::env::join_paths(
         generator
             .runtime_inputs
@@ -4476,22 +5670,19 @@ fn generate_external_values(
             .map(|input| Path::new(input).join("bin")),
     )
     .context("generator runtime inputs cannot form a safe PATH")?;
-    let mut child = ProcessCommand::new(&generator.executable)
-        .args(&generator.arguments)
-        .env_clear()
-        .env("PATH", runtime_path)
-        .env("HOME", workspace.path())
-        .env("TMPDIR", workspace.path())
-        .env("NIX_SEAL_OUTPUT_DIR", &output_directory)
-        .env("NIX_SEAL_OUTPUT_COUNT", generator.outputs.len().to_string())
-        .env("NIX_SEAL_PROMPT_DIR", &prompt_directory)
-        .env("NIX_SEAL_PROMPT_COUNT", prompts.len().to_string())
-        .current_dir(workspace.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("could not start constrained generator")?;
+    let layout = GeneratorExecutionLayout {
+        runtime_path: &runtime_path,
+        workspace: workspace.path(),
+        output_directory: &output_directory,
+        public_output_directory: &public_output_directory,
+        prompt_directory: &prompt_directory,
+        prompt_count: prompts.len(),
+        secret_directory: &secret_directory,
+        secret_count: generator.secret_dependencies.len(),
+        output_count: generator.outputs.len(),
+        public_output_count: generator.public_outputs.len(),
+    };
+    let mut child = spawn_external_generator(generator, &layout)?;
     let deadline = Instant::now() + Duration::from_secs(u64::from(generator.timeout_seconds));
     loop {
         match child
@@ -4501,8 +5692,7 @@ fn generate_external_values(
             Some(status) if status.success() => break,
             Some(_) => bail!("constrained generator failed"),
             None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child_process_tree(&mut child);
                 bail!("constrained generator timed out");
             }
             None => thread::sleep(Duration::from_millis(10)),
@@ -4530,10 +5720,270 @@ fn generate_external_values(
     if actual != expected {
         bail!("constrained generator created undeclared or missing outputs");
     }
-    expected
+    let secrets = expected
         .iter()
         .map(|name| read_generator_output(&output_directory.join(name), generator.max_output_bytes))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let expected_public = generator
+        .public_outputs
+        .iter()
+        .enumerate()
+        .map(|(index, _)| index.to_string())
+        .collect::<BTreeSet<_>>();
+    let actual_public = fs::read_dir(&public_output_directory)
+        .context("could not inspect constrained generator public outputs")?
+        .map(|entry| {
+            let entry = entry.context("could not inspect constrained generator public output")?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("generator public output name is not UTF-8"))?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .context("could not inspect constrained generator public output metadata")?;
+            if !metadata.file_type().is_file() {
+                bail!("constrained generator public output is not a regular file");
+            }
+            Ok(name)
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if actual_public != expected_public {
+        bail!("constrained generator created undeclared or missing public outputs");
+    }
+    let public = expected_public
+        .iter()
+        .map(|name| {
+            read_generator_output(
+                &public_output_directory.join(name),
+                generator.max_output_bytes,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GeneratedValues { secrets, public })
+}
+
+struct GeneratorExecutionLayout<'a> {
+    runtime_path: &'a OsStr,
+    workspace: &'a Path,
+    output_directory: &'a Path,
+    public_output_directory: &'a Path,
+    prompt_directory: &'a Path,
+    prompt_count: usize,
+    secret_directory: &'a Path,
+    secret_count: usize,
+    output_count: usize,
+    public_output_count: usize,
+}
+
+fn build_external_generator_command(
+    executable: &Path,
+    generator_args: &[OsString],
+    layout: &GeneratorExecutionLayout<'_>,
+) -> ProcessCommand {
+    let mut command = ProcessCommand::new(executable);
+    command
+        .args(generator_args)
+        .env_clear()
+        .env("PATH", layout.runtime_path)
+        .env("HOME", layout.workspace)
+        .env("TMPDIR", layout.workspace)
+        .env("NIX_SEAL_OUTPUT_DIR", layout.output_directory)
+        .env("NIX_SEAL_OUTPUT_COUNT", layout.output_count.to_string())
+        .env("NIX_SEAL_PUBLIC_OUTPUT_DIR", layout.public_output_directory)
+        .env(
+            "NIX_SEAL_PUBLIC_OUTPUT_COUNT",
+            layout.public_output_count.to_string(),
+        )
+        .env("NIX_SEAL_PROMPT_DIR", layout.prompt_directory)
+        .env("NIX_SEAL_PROMPT_COUNT", layout.prompt_count.to_string())
+        .env("NIX_SEAL_SECRET_DIR", layout.secret_directory)
+        .env("NIX_SEAL_SECRET_COUNT", layout.secret_count.to_string())
+        .current_dir(layout.workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+#[allow(clippy::too_many_lines)]
+fn spawn_external_generator(
+    generator: &nix_seal_core::Generator,
+    layout: &GeneratorExecutionLayout<'_>,
+) -> Result<Child> {
+    let generator_args = generator
+        .arguments
+        .iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    #[cfg(all(target_os = "linux", not(test)))]
+    {
+        let worker_executable = std::env::current_exe()
+            .context("could not locate nix-seal generator worker")?
+            .canonicalize()
+            .context("could not canonicalize nix-seal generator worker")?;
+        let mut worker = ProcessCommand::new(worker_executable);
+        worker
+            .arg("__generator-worker")
+            .arg("--executable")
+            .arg(&generator.executable)
+            .arg("--workspace")
+            .arg(layout.workspace)
+            .arg("--output-directory")
+            .arg(layout.output_directory)
+            .arg("--public-output-directory")
+            .arg(layout.public_output_directory)
+            .arg("--prompt-directory")
+            .arg(layout.prompt_directory)
+            .arg("--prompt-count")
+            .arg(layout.prompt_count.to_string())
+            .arg("--secret-directory")
+            .arg(layout.secret_directory)
+            .arg("--secret-count")
+            .arg(generator.secret_dependencies.len().to_string())
+            .arg("--output-count")
+            .arg(generator.outputs.len().to_string())
+            .arg("--public-output-count")
+            .arg(generator.public_outputs.len().to_string());
+        if !layout.runtime_path.is_empty() {
+            worker.arg("--runtime-path").arg(layout.runtime_path);
+        }
+        for argument in &generator_args {
+            worker.arg("--generator-arg").arg(argument);
+        }
+        worker
+            .env_clear()
+            .env("NIX_SEAL_GENERATOR_WORKER", "1")
+            .current_dir(layout.workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        isolate_child_process_group(&mut worker);
+        let mut child = worker
+            .spawn()
+            .context("could not start constrained generator isolation worker")?;
+        let Some(mut status) = child.stdout.take() else {
+            terminate_child_process_tree(&mut child);
+            bail!("generator isolation worker did not provide a status pipe");
+        };
+        let (status_tx, status_rx) = mpsc::sync_channel(1);
+        let status_reader = thread::spawn(move || {
+            let mut marker = vec![0_u8; GENERATOR_WORKER_MAGIC.len() + 1];
+            let result = status
+                .read_exact(&mut marker)
+                .map(|()| marker)
+                .map_err(|_| ());
+            let _ = status_tx.send(result);
+        });
+        let marker = match status_rx.recv_timeout(GENERATOR_WORKER_STARTUP_TIMEOUT) {
+            Ok(Ok(marker))
+                if marker[..GENERATOR_WORKER_MAGIC.len()] == GENERATOR_WORKER_MAGIC[..] =>
+            {
+                let _ = status_reader.join();
+                marker
+            }
+            Ok(Ok(_) | Err(())) => {
+                terminate_child_process_tree(&mut child);
+                let _ = status_reader.join();
+                bail!("generator isolation worker returned an invalid status");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                terminate_child_process_tree(&mut child);
+                let _ = status_reader.join();
+                bail!("generator isolation worker startup timed out");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                terminate_child_process_tree(&mut child);
+                let _ = status_reader.join();
+                bail!("generator isolation worker returned no status");
+            }
+        };
+        match marker[GENERATOR_WORKER_MAGIC.len()] {
+            1 => Ok(child),
+            0 => {
+                terminate_child_process_tree(&mut child);
+                eprintln!(
+                    "warning: Linux network isolation was unavailable for this external generator; trust the declared executable and runtime inputs"
+                );
+                let mut direct = build_external_generator_command(
+                    Path::new(&generator.executable),
+                    &generator_args,
+                    layout,
+                );
+                isolate_child_process_group(&mut direct);
+                direct
+                    .spawn()
+                    .context("could not start constrained generator")
+            }
+            _ => {
+                terminate_child_process_tree(&mut child);
+                bail!("generator isolation worker returned an invalid status");
+            }
+        }
+    }
+    #[cfg(any(not(target_os = "linux"), test))]
+    {
+        eprintln!(
+            "warning: network isolation is unavailable on this platform for this external generator; trust the declared executable and runtime inputs"
+        );
+        let mut direct = build_external_generator_command(
+            Path::new(&generator.executable),
+            &generator_args,
+            layout,
+        );
+        isolate_child_process_group(&mut direct);
+        direct
+            .spawn()
+            .context("could not start constrained generator")
+    }
+}
+
+fn materialize_generator_secret_dependencies(
+    generator: &nix_seal_core::Generator,
+    secret_inputs: GeneratorSecretInputs<'_>,
+    secret_directory: &Path,
+) -> Result<()> {
+    if generator.secret_dependencies.is_empty() {
+        return Ok(());
+    }
+    let GeneratorSecretInputs::Plan {
+        plan,
+        repository_root,
+        identity,
+    } = secret_inputs
+    else {
+        bail!("external generator secret dependencies require a validated plan context");
+    };
+    for (index, secret_id) in generator.secret_dependencies.iter().enumerate() {
+        let recipients = nix_seal_policy::secret_recipients(plan, secret_id)?;
+        let authorized = recipients
+            .recipients
+            .values()
+            .any(|recipient| nix_seal_crypto::identity_matches_recipient(identity, recipient));
+        if !authorized {
+            bail!(
+                "generator identity is not authorized by canonical recipient policy for {secret_id}"
+            );
+        }
+        let secret = plan
+            .secrets
+            .get(secret_id)
+            .context("generator secret dependency is absent from plan")?;
+        let ciphertext_path = existing_secret_path(repository_root, &secret.source)?;
+        let ciphertext = open_public_ciphertext(&ciphertext_path)?;
+        let output_path = secret_directory.join(index.to_string());
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output_path)
+            .context("could not create private generator secret dependency")?;
+        set_private_file(&output_path)?;
+        nix_seal_crypto::decrypt(ciphertext, &mut output, identity).with_context(|| {
+            format!("could not decrypt generator secret dependency {secret_id}")
+        })?;
+        output
+            .sync_all()
+            .context("could not durably stage generator secret dependency")?;
+    }
+    Ok(())
 }
 
 fn read_generator_output(path: &Path, maximum: u64) -> Result<SecretBox<Vec<u8>>> {
@@ -4577,7 +6027,7 @@ fn parse_prompt_files(values: &[String]) -> Result<BTreeMap<nix_seal_core::Id, P
 
 fn read_generator_prompts(
     generator: &nix_seal_core::Generator,
-    prompt_files: &BTreeMap<nix_seal_core::Id, PathBuf>,
+    prompt_files: &BTreeMap<nix_seal_core::Id, Option<PathBuf>>,
 ) -> Result<Vec<SecretBox<Vec<u8>>>> {
     generator
         .prompts
@@ -4585,20 +6035,151 @@ fn read_generator_prompts(
         .map(|prompt| {
             let path = prompt_files
                 .get(&prompt.id)
-                .context("declared generator prompt has no private response file")?;
-            let mut input = open_private_identity(path)
-                .context("generator prompt response file has unsafe ownership or permissions")?;
-            let mut value = Vec::new();
-            std::io::Read::by_ref(&mut input)
-                .take(1024 * 1024 + 1)
-                .read_to_end(&mut value)
-                .context("could not read generator prompt response")?;
-            if value.len() > 1024 * 1024 {
-                bail!("generator prompt response exceeds the 1 MiB safety limit");
+                .context("declared generator prompt has no response source")?;
+            match path {
+                Some(path) => {
+                    let mut input = open_private_identity(path).context(
+                        "generator prompt response file has unsafe ownership or permissions",
+                    )?;
+                    let mut value = Vec::new();
+                    std::io::Read::by_ref(&mut input)
+                        .take(1024 * 1024 + 1)
+                        .read_to_end(&mut value)
+                        .context("could not read generator prompt response")?;
+                    if value.len() > 1024 * 1024 {
+                        bail!("generator prompt response exceeds the 1 MiB safety limit");
+                    }
+                    Ok(SecretBox::new(Box::new(value)))
+                }
+                None => read_tty_prompt(prompt),
             }
-            Ok(SecretBox::new(Box::new(value)))
         })
         .collect()
+}
+
+const MAX_INTERACTIVE_PROMPT_BYTES: usize = 1024 * 1024;
+
+/// Read one declared prompt from a controlling terminal. This frontend is
+/// intentionally separate from stdin/stdout so generator pipes cannot consume
+/// prompt input or receive prompt bytes. Multiline prompts terminate on an
+/// explicit Ctrl-D, while single-line prompts consume one terminal line.
+#[cfg(unix)]
+fn read_tty_prompt(prompt: &nix_seal_core::GeneratorPrompt) -> Result<SecretBox<Vec<u8>>> {
+    use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+
+    let mut tty = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .context("interactive prompting requires a controlling terminal")?;
+    if !rustix::termios::isatty(&tty) {
+        bail!("interactive prompting requires a controlling terminal");
+    }
+
+    let message = prompt
+        .message
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    tty.write_all(message.as_bytes())
+        .and_then(|()| {
+            if prompt.multiline {
+                tty.write_all(b" (finish with Ctrl-D): ")
+            } else {
+                tty.write_all(b": ")
+            }
+        })
+        .and_then(|()| tty.flush())
+        .context("could not write interactive prompt")?;
+
+    let original = tcgetattr(&tty).context("could not inspect terminal settings")?;
+    let restore_tty = tty
+        .try_clone()
+        .context("could not duplicate terminal handle")?;
+    let restore = TerminalModeGuard {
+        tty: restore_tty,
+        original: Some(original.clone()),
+    };
+    if matches!(prompt.mode, nix_seal_core::GeneratorPromptMode::Hidden) {
+        let mut masked = original;
+        masked
+            .local_modes
+            .remove(LocalModes::ECHO | LocalModes::ECHONL);
+        tcsetattr(&tty, OptionalActions::Flush, &masked)
+            .context("could not disable terminal echo for hidden prompt")?;
+    }
+
+    let mut value = Vec::new();
+    if prompt.multiline {
+        (&mut tty)
+            .take((MAX_INTERACTIVE_PROMPT_BYTES + 1) as u64)
+            .read_to_end(&mut value)
+            .context("could not read interactive prompt response")?;
+    } else {
+        loop {
+            let mut buffer = [0_u8; 4096];
+            let read = tty
+                .read(&mut buffer)
+                .context("could not read interactive prompt response")?;
+            if read == 0 {
+                break;
+            }
+            let end = buffer[..read]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(read, |position| position + 1);
+            value.extend_from_slice(&buffer[..end]);
+            let finished = value.len() > MAX_INTERACTIVE_PROMPT_BYTES || end != read;
+            buffer.zeroize();
+            if finished {
+                break;
+            }
+        }
+    }
+    if value.len() > MAX_INTERACTIVE_PROMPT_BYTES {
+        bail!("interactive prompt response exceeds the 1 MiB safety limit");
+    }
+    if !prompt.multiline && value.ends_with(b"\n") {
+        value.pop();
+        if value.ends_with(b"\r") {
+            value.pop();
+        }
+    }
+    drop(restore);
+    tty.write_all(b"\n")
+        .and_then(|()| tty.flush())
+        .context("could not finish interactive prompt")?;
+    Ok(SecretBox::new(Box::new(value)))
+}
+
+#[cfg(unix)]
+struct TerminalModeGuard {
+    tty: fs::File,
+    original: Option<rustix::termios::Termios>,
+}
+
+#[cfg(unix)]
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            let _ = rustix::termios::tcsetattr(
+                &self.tty,
+                rustix::termios::OptionalActions::Drain,
+                &original,
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn read_tty_prompt(_prompt: &nix_seal_core::GeneratorPrompt) -> Result<SecretBox<Vec<u8>>> {
+    bail!("interactive prompting is unavailable on this platform")
 }
 
 fn collect_generator_order(
@@ -5017,13 +6598,78 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_plugin_worker() -> Result<()> {
+    if std::env::var_os("NIX_SEAL_PLUGIN_WORKER").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        bail!("internal age-plugin worker may only be launched by nix-seal");
+    }
+    nix_seal_crypto::run_plugin_worker_protocol(std::io::stdin().lock(), std::io::stdout().lock())
+        .map_err(anyhow::Error::from)
+}
+
+fn run_generator_worker_main(arguments: &GeneratorWorkerArgs) -> Result<()> {
+    if std::env::var_os("NIX_SEAL_GENERATOR_WORKER").as_deref() != Some(OsStr::new("1")) {
+        bail!("internal generator worker may only be launched by nix-seal");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let isolated = {
+            #[allow(deprecated)]
+            {
+                rustix::thread::unshare(rustix::thread::UnshareFlags::NEWNET).is_ok()
+            }
+        };
+        let mut status = std::io::stdout().lock();
+        status.write_all(GENERATOR_WORKER_MAGIC)?;
+        status.write_all(&[u8::from(isolated)])?;
+        status.flush()?;
+        drop(status);
+        if !isolated {
+            return Ok(());
+        }
+        let executable = resolve_external_executable(&arguments.executable)?;
+        let runtime_path = arguments
+            .runtime_path
+            .as_deref()
+            .unwrap_or_else(|| OsStr::new(""));
+        let layout = GeneratorExecutionLayout {
+            runtime_path,
+            workspace: &arguments.workspace,
+            output_directory: &arguments.output_directory,
+            public_output_directory: &arguments.public_output_directory,
+            prompt_directory: &arguments.prompt_directory,
+            prompt_count: arguments.prompt_count,
+            secret_directory: &arguments.secret_directory,
+            secret_count: arguments.secret_count,
+            output_count: arguments.output_count,
+            public_output_count: arguments.public_output_count,
+        };
+        let mut command =
+            build_external_generator_command(&executable, &arguments.generator_args, &layout);
+        let mut child = command
+            .spawn()
+            .context("could not start constrained generator")?;
+        let status = child
+            .wait()
+            .context("could not observe constrained generator")?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("constrained generator failed")
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = arguments;
+        bail!("generator network isolation is unavailable on this platform")
+    }
+}
+
 fn ensure_identity_matches_recipient(
     identity: &secrecy::SecretString,
     recipient: &str,
 ) -> Result<()> {
-    if nix_seal_crypto::recipient_from_identity(identity)?
-        != nix_seal_crypto::normalize_recipient(recipient)?
-    {
+    nix_seal_crypto::normalize_recipient(recipient)?;
+    if !nix_seal_crypto::identity_matches_recipient(identity, recipient) {
         bail!("target identity does not match the recipient selected by plan policy");
     }
     Ok(())
@@ -5081,12 +6727,12 @@ fn read_plan_bounded(path: &Path) -> Result<nix_seal_core::PlanV1> {
     let plan: nix_seal_core::PlanV1 =
         serde_json::from_slice(&bytes).context("invalid strict plan.v1 JSON")?;
     nix_seal_policy::validate(&plan)?;
-    validate_plan_identity_material(&plan, false)?;
+    validate_plan_identity_material(&plan)?;
     Ok(plan)
 }
 
 fn deep_check_plan(plan: &nix_seal_core::PlanV1, repository_root: &Path) -> Result<()> {
-    validate_plan_identity_material(plan, true)?;
+    validate_plan_identity_material(plan)?;
     for (secret_id, secret) in &plan.secrets {
         let recipients = nix_seal_policy::secret_recipients(plan, secret_id)?;
         for recipient in recipients.recipients.values() {
@@ -5109,7 +6755,7 @@ fn deep_check_plan(plan: &nix_seal_core::PlanV1, repository_root: &Path) -> Resu
     Ok(())
 }
 
-fn validate_plan_identity_material(plan: &nix_seal_core::PlanV1, deep: bool) -> Result<()> {
+fn validate_plan_identity_material(plan: &nix_seal_core::PlanV1) -> Result<()> {
     let mut trusted = nix_seal_manifest::TrustedKeys::new();
     for (id, identity) in &plan.identities {
         match identity.kind {
@@ -5119,9 +6765,8 @@ fn validate_plan_identity_material(plan: &nix_seal_core::PlanV1, deep: bool) -> 
                     .with_context(|| format!("signer identity {id} is malformed or duplicated"))?;
             }
             nix_seal_core::IdentityKind::Plugin => {
-                if deep {
-                    bail!("identity {id} uses a plugin that this release cannot deeply validate");
-                }
+                nix_seal_crypto::recipient_fingerprint(&identity.public)
+                    .with_context(|| format!("plugin identity {id} has a malformed recipient"))?;
             }
             nix_seal_core::IdentityKind::Administrator
             | nix_seal_core::IdentityKind::Target
@@ -5185,6 +6830,7 @@ fn run_secret(command: SecretCommand, json: bool) -> Result<()> {
             "imported",
         )?,
         SecretCommand::Edit(arguments) => run_secret_edit(arguments, json)?,
+        SecretCommand::Rekey(arguments) => run_secret_rekey(&arguments, json)?,
         SecretCommand::Delete(arguments) => run_secret_delete(&arguments, json)?,
         SecretCommand::Reveal(arguments) => {
             if json {
@@ -5193,8 +6839,11 @@ fn run_secret(command: SecretCommand, json: bool) -> Result<()> {
             let plan = read_plan_bounded(&arguments.policy.plan)?;
             let recipients = nix_seal_policy::secret_recipients(&plan, &arguments.policy.secret)?;
             let identity = read_identity(&arguments.identity)?;
-            let public = nix_seal_crypto::recipient_from_identity(&identity)?;
-            if !recipients.recipients.values().any(|value| value == &public) {
+            if !recipients
+                .recipients
+                .values()
+                .any(|value| nix_seal_crypto::identity_matches_recipient(&identity, value))
+            {
                 bail!("reveal identity is not authorized by canonical recipient policy");
             }
             let secret = plan
@@ -5333,6 +6982,7 @@ fn run_secret_write(
         .canonicalize()
         .context("repository root must exist")?;
     let identity = read_identity(&arguments.identity)?;
+    ensure_canonical_authoring_identity_authorized(&plan, &arguments.policy.secret, &identity)?;
     let input = read_structured_secret_input(arguments.format)?;
     let result = nix_seal_authoring::write_secret(
         &root,
@@ -5375,6 +7025,105 @@ fn run_secret_write(
     Ok(())
 }
 
+fn run_secret_rekey(arguments: &SecretRekeyArgs, json: bool) -> Result<()> {
+    let plan = read_plan_bounded(&arguments.policy.plan)?;
+    let secret = plan
+        .secrets
+        .get(&arguments.policy.secret)
+        .context("secret is absent from plan")?;
+    let recipient_policy = nix_seal_policy::secret_recipients(&plan, &arguments.policy.secret)?;
+    let recipients: Vec<_> = recipient_policy
+        .recipients
+        .values()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let root = arguments
+        .repository_root
+        .canonicalize()
+        .context("repository root must exist")?;
+    let source = existing_secret_path(&root, &secret.source)?;
+
+    if !arguments.yes {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema":"nix-seal.output.v1",
+                    "operation":"rekey-dry-run",
+                    "secretId":arguments.policy.secret,
+                    "ciphertextPath":source,
+                    "recipientCount":recipients.len(),
+                    "replace":true
+                })
+            );
+        } else {
+            println!(
+                "canonical rekey dry-run for {} ({} recipient(s))",
+                arguments.policy.secret,
+                recipients.len()
+            );
+            eprintln!(
+                "review the recipient policy, then rerun with --identity <private-key> --yes"
+            );
+        }
+        return Ok(());
+    }
+
+    let identity_path = arguments
+        .identity
+        .as_deref()
+        .context("canonical rekey requires --identity when --yes is supplied")?;
+    let identity = read_identity(identity_path)?;
+    let administrator_authorized = recipient_policy.recipients.iter().any(|(id, recipient)| {
+        plan.identities.get(id).is_some_and(|declared| {
+            matches!(
+                declared.kind,
+                nix_seal_core::IdentityKind::Administrator | nix_seal_core::IdentityKind::Recovery
+            ) && nix_seal_crypto::identity_matches_recipient(&identity, recipient)
+        })
+    });
+    if !administrator_authorized {
+        bail!(
+            "rekey identity must be an administrator or recovery identity authorized by canonical recipient policy"
+        );
+    }
+    if matches!(secret.delivery, nix_seal_core::DeliveryMode::Direct) {
+        eprintln!(
+            "warning: direct mode allows matching target keys to decrypt current and historical Git ciphertext"
+        );
+    }
+    let result = nix_seal_authoring::rekey_secret(
+        &root,
+        Path::new(&secret.source),
+        Path::new(&secret.source),
+        &recipients,
+        &identity,
+        nix_seal_authoring::WriteMode::Replace,
+    )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.output.v1",
+                "operation":"rekeyed",
+                "secretId":arguments.policy.secret,
+                "ciphertextPath":result.path,
+                "ciphertextHash":result.ciphertext_hash,
+                "recipientCount":recipients.len()
+            })
+        );
+    } else {
+        println!("{}", result.path.display());
+        eprintln!(
+            "re-encrypted canonical ciphertext for {} without changing the application credential",
+            arguments.policy.secret
+        );
+    }
+    Ok(())
+}
+
 fn read_structured_secret_input(format: Option<SecretFormat>) -> Result<SecretBox<Vec<u8>>> {
     let mut input = SecretBox::new(Box::new(Vec::new()));
     BoundedReader::new(
@@ -5400,6 +7149,10 @@ fn validate_structured_secret_bytes(input: &[u8], format: Option<SecretFormat>) 
         SecretFormat::Toml => {
             let _: toml::Value =
                 toml::from_str(text).context("structured TOML secret input is malformed")?;
+        }
+        SecretFormat::Yaml => {
+            let _: yaml_serde::Value =
+                yaml_serde::from_str(text).context("structured YAML secret input is malformed")?;
         }
         SecretFormat::Dotenv => validate_dotenv(text)?,
     }
@@ -5468,6 +7221,11 @@ fn run_secret_edit(arguments: SecretEditArgs, json: bool) -> Result<()> {
     }
     .canonicalize()
     .context("editor workspace root must exist")?;
+    ensure_canonical_authoring_identity_authorized(
+        &plan,
+        &arguments.secret.policy.secret,
+        &identity,
+    )?;
     if matches!(secret.delivery, nix_seal_core::DeliveryMode::Direct) {
         eprintln!(
             "warning: direct mode allows matching target keys to decrypt current and historical Git ciphertext"
@@ -5559,6 +7317,11 @@ fn existing_secret_path(repository_root: &Path, relative: &str) -> Result<PathBu
         }
     }
     Ok(path)
+}
+
+fn existing_public_output_path(repository_root: &Path, relative: &str) -> Result<PathBuf> {
+    existing_secret_path(repository_root, relative)
+        .context("public output path is missing or unsafe")
 }
 
 /// Resolves an explicit plaintext render destination without permitting the
@@ -5665,8 +7428,45 @@ fn read_identity(path: &Path) -> Result<SecretString> {
     if bytes.len() > 1024 * 1024 {
         bail!("identity exceeds the 1 MiB safety limit");
     }
+    if bytes.starts_with(b"age-encryption.org/v1") {
+        let passphrase = read_identity_passphrase(false)?;
+        return nix_seal_crypto::decrypt_passphrase_identity(bytes.as_slice(), &passphrase)
+            .context("could not decrypt passphrase-protected identity");
+    }
     Ok(SecretString::from(
         String::from_utf8(bytes).context("identity is not UTF-8")?,
+    ))
+}
+
+/// Reads a human recovery passphrase only from the controlling terminal. The
+/// passphrase is never accepted through argv, stdin, or environment variables.
+/// New passphrases are confirmed and must meet a conservative length floor;
+/// existing encrypted identities still prompt without requiring confirmation.
+fn read_identity_passphrase(confirm: bool) -> Result<SecretString> {
+    let prompt = nix_seal_core::GeneratorPrompt {
+        id: nix_seal_core::Id::parse("identity/passphrase")
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+        mode: nix_seal_core::GeneratorPromptMode::Hidden,
+        message: "Recovery identity passphrase".to_owned(),
+        multiline: false,
+        persistent: false,
+    };
+    let mut first = read_tty_prompt(&prompt)?;
+    if first.expose_secret().len() < 16 {
+        bail!("recovery identity passphrase must be at least 16 bytes");
+    }
+    if confirm {
+        let confirmation = read_tty_prompt(&nix_seal_core::GeneratorPrompt {
+            message: "Confirm recovery identity passphrase".to_owned(),
+            ..prompt
+        })?;
+        if first.expose_secret() != confirmation.expose_secret() {
+            bail!("recovery identity passphrase confirmation did not match");
+        }
+    }
+    let bytes = std::mem::take(first.expose_secret_mut());
+    Ok(SecretString::from(
+        String::from_utf8(bytes).context("recovery identity passphrase is not UTF-8")?,
     ))
 }
 
@@ -6245,6 +8045,188 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             validate_structured_secret_bytes(b"token = 'value'", Some(SecretFormat::Toml)).is_ok()
         );
         assert!(validate_structured_secret_bytes(b"token =", Some(SecretFormat::Toml)).is_err());
+        assert!(
+            validate_structured_secret_bytes(b"token: value\n", Some(SecretFormat::Yaml)).is_ok()
+        );
+        assert!(validate_structured_secret_bytes(b"token: [", Some(SecretFormat::Yaml)).is_err());
+    }
+
+    #[test]
+    fn canonical_secret_rekey_is_dry_run_first_and_replaces_recipients_atomically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        let secrets = repository.join("secrets");
+        fs::create_dir_all(&secrets)?;
+        let plan_path = temporary.path().join("plan.v1.json");
+        let old_identity_path = temporary.path().join("old.identity");
+        let new_identity_path = temporary.path().join("new.identity");
+        let (old_identity, old_recipient) = nix_seal_crypto::generate_x25519();
+        let (new_identity, new_recipient) = nix_seal_crypto::generate_x25519();
+        write_new_private(&old_identity_path, old_identity.expose_secret().as_bytes())?;
+        write_new_private(&new_identity_path, new_identity.expose_secret().as_bytes())?;
+
+        let secret_id = nix_seal_core::Id::parse("application/password")?;
+        let mut ciphertext = fs::File::create(secrets.join("password.age"))?;
+        nix_seal_crypto::encrypt(
+            b"canonical-rekey-canary".as_slice(),
+            &mut ciphertext,
+            &[old_recipient.clone(), new_recipient.clone()],
+        )?;
+        ciphertext.sync_all()?;
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.identities.insert(
+            nix_seal_core::Id::parse("administrator")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: new_recipient,
+            },
+        );
+        plan.identities.insert(
+            nix_seal_core::Id::parse("signer.release")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Signer,
+                public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public()?,
+            },
+        );
+        plan.secrets.insert(
+            secret_id.clone(),
+            nix_seal_core::Secret {
+                source: "secrets/password.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: Vec::new(),
+                selectors: nix_seal_core::TargetSelectors::default(),
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: None,
+                repository_only: false,
+            },
+        );
+        nix_seal_policy::validate(&plan)?;
+        fs::write(&plan_path, nix_seal_policy::canonical_json(&plan)?)?;
+        let source = secrets.join("password.age");
+        let before = fs::read(&source)?;
+
+        run_secret_rekey(
+            &SecretRekeyArgs {
+                policy: SecretPlanArgs {
+                    plan: plan_path.clone(),
+                    secret: secret_id.clone(),
+                },
+                repository_root: repository.clone(),
+                identity: None,
+                yes: false,
+            },
+            true,
+        )?;
+        assert_eq!(fs::read(&source)?, before);
+
+        run_secret_rekey(
+            &SecretRekeyArgs {
+                policy: SecretPlanArgs {
+                    plan: plan_path,
+                    secret: secret_id,
+                },
+                repository_root: repository,
+                identity: Some(new_identity_path),
+                yes: true,
+            },
+            true,
+        )?;
+
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(
+            open_public_ciphertext(&source)?,
+            &mut plaintext,
+            &new_identity,
+        )?;
+        assert_eq!(plaintext, b"canonical-rekey-canary");
+        let mut old_plaintext = Vec::new();
+        assert!(
+            nix_seal_crypto::decrypt(
+                open_public_ciphertext(&source)?,
+                &mut old_plaintext,
+                &old_identity,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_authoring_rejects_target_identities_even_in_direct_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (administrator, administrator_recipient) = nix_seal_crypto::generate_x25519();
+        let (target, target_recipient) = nix_seal_crypto::generate_x25519();
+        let administrator_id = nix_seal_core::Id::parse("administrator")?;
+        let signer_id = nix_seal_core::Id::parse("release-signer")?;
+        let target_identity_id = nix_seal_core::Id::parse("target-identity")?;
+        let target_id = nix_seal_core::Id::parse("desktop")?;
+        let secret_id = nix_seal_core::Id::parse("application/token")?;
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.identities.insert(
+            administrator_id.clone(),
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: administrator_recipient,
+            },
+        );
+        plan.identities.insert(
+            target_identity_id.clone(),
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Target,
+                public: target_recipient,
+            },
+        );
+        plan.identities.insert(
+            signer_id.clone(),
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Signer,
+                public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public()?,
+            },
+        );
+        plan.targets.insert(
+            target_id.clone(),
+            nix_seal_core::Target {
+                kind: nix_seal_core::TargetKind::NixOs,
+                system: "x86_64-linux".to_owned(),
+                identity: target_identity_id,
+                username: None,
+                configuration: None,
+                environment: None,
+                tags: Vec::new(),
+            },
+        );
+        plan.secrets.insert(
+            secret_id.clone(),
+            nix_seal_core::Secret {
+                source: "secrets/token.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Direct,
+                administrators: vec![administrator_id],
+                consumers: vec![target_id],
+                selectors: nix_seal_core::TargetSelectors::default(),
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: Some(nix_seal_core::Id::parse("release")?),
+                repository_only: false,
+            },
+        );
+        plan.approval_policies.insert(
+            nix_seal_core::Id::parse("release")?,
+            nix_seal_core::ApprovalPolicy {
+                threshold: 1,
+                signers: vec![signer_id],
+            },
+        );
+        nix_seal_policy::validate(&plan)?;
+        assert!(
+            ensure_canonical_authoring_identity_authorized(&plan, &secret_id, &target).is_err()
+        );
+        ensure_canonical_authoring_identity_authorized(&plan, &secret_id, &administrator)?;
+        Ok(())
     }
 
     #[test]
@@ -6317,10 +8299,12 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 delivery: nix_seal_core::DeliveryMode::Rekeyed,
                 administrators: Vec::new(),
                 consumers: Vec::new(),
+                selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         plan.templates.insert(
@@ -6426,6 +8410,8 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 system: "x86_64-linux".to_owned(),
                 identity: nix_seal_core::Id::parse("target.direct")?,
                 username: None,
+                configuration: None,
+                environment: None,
                 tags: Vec::new(),
             },
         );
@@ -6436,10 +8422,12 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 delivery: nix_seal_core::DeliveryMode::Direct,
                 administrators: Vec::new(),
                 consumers: vec![target_id.clone()],
+                selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         nix_seal_policy::validate(&plan)?;
@@ -6671,10 +8659,12 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 delivery: nix_seal_core::DeliveryMode::Rekeyed,
                 administrators: vec![group.clone()],
                 consumers: Vec::new(),
+                selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         assert_eq!(
@@ -6726,8 +8716,79 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             })
             .to_string(),
         )?;
-        migrate_agenix_rekey_export(&metadata, true)?;
+        migrate_agenix_rekey_export(
+            &AgenixRekeyMigrationArgs {
+                metadata,
+                repository_root: PathBuf::from("."),
+                destination: None,
+                identity: None,
+                recipients: Vec::new(),
+                replace: false,
+                execute: false,
+            },
+            true,
+        )?;
         assert!(validate_agenix_rekey_source("../unsafe.age").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn agenix_rekey_export_bulk_import_is_side_by_side_and_dry_run_first()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(repository.join("legacy"))?;
+        let (identity, master_recipient) = nix_seal_crypto::generate_x25519();
+        let (_, target_recipient) = nix_seal_crypto::generate_x25519();
+        let source = repository.join("legacy/service.age");
+        let mut output = fs::File::create(&source)?;
+        nix_seal_crypto::encrypt(
+            &b"agenix-rekey-canary"[..],
+            &mut output,
+            std::slice::from_ref(&master_recipient),
+        )?;
+        output.sync_all()?;
+        let identity_path = temporary.path().join("administrator.agekey");
+        write_new_private(&identity_path, identity.expose_secret().as_bytes())?;
+        let metadata = temporary.path().join("agenix-rekey.json");
+        fs::write(
+            &metadata,
+            serde_json::json!({
+                "schema":"nix-seal.agenix-rekey-export.v1",
+                "target":{
+                    "id":"desktop",
+                    "kind":"nixos",
+                    "system":"x86_64-linux",
+                    "recipient":target_recipient,
+                    "storageMode":"derivation"
+                },
+                "masterRecipients":[master_recipient.clone()],
+                "secrets":{"service-token":{"rekeyFile":"legacy/service.age"}}
+            })
+            .to_string(),
+        )?;
+        let common = || AgenixRekeyMigrationArgs {
+            metadata: metadata.clone(),
+            repository_root: repository.clone(),
+            destination: Some(PathBuf::from("migrated")),
+            identity: Some(identity_path.clone()),
+            recipients: vec![master_recipient.clone()],
+            replace: false,
+            execute: false,
+        };
+        migrate_agenix_rekey_export(&common(), true)?;
+        assert!(!repository.join("migrated/legacy/service.age").exists());
+        let mut execute = common();
+        execute.execute = true;
+        migrate_agenix_rekey_export(&execute, true)?;
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(
+            fs::File::open(repository.join("migrated/legacy/service.age"))?,
+            &mut plaintext,
+            &identity,
+        )?;
+        assert_eq!(plaintext, b"agenix-rekey-canary");
+        assert!(source.is_file());
         Ok(())
     }
 
@@ -6740,7 +8801,42 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         fs::create_dir(machines.join("desktop"))?;
         fs::create_dir(machines.join("desktop/facts"))?;
         fs::write(machines.join("desktop/facts/public-key"), b"public value")?;
-        migrate_clan_facts_tree(&machines, false)?;
+        migrate_clan_facts_tree(
+            &ClanFactsMigrationArgs {
+                directory: machines,
+                repository_root: PathBuf::from("."),
+                destination: None,
+                replace: false,
+                execute: false,
+            },
+            false,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn clan_facts_migration_bulk_copies_public_leaves_side_by_side()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        let fact = repository.join("machines/desktop/facts/public-key");
+        fs::create_dir_all(fact.parent().ok_or("fact parent")?)?;
+        fs::write(&fact, b"public value")?;
+        let common = || ClanFactsMigrationArgs {
+            directory: PathBuf::from("machines"),
+            repository_root: repository.clone(),
+            destination: Some(PathBuf::from("nix-seal-public")),
+            replace: false,
+            execute: false,
+        };
+        migrate_clan_facts_tree(&common(), true)?;
+        let destination = repository.join("nix-seal-public/desktop/facts/public-key");
+        assert!(!destination.exists());
+        let mut execute = common();
+        execute.execute = true;
+        migrate_clan_facts_tree(&execute, true)?;
+        assert_eq!(fs::read(destination)?, b"public value");
+        assert_eq!(fs::read(fact)?, b"public value");
         Ok(())
     }
 
@@ -6861,6 +8957,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn built_in_generators_are_bounded_and_format_safe() -> Result<(), Box<dyn std::error::Error>> {
         let output = nix_seal_core::Id::parse("application/token")?;
@@ -6871,7 +8968,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "48".to_owned())]),
             validation: None,
@@ -6884,7 +8983,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
             validation: None,
@@ -6899,7 +9000,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
             validation: None,
@@ -6912,7 +9015,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::from([("bytes".to_owned(), "24".to_owned())]),
             validation: None,
@@ -6932,7 +9037,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![output.clone()],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
             validation: None,
@@ -6950,7 +9057,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![output],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
             validation: None,
@@ -6974,7 +9083,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![nix_seal_core::Id::parse("application/passphrase")?],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::from([("words".to_owned(), "12".to_owned())]),
             validation: None,
@@ -7004,7 +9115,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![nix_seal_core::Id::parse("application/password-hash")?],
+            public_outputs: Vec::new(),
             prompts: vec![nix_seal_core::GeneratorPrompt {
                 id: nix_seal_core::Id::parse("password")?,
                 mode: nix_seal_core::GeneratorPromptMode::Hidden,
@@ -7020,8 +9133,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             validation: None,
         };
         let password = SecretBox::new(Box::new(b"argon2id-test-password".to_vec()));
-        let generated = generate_generator_values(&generator, &[password])?;
-        let encoded = std::str::from_utf8(generated[0].expose_secret())?;
+        let generated =
+            generate_generator_values(&generator, &[password], GeneratorSecretInputs::None)?;
+        let encoded = std::str::from_utf8(generated.secrets[0].expose_secret())?;
         assert!(encoded.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
         let parsed = PasswordHash::new(encoded)
             .map_err(|_| "generated Argon2id output is not a valid PHC hash")?;
@@ -7038,7 +9152,8 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         assert!(
             generate_generator_values(
                 &visible,
-                &[SecretBox::new(Box::new(b"argon2id-test-password".to_vec()))]
+                &[SecretBox::new(Box::new(b"argon2id-test-password".to_vec()))],
+                GeneratorSecretInputs::None,
             )
             .is_err()
         );
@@ -7061,10 +9176,12 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 delivery: nix_seal_core::DeliveryMode::Rekeyed,
                 administrators: Vec::new(),
                 consumers: Vec::new(),
+                selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         let generator = nix_seal_core::Generator {
@@ -7074,7 +9191,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![secret_id],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
             validation: Some("v1".to_owned()),
@@ -7084,7 +9203,17 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             GeneratorAction::Create
         );
         fs::write(repository.join("secrets/token.age"), b"ciphertext")?;
-        write_generator_state(&repository, &generator_id, "v1", &generator.outputs)?;
+        write_generator_state(
+            &repository,
+            &generator_id,
+            "v1",
+            &generator.outputs,
+            &generator
+                .public_outputs
+                .iter()
+                .map(|output| output.id.clone())
+                .collect::<Vec<_>>(),
+        )?;
         assert_eq!(
             generator_action(&plan, &generator_id, &generator, &repository, false)?,
             GeneratorAction::Unchanged
@@ -7103,6 +9232,95 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
     }
 
     #[test]
+    fn interactive_prompt_resolution_is_explicit_and_keeps_noninteractive_runs_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(&repository)?;
+        let generator_id = nix_seal_core::Id::parse("application/bootstrap")?;
+        let prompt_id = nix_seal_core::Id::parse("database/password")?;
+        let generator = nix_seal_core::Generator {
+            executable: "/nix/store/example/bin/generator".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
+            outputs: vec![nix_seal_core::Id::parse("application/token")?],
+            public_outputs: Vec::new(),
+            prompts: vec![nix_seal_core::GeneratorPrompt {
+                id: prompt_id.clone(),
+                mode: nix_seal_core::GeneratorPromptMode::Hidden,
+                message: "Database password".to_owned(),
+                multiline: false,
+                persistent: false,
+            }],
+            parameters: BTreeMap::new(),
+            validation: None,
+        };
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.generators.insert(generator_id.clone(), generator);
+        let order = vec![generator_id];
+        assert!(validate_generator_prompt_files(&plan, &order, &[], &repository, false).is_err());
+        let resolved = validate_generator_prompt_files(&plan, &order, &[], &repository, true)?;
+        assert_eq!(resolved.get(&prompt_id), Some(&None));
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_prompt_state_is_private_and_reused() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(&repository)?;
+        let generator_id = nix_seal_core::Id::parse("application/bootstrap")?;
+        let prompt_id = nix_seal_core::Id::parse("database/password")?;
+        let generator = nix_seal_core::Generator {
+            executable: "/nix/store/example/bin/generator".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
+            outputs: vec![nix_seal_core::Id::parse("application/token")?],
+            public_outputs: Vec::new(),
+            prompts: vec![nix_seal_core::GeneratorPrompt {
+                id: prompt_id.clone(),
+                mode: nix_seal_core::GeneratorPromptMode::Hidden,
+                message: "Database password".to_owned(),
+                multiline: false,
+                persistent: true,
+            }],
+            parameters: BTreeMap::new(),
+            validation: None,
+        };
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.generators
+            .insert(generator_id.clone(), generator.clone());
+        let value = SecretBox::new(Box::new(b"persistent-prompt".to_vec()));
+        persist_generator_prompts(&repository, &generator_id, &generator, &[value])?;
+        let path = generator_prompt_state_path(&repository, &generator_id, &prompt_id)?;
+        let metadata = fs::metadata(&path)?;
+        assert!(metadata.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        }
+        let files = validate_generator_prompt_files(
+            &plan,
+            std::slice::from_ref(&generator_id),
+            &[],
+            &repository,
+            false,
+        )?;
+        let restored = read_generator_prompts(&generator, &files)?;
+        assert_eq!(restored[0].expose_secret(), b"persistent-prompt");
+        Ok(())
+    }
+
+    #[test]
     fn ssh_ed25519_generator_emits_a_standard_age_compatible_private_identity()
     -> Result<(), Box<dyn std::error::Error>> {
         let generator = nix_seal_core::Generator {
@@ -7112,7 +9330,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
             max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![nix_seal_core::Id::parse("application/ssh-private-key")?],
+            public_outputs: Vec::new(),
             prompts: Vec::new(),
             parameters: BTreeMap::new(),
             validation: None,
@@ -7163,16 +9383,21 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             executable: shell.to_string_lossy().into_owned(),
             arguments: vec![
                 "-c".to_owned(),
-                "IFS= read -r value < \"$NIX_SEAL_PROMPT_DIR/0\"; printf %s \"$value\" > \"$NIX_SEAL_OUTPUT_DIR/0\"; printf second > \"$NIX_SEAL_OUTPUT_DIR/1\"".to_owned(),
+                "IFS= read -r value < \"$NIX_SEAL_PROMPT_DIR/0\"; printf %s \"$value\" > \"$NIX_SEAL_OUTPUT_DIR/0\"; printf second > \"$NIX_SEAL_OUTPUT_DIR/1\"; printf public > \"$NIX_SEAL_PUBLIC_OUTPUT_DIR/0\"".to_owned(),
             ],
             runtime_inputs: Vec::new(),
             timeout_seconds: 5,
             max_output_bytes: 1024,
             dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
             outputs: vec![
                 nix_seal_core::Id::parse("generator/one")?,
                 nix_seal_core::Id::parse("generator/two")?,
             ],
+            public_outputs: vec![nix_seal_core::GeneratorPublicOutput {
+                id: nix_seal_core::Id::parse("generator/public")?,
+                destination: "public/generator-output".to_owned(),
+            }],
             prompts: vec![nix_seal_core::GeneratorPrompt {
                 id: nix_seal_core::Id::parse("generator/value")?,
                 mode: nix_seal_core::GeneratorPromptMode::Hidden,
@@ -7183,11 +9408,109 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             parameters: BTreeMap::new(),
             validation: None,
         };
-        let values =
-            generate_external_values(&generator, &[SecretBox::new(Box::new(b"first".to_vec()))])?;
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[0].expose_secret(), b"first");
-        assert_eq!(values[1].expose_secret(), b"second");
+        let values = generate_external_values(
+            &generator,
+            &[SecretBox::new(Box::new(b"first".to_vec()))],
+            GeneratorSecretInputs::None,
+        )?;
+        assert_eq!(values.secrets.len(), 2);
+        assert_eq!(values.secrets[0].expose_secret(), b"first");
+        assert_eq!(values.secrets[1].expose_secret(), b"second");
+        assert_eq!(values.public.len(), 1);
+        assert_eq!(values.public[0].expose_secret(), b"public");
+        Ok(())
+    }
+
+    #[test]
+    fn constrained_external_generator_receives_only_declared_secret_inputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let shell = std::env::split_paths(&std::env::var_os("PATH").ok_or("PATH is absent")?)
+            .map(|directory| directory.join("sh"))
+            .find(|candidate| candidate.is_file())
+            .ok_or("sh is absent from PATH")?
+            .canonicalize()?;
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(repository.join("secrets"))?;
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        let dependency_id = nix_seal_core::Id::parse("application/input")?;
+        let output_id = nix_seal_core::Id::parse("application/output")?;
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.identities.insert(
+            nix_seal_core::Id::parse("administrator")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Administrator,
+                public: recipient.clone(),
+            },
+        );
+        plan.identities.insert(
+            nix_seal_core::Id::parse("signer")?,
+            nix_seal_core::Identity {
+                kind: nix_seal_core::IdentityKind::Signer,
+                public: nix_seal_manifest::ApprovalSigningKey::generate()?.encode_public()?,
+            },
+        );
+        plan.secrets.insert(
+            dependency_id.clone(),
+            nix_seal_core::Secret {
+                source: "secrets/input.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Rekeyed,
+                administrators: Vec::new(),
+                consumers: Vec::new(),
+                selectors: nix_seal_core::TargetSelectors::default(),
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: None,
+                repository_only: false,
+            },
+        );
+        nix_seal_crypto::encrypt(
+            std::io::Cursor::new(b"dependency-canary"),
+            fs::File::create(repository.join("secrets/input.age"))?,
+            &[recipient],
+        )?;
+        let generator = nix_seal_core::Generator {
+            executable: shell.to_string_lossy().into_owned(),
+            arguments: vec![
+                "-c".to_owned(),
+                "test \"$NIX_SEAL_SECRET_COUNT\" = 1; test -f \"$NIX_SEAL_SECRET_DIR/0\"; test ! -e \"$NIX_SEAL_SECRET_DIR/1\"; IFS= read -r value < \"$NIX_SEAL_SECRET_DIR/0\"; printf %s \"$value\" > \"$NIX_SEAL_OUTPUT_DIR/0\"".to_owned(),
+            ],
+            runtime_inputs: Vec::new(),
+            timeout_seconds: 5,
+            max_output_bytes: 1024,
+            dependencies: Vec::new(),
+            secret_dependencies: vec![dependency_id],
+            outputs: vec![output_id],
+            public_outputs: Vec::new(),
+            prompts: Vec::new(),
+            parameters: BTreeMap::new(),
+            validation: None,
+        };
+        let values = generate_external_values(
+            &generator,
+            &[],
+            GeneratorSecretInputs::Plan {
+                plan: &plan,
+                repository_root: &repository,
+                identity: &identity,
+            },
+        )?;
+        assert_eq!(values.secrets.len(), 1);
+        assert_eq!(values.secrets[0].expose_secret(), b"dependency-canary");
+        let (unauthorized_identity, _) = nix_seal_crypto::generate_x25519();
+        assert!(
+            generate_external_values(
+                &generator,
+                &[],
+                GeneratorSecretInputs::Plan {
+                    plan: &plan,
+                    repository_root: &repository,
+                    identity: &unauthorized_identity,
+                },
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -7303,6 +9626,83 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
     }
 
     #[test]
+    fn secretctl_migration_bulk_rekeys_side_by_side_after_dry_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let private = "-----BEGIN_OPENSSH_PRIVATE_KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+QyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYgAAAJgAIAxdACAM\n\
+XQAAAAtzc2gtZWQyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYg\n\
+AAAEC2BsIi0QwW2uFscKTUUXNHLsYX4FxlaSDSblbAj7WR7bM+rvN+ot98qgEN796jTiQf\n\
+ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
+-----END_OPENSSH_PRIVATE_KEY-----\n";
+        let private = private.replace('_', " ");
+        let recipient =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        let source = repository.join("secrets/operators/token.age");
+        fs::create_dir_all(source.parent().ok_or("source parent")?)?;
+        let mut ciphertext = fs::File::create(&source)?;
+        nix_seal_crypto::encrypt(
+            b"secretctl-canary".as_slice(),
+            &mut ciphertext,
+            &[recipient.to_owned()],
+        )?;
+        ciphertext.sync_all()?;
+        let identity_path = temporary.path().join("identity");
+        write_private_bytes(&identity_path, private.as_bytes())?;
+        let index_path = temporary.path().join("secretIndex.json");
+        fs::write(
+            &index_path,
+            serde_json::json!({
+                "version":1,
+                "groups":{"operators":[recipient]},
+                "targets":{"host:nixos:desktop":{
+                    "type":"host",
+                    "groups":["operators"],
+                    "publicKey":recipient,
+                    "recipients":[recipient]
+                }},
+                "secrets":{"operators.token":{
+                    "id":"operators.token",
+                    "group":"operators",
+                    "scope":"host",
+                    "selector":null,
+                    "agenixName":"token",
+                    "file":"secrets/operators/token.age",
+                    "recipients":[recipient],
+                    "consumers":["host:nixos:desktop"]
+                }}
+            })
+            .to_string(),
+        )?;
+        let common = || SecretctlMigrationArgs {
+            index: index_path.clone(),
+            plan_output: None,
+            target_systems: Vec::new(),
+            signers: Vec::new(),
+            repository_root: repository.clone(),
+            destination: Some(PathBuf::from("migrated")),
+            identity: Some(identity_path.clone()),
+            recipients: vec![recipient.to_owned()],
+            replace: false,
+            execute: false,
+        };
+        migrate_secretctl(&common(), true)?;
+        let destination = repository.join("migrated/secrets/operators/token.age");
+        assert!(!destination.exists());
+        let mut execute = common();
+        execute.execute = true;
+        migrate_secretctl(&execute, true)?;
+        let identity = SecretString::from(private);
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(fs::File::open(destination)?, &mut plaintext, &identity)?;
+        assert_eq!(plaintext, b"secretctl-canary");
+        assert!(source.is_file());
+        Ok(())
+    }
+
+    #[test]
     fn agenix_migration_inventory_accepts_only_valid_age_ciphertexts()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
@@ -7325,6 +9725,56 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             migrated_id("agenix/nested/token")?.as_str(),
             "agenix/nested/token"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn agenix_migration_bulk_rekeys_side_by_side_only_after_dry_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        let legacy = repository.join("legacy");
+        std::fs::create_dir_all(&legacy)?;
+        let (identity, administrator_recipient) = nix_seal_crypto::generate_x25519();
+        let (_, target_recipient) = nix_seal_crypto::generate_x25519();
+        let identity_path = temporary.path().join("administrator.agekey");
+        write_new_private(&identity_path, identity.expose_secret().as_bytes())?;
+        let source_recipients = vec![administrator_recipient.clone()];
+        for (name, value) in [
+            ("one", b"one-value".as_slice()),
+            ("two", b"two-value".as_slice()),
+        ] {
+            let path = legacy.join(format!("{name}.age"));
+            let mut output = std::fs::File::create(path)?;
+            nix_seal_crypto::encrypt(value, &mut output, &source_recipients)?;
+            output.sync_all()?;
+        }
+        let common = || AgeTreeMigrationArgs {
+            directory: PathBuf::from("legacy"),
+            repository_root: repository.clone(),
+            destination: Some(PathBuf::from("migrated")),
+            identity: Some(identity_path.clone()),
+            recipients: vec![administrator_recipient.clone(), target_recipient.clone()],
+            replace: false,
+            execute: false,
+        };
+        migrate_agenix_tree(&common(), "agenix", true)?;
+        assert!(!repository.join("migrated/one.age").exists());
+        assert!(!repository.join("migrated/two.age").exists());
+
+        let mut execute = common();
+        execute.execute = true;
+        migrate_agenix_tree(&execute, "agenix", true)?;
+        assert!(repository.join("migrated/one.age").is_file());
+        assert!(repository.join("migrated/two.age").is_file());
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(
+            std::fs::File::open(repository.join("migrated/one.age"))?,
+            &mut plaintext,
+            &identity,
+        )?;
+        assert_eq!(plaintext, b"one-value");
+        assert!(repository.join("legacy/one.age").is_file());
         Ok(())
     }
 
@@ -7390,6 +9840,39 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         Ok(())
     }
 
+    #[test]
+    fn clan_vars_migration_bulk_encrypts_side_by_side_only_after_dry_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        let value = repository.join("vars/per-machine/desktop/service-token/api-token/value");
+        std::fs::create_dir_all(value.parent().ok_or("value parent")?)?;
+        std::fs::write(&value, b"clan-vars-secret-canary")?;
+        let (identity, recipient) = nix_seal_crypto::generate_x25519();
+        let identity_path = temporary.path().join("administrator.agekey");
+        write_new_private(&identity_path, identity.expose_secret().as_bytes())?;
+        let common = || ClanVarsMigrationArgs {
+            directory: PathBuf::from("vars/per-machine"),
+            repository_root: repository.clone(),
+            destination: Some(PathBuf::from("migrated")),
+            identity: Some(identity_path.clone()),
+            recipients: vec![recipient.clone()],
+            replace: false,
+            execute: false,
+        };
+        migrate_clan_vars_tree(&common(), true)?;
+        let destination = repository.join("migrated/desktop/service-token/api-token.age");
+        assert!(!destination.exists());
+        let mut execute = common();
+        execute.execute = true;
+        migrate_clan_vars_tree(&execute, true)?;
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(std::fs::File::open(destination)?, &mut plaintext, &identity)?;
+        assert_eq!(plaintext, b"clan-vars-secret-canary");
+        assert_eq!(std::fs::read(value)?, b"clan-vars-secret-canary");
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn agenix_migration_refuses_a_symlinked_root() -> Result<(), Box<dyn std::error::Error>> {
@@ -7398,7 +9881,22 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         let outside = tempfile::tempdir()?;
         let linked = temporary.path().join("secrets");
         symlink(outside.path(), &linked)?;
-        assert!(migrate_agenix_tree(&linked, "agenix", false).is_err());
+        assert!(
+            migrate_agenix_tree(
+                &AgeTreeMigrationArgs {
+                    directory: linked,
+                    repository_root: PathBuf::from("."),
+                    destination: None,
+                    identity: None,
+                    recipients: Vec::new(),
+                    replace: false,
+                    execute: false,
+                },
+                "agenix",
+                false,
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -7438,10 +9936,12 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 delivery: nix_seal_core::DeliveryMode::Rekeyed,
                 administrators: Vec::new(),
                 consumers: Vec::new(),
+                selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         plan.secrets.insert(
@@ -7451,10 +9951,12 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 delivery: nix_seal_core::DeliveryMode::Rekeyed,
                 administrators: Vec::new(),
                 consumers: Vec::new(),
+                selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         plan.generators.insert(
@@ -7466,7 +9968,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
                 max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
                 dependencies: Vec::new(),
+                secret_dependencies: Vec::new(),
                 outputs: vec![secret_id, second_secret_id],
+                public_outputs: Vec::new(),
                 prompts: Vec::new(),
                 parameters: BTreeMap::from([("bytes".to_owned(), "20".to_owned())]),
                 validation: None,
@@ -7481,6 +9985,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             identity: identity_path.clone(),
             replace: false,
             prompt_files: Vec::new(),
+            interactive: false,
         };
         run_generate(&request, false)?;
         let ciphertext = repository.join("secrets/application-token.age");
@@ -7604,6 +10109,8 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 system: "x86_64-linux".to_owned(),
                 identity: target_identity_id,
                 username: None,
+                configuration: None,
+                environment: None,
                 tags: Vec::new(),
             },
         );
@@ -7614,10 +10121,12 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 delivery: nix_seal_core::DeliveryMode::Rekeyed,
                 administrators: Vec::new(),
                 consumers: vec![target_id.clone()],
+                selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: runtime.clone(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         plan.templates.insert(
@@ -7805,6 +10314,8 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 system: "x86_64-linux".to_owned(),
                 identity: target_identity_id,
                 username: None,
+                configuration: None,
+                environment: None,
                 tags: Vec::new(),
             },
         );
@@ -7815,10 +10326,12 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 delivery: nix_seal_core::DeliveryMode::Rekeyed,
                 administrators: Vec::new(),
                 consumers: vec![target_id.clone()],
+                selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
+                repository_only: false,
             },
         );
         nix_seal_policy::validate(&plan)?;

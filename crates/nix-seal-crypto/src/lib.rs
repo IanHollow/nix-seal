@@ -1,13 +1,28 @@
 #![forbid(unsafe_code)]
 //! Isolated adapter for the pre-1.0 Rust age implementation.
 
-use age::{Decryptor, Encryptor, Identity, Recipient, secrecy::ExposeSecret};
+use age::{Decryptor, Encryptor, Identity, NoCallbacks, Recipient, secrecy::ExposeSecret};
 use secrecy::{ExposeSecretMut, SecretBox};
-use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::{
+    collections::BTreeSet,
+    env, fs,
+    io::{BufRead, BufReader, Cursor, Read, Write},
+    path::Path,
+    process::{Child, Command, Stdio},
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::Duration,
+};
 use thiserror::Error;
 
 const MAX_SECRET_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_IDENTITY_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_AGE_HEADER_BYTES: usize = 1024 * 1024;
+const MAX_PLUGIN_FIELD_BYTES: usize = 64 * 1024;
+const MAX_PLUGIN_RECIPIENTS: usize = 256;
+const MAX_PLUGIN_CIPHERTEXT_BYTES: u64 = MAX_SECRET_BYTES + (2 * 1024 * 1024);
+const PLUGIN_WORKER_TIMEOUT: Duration = Duration::from_mins(2);
+const PLUGIN_WORKER_MAGIC: &[u8] = b"nix-seal-age-plugin-worker-v1\n";
 
 /// A redacted cryptographic error.
 #[derive(Debug, Error)]
@@ -33,6 +48,13 @@ pub enum CryptoError {
     /// The operating-system CSPRNG failed.
     #[error("operating-system random generation failed")]
     Random,
+    /// A plugin worker could not be started or completed safely.
+    #[error("age plugin execution failed in the isolated worker")]
+    Plugin,
+    /// A plugin identity cannot be converted into a public recipient without
+    /// invoking a plugin-specific operation.
+    #[error("age plugin identity has no generic public-recipient conversion")]
+    PluginIdentityPublic,
 }
 
 /// Returns CSPRNG bytes in a zeroizing secret container.
@@ -53,6 +75,61 @@ pub fn generate_x25519() -> (secrecy::SecretString, String) {
     (private, identity.to_public().to_string())
 }
 
+/// Encrypts a native age identity file with age's standard scrypt recipient.
+///
+/// This is intended for human-held recovery identities only. Callers must
+/// obtain the passphrase through an interactive protected channel; automation
+/// should use a hardware-backed or agent identity instead. The returned bytes
+/// are an ordinary age ciphertext and contain no plaintext identity material.
+pub fn encrypt_passphrase_identity(
+    identity: &secrecy::SecretString,
+    passphrase: &secrecy::SecretString,
+) -> Result<Vec<u8>, CryptoError> {
+    let passphrase = age::secrecy::SecretString::from(passphrase.expose_secret().to_owned());
+    let encryptor = Encryptor::with_user_passphrase(passphrase);
+    let mut ciphertext = Vec::new();
+    let mut writer = encryptor
+        .wrap_output(&mut ciphertext)
+        .map_err(|_| CryptoError::Encrypt)?;
+    writer
+        .write_all(identity.expose_secret().as_bytes())
+        .map_err(|_| CryptoError::Io)?;
+    writer.write_all(b"\n").map_err(|_| CryptoError::Io)?;
+    writer.finish().map_err(|_| CryptoError::Encrypt)?;
+    Ok(ciphertext)
+}
+
+/// Decrypts an age scrypt-protected identity file after the CLI has obtained
+/// its passphrase from a protected interactive channel. This helper accepts
+/// only passphrase-encrypted age files and bounds the decrypted identity
+/// payload before converting it to a zeroizing string.
+pub fn decrypt_passphrase_identity<R: Read>(
+    input: R,
+    passphrase: &secrecy::SecretString,
+) -> Result<secrecy::SecretString, CryptoError> {
+    let decryptor = Decryptor::new(input).map_err(|_| CryptoError::Decrypt)?;
+    if !decryptor.is_scrypt() {
+        return Err(CryptoError::Identity);
+    }
+    let passphrase = age::secrecy::SecretString::from(passphrase.expose_secret().to_owned());
+    let identity = age::scrypt::Identity::new(passphrase);
+    let mut reader = decryptor
+        .decrypt(std::iter::once(&identity as &dyn Identity))
+        .map_err(|_| CryptoError::Decrypt)?;
+    let mut plaintext = Vec::new();
+    reader
+        .by_ref()
+        .take(MAX_IDENTITY_FILE_BYTES + 1)
+        .read_to_end(&mut plaintext)
+        .map_err(|_| CryptoError::Io)?;
+    if plaintext.len() as u64 > MAX_IDENTITY_FILE_BYTES {
+        return Err(CryptoError::InputTooLarge);
+    }
+    String::from_utf8(plaintext)
+        .map(secrecy::SecretString::from)
+        .map_err(|_| CryptoError::Identity)
+}
+
 /// Derives the normalized public recipient from a native X25519 or unencrypted
 /// OpenSSH compatibility identity.
 pub fn recipient_from_identity(identity: &secrecy::SecretString) -> Result<String, CryptoError> {
@@ -62,6 +139,14 @@ pub fn recipient_from_identity(identity: &secrecy::SecretString) -> Result<Strin
         .parse::<age::x25519::Identity>()
     {
         return Ok(parsed.to_public().to_string());
+    }
+    if identity
+        .expose_secret()
+        .trim()
+        .parse::<age::plugin::Identity>()
+        .is_ok()
+    {
+        return Err(CryptoError::PluginIdentityPublic);
     }
     let parsed = parse_ssh_identity(identity)?;
     age::ssh::Recipient::try_from(parsed)
@@ -77,10 +162,39 @@ pub fn normalize_recipient(recipient: &str) -> Result<String, CryptoError> {
     if let Ok(parsed) = recipient.parse::<age::x25519::Recipient>() {
         return Ok(parsed.to_string());
     }
+    if let Ok(parsed) = recipient.parse::<age::plugin::Recipient>() {
+        return Ok(parsed.to_string());
+    }
     recipient
         .parse::<age::ssh::Recipient>()
         .map(|parsed| parsed.to_string())
         .map_err(|_| CryptoError::Recipient)
+}
+
+/// Returns whether an identity is a plugin identity for the supplied plugin
+/// recipient. Plugin identities are intentionally compared only by plugin
+/// name here; the age stanza decryption remains the authoritative proof that
+/// the opaque identity contains the corresponding private key.
+#[must_use]
+pub fn identity_matches_recipient(identity: &secrecy::SecretString, recipient: &str) -> bool {
+    if let (Ok(identity), Ok(recipient)) = (
+        identity
+            .expose_secret()
+            .trim()
+            .parse::<age::plugin::Identity>(),
+        recipient.parse::<age::plugin::Recipient>(),
+    ) {
+        return identity.plugin() == recipient.plugin();
+    }
+    recipient_from_identity(identity)
+        .ok()
+        .and_then(|actual| normalize_recipient(&actual).ok())
+        .and_then(|actual| {
+            normalize_recipient(recipient)
+                .ok()
+                .map(|expected| actual == expected)
+        })
+        .unwrap_or(false)
 }
 
 /// Returns a domain-separated fingerprint of a normalized age recipient.
@@ -94,7 +208,25 @@ pub fn recipient_fingerprint(recipient: &str) -> Result<String, CryptoError> {
 
 /// Encrypts a stream to native age or OpenSSH-compatibility recipients, bounded
 /// to 64 MiB.
-pub fn encrypt<R: Read, W: Write>(
+pub fn encrypt<R: Read + Send, W: Write>(
+    input: R,
+    output: W,
+    recipients: &[String],
+) -> Result<(), CryptoError> {
+    if recipients.iter().any(|value| is_plugin_recipient(value)) {
+        return run_plugin_operation(
+            &PluginOperation::Encrypt {
+                identity: None,
+                recipients,
+            },
+            input,
+            output,
+        );
+    }
+    encrypt_direct(input, output, recipients)
+}
+
+fn encrypt_direct<R: Read, W: Write>(
     mut input: R,
     output: W,
     recipients: &[String],
@@ -126,11 +258,21 @@ pub fn encrypt<R: Read, W: Write>(
 
 /// Decrypts a stream using a native X25519 or unencrypted OpenSSH
 /// compatibility identity, bounded to 64 MiB.
-pub fn decrypt<R: Read, W: Write>(
+pub fn decrypt<R: Read + Send, W: Write>(
     input: R,
     output: W,
     identity: &secrecy::SecretString,
 ) -> Result<(), CryptoError> {
+    if is_plugin_identity(identity) {
+        return run_plugin_operation(
+            &PluginOperation::Decrypt {
+                identity: Some(identity),
+                recipients: &[],
+            },
+            input,
+            output,
+        );
+    }
     let parsed = parse_identity(identity)?;
     decrypt_with_identity(input, output, parsed.as_ref())
 }
@@ -138,6 +280,16 @@ pub fn decrypt<R: Read, W: Write>(
 fn parse_recipient(value: &str) -> Result<Box<dyn Recipient + Send>, CryptoError> {
     if let Ok(recipient) = value.parse::<age::x25519::Recipient>() {
         return Ok(Box::new(recipient));
+    }
+    if let Ok(recipient) = value.parse::<age::plugin::Recipient>() {
+        let plugin = age::plugin::RecipientPluginV1::new(
+            recipient.plugin(),
+            std::slice::from_ref(&recipient),
+            &[],
+            NoCallbacks,
+        )
+        .map_err(|_| CryptoError::Plugin)?;
+        return Ok(Box::new(plugin));
     }
     value
         .parse::<age::ssh::Recipient>()
@@ -155,11 +307,43 @@ fn parse_identity(
     {
         return Ok(Box::new(parsed));
     }
+    if is_plugin_identity(identity) {
+        return parse_plugin_identity(identity);
+    }
     let parsed = parse_ssh_identity(identity)?;
     if matches!(&parsed, age::ssh::Identity::Encrypted(_)) {
         return Err(CryptoError::Identity);
     }
     Ok(Box::new(parsed))
+}
+
+fn parse_plugin_identity(
+    identity: &secrecy::SecretString,
+) -> Result<Box<dyn Identity + Send>, CryptoError> {
+    let parsed = identity
+        .expose_secret()
+        .trim()
+        .parse::<age::plugin::Identity>()
+        .map_err(|_| CryptoError::Identity)?;
+    let plugin = age::plugin::IdentityPluginV1::new(
+        parsed.plugin(),
+        std::slice::from_ref(&parsed),
+        NoCallbacks,
+    )
+    .map_err(|_| CryptoError::Plugin)?;
+    Ok(Box::new(plugin))
+}
+
+fn is_plugin_recipient(value: &str) -> bool {
+    value.parse::<age::plugin::Recipient>().is_ok()
+}
+
+fn is_plugin_identity(value: &secrecy::SecretString) -> bool {
+    value
+        .expose_secret()
+        .trim()
+        .parse::<age::plugin::Identity>()
+        .is_ok()
 }
 
 fn parse_ssh_identity(identity: &secrecy::SecretString) -> Result<age::ssh::Identity, CryptoError> {
@@ -290,7 +474,26 @@ fn validate_age_header_structure(ciphertext: &[u8]) -> Result<(), CryptoError> {
 /// Streams a canonical age payload directly into new target encryption.
 ///
 /// No plaintext is materialized outside the bounded age reader/writer buffers.
-pub fn rekey<R: Read, W: Write>(
+pub fn rekey<R: Read + Send, W: Write>(
+    input: R,
+    output: W,
+    identity: &secrecy::SecretString,
+    recipients: &[String],
+) -> Result<(), CryptoError> {
+    if is_plugin_identity(identity) || recipients.iter().any(|value| is_plugin_recipient(value)) {
+        return run_plugin_operation(
+            &PluginOperation::Rekey {
+                identity: Some(identity),
+                recipients,
+            },
+            input,
+            output,
+        );
+    }
+    rekey_direct(input, output, identity, recipients)
+}
+
+fn rekey_direct<R: Read, W: Write>(
     input: R,
     output: W,
     identity: &secrecy::SecretString,
@@ -331,6 +534,417 @@ pub fn rekey<R: Read, W: Write>(
     Ok(())
 }
 
+enum PluginOperation<'a> {
+    Encrypt {
+        identity: Option<&'a secrecy::SecretString>,
+        recipients: &'a [String],
+    },
+    Decrypt {
+        identity: Option<&'a secrecy::SecretString>,
+        recipients: &'a [String],
+    },
+    Rekey {
+        identity: Option<&'a secrecy::SecretString>,
+        recipients: &'a [String],
+    },
+}
+
+impl PluginOperation<'_> {
+    const fn code(&self) -> u8 {
+        match self {
+            Self::Encrypt { .. } => 1,
+            Self::Decrypt { .. } => 2,
+            Self::Rekey { .. } => 3,
+        }
+    }
+
+    fn identity(&self) -> Option<&secrecy::SecretString> {
+        match self {
+            Self::Encrypt { identity, .. }
+            | Self::Decrypt { identity, .. }
+            | Self::Rekey { identity, .. } => *identity,
+        }
+    }
+
+    fn recipients(&self) -> &[String] {
+        match self {
+            Self::Encrypt { recipients, .. }
+            | Self::Decrypt { recipients, .. }
+            | Self::Rekey { recipients, .. } => recipients,
+        }
+    }
+
+    const fn input_limit(&self) -> u64 {
+        match self {
+            Self::Encrypt { .. } => MAX_SECRET_BYTES,
+            Self::Decrypt { .. } | Self::Rekey { .. } => MAX_PLUGIN_CIPHERTEXT_BYTES,
+        }
+    }
+
+    const fn output_limit(&self) -> u64 {
+        match self {
+            Self::Encrypt { .. } | Self::Rekey { .. } => MAX_PLUGIN_CIPHERTEXT_BYTES,
+            Self::Decrypt { .. } => MAX_SECRET_BYTES,
+        }
+    }
+}
+
+/// Runs the internal age-plugin worker protocol.
+///
+/// This entrypoint is intentionally not a general-purpose plugin API. The CLI
+/// exposes it only as a hidden subcommand, while the public crypto operations
+/// use it automatically whenever a standard age plugin recipient or identity
+/// is encountered. The framing carries private identities and payload bytes
+/// over pipes rather than arguments or environment variables.
+pub fn run_plugin_worker_protocol<R: Read, W: Write>(
+    mut input: R,
+    mut output: W,
+) -> Result<(), CryptoError> {
+    let mut magic = vec![0_u8; PLUGIN_WORKER_MAGIC.len()];
+    input
+        .read_exact(&mut magic)
+        .map_err(|_| CryptoError::Plugin)?;
+    if magic != PLUGIN_WORKER_MAGIC {
+        return Err(CryptoError::Plugin);
+    }
+    let operation = match read_plugin_byte(&mut input)? {
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        _ => return Err(CryptoError::Plugin),
+    };
+    let identity = read_plugin_field(&mut input, true)?.map(secrecy::SecretString::from);
+    let recipient_count = read_plugin_u32(&mut input)? as usize;
+    if recipient_count > MAX_PLUGIN_RECIPIENTS {
+        return Err(CryptoError::Plugin);
+    }
+    let mut recipients = Vec::with_capacity(recipient_count);
+    for _ in 0..recipient_count {
+        recipients.push(read_plugin_field(&mut input, false)?.ok_or(CryptoError::Plugin)?);
+    }
+
+    match operation {
+        1 => encrypt_direct(&mut input, &mut output, &recipients),
+        2 => {
+            let identity = identity.as_ref().ok_or(CryptoError::Plugin)?;
+            decrypt_with_identity(&mut input, &mut output, parse_identity(identity)?.as_ref())
+        }
+        3 => {
+            let identity = identity.as_ref().ok_or(CryptoError::Plugin)?;
+            rekey_direct(&mut input, &mut output, identity, &recipients)
+        }
+        _ => Err(CryptoError::Plugin),
+    }
+}
+
+fn run_plugin_operation<R: Read + Send, W: Write>(
+    operation: &PluginOperation<'_>,
+    input: R,
+    mut output: W,
+) -> Result<(), CryptoError> {
+    let plugin_directories = plugin_binary_directories(operation)?;
+    let executable = env::current_exe()
+        .map_err(|_| CryptoError::Plugin)?
+        .canonicalize()
+        .map_err(|_| CryptoError::Plugin)?;
+    let worker_directory = tempfile::Builder::new()
+        .prefix("nix-seal-plugin-worker-")
+        .tempdir()
+        .map_err(|_| CryptoError::Plugin)?;
+    set_private_worker_directory(worker_directory.path())?;
+
+    let mut command = Command::new(executable);
+    command
+        .arg("__plugin-worker")
+        .env_clear()
+        .env("NIX_SEAL_PLUGIN_WORKER", "1")
+        .env("PATH", plugin_directories)
+        .current_dir(worker_directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    copy_plugin_environment(&mut command);
+    isolate_plugin_process_group(&mut command);
+
+    let mut child = command.spawn().map_err(|_| CryptoError::Plugin)?;
+    let Some(stdin) = child.stdin.take() else {
+        terminate_plugin_process_tree(&mut child);
+        return Err(CryptoError::Plugin);
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate_plugin_process_tree(&mut child);
+        return Err(CryptoError::Plugin);
+    };
+    let child = Arc::new(Mutex::new(child));
+    let watchdog_child = Arc::clone(&child);
+    let (complete_tx, complete_rx) = mpsc::channel();
+    let watchdog = thread::spawn(move || {
+        if complete_rx.recv_timeout(PLUGIN_WORKER_TIMEOUT).is_err()
+            && let Ok(mut child) = watchdog_child.lock()
+        {
+            terminate_plugin_process_tree(&mut child);
+        }
+    });
+
+    let (output_result, input_result) = thread::scope(|scope| {
+        let writer = scope.spawn(|| write_plugin_request(stdin, operation, input));
+        let output_result = copy_bounded(&mut stdout, &mut output, operation.output_limit());
+        if output_result.is_err()
+            && let Ok(mut child) = child.lock()
+        {
+            terminate_plugin_process_tree(&mut child);
+        }
+        let input_result = match writer.join() {
+            Ok(result) => result,
+            Err(_) => Err(CryptoError::Plugin),
+        };
+        (output_result, input_result)
+    });
+    let _ = complete_tx.send(());
+    let _ = watchdog.join();
+    if output_result.is_err() || input_result.is_err() {
+        if let Ok(mut child) = child.lock() {
+            terminate_plugin_process_tree(&mut child);
+        }
+        return Err(CryptoError::Plugin);
+    }
+    let status = child
+        .lock()
+        .map_err(|_| CryptoError::Plugin)?
+        .wait()
+        .map_err(|_| CryptoError::Plugin)?;
+    if !status.success() {
+        return Err(CryptoError::Plugin);
+    }
+    Ok(())
+}
+
+fn write_plugin_request<W: Write, R: Read>(
+    mut output: W,
+    operation: &PluginOperation<'_>,
+    mut input: R,
+) -> Result<(), CryptoError> {
+    output
+        .write_all(PLUGIN_WORKER_MAGIC)
+        .and_then(|()| output.write_all(&[operation.code()]))
+        .map_err(|_| CryptoError::Plugin)?;
+    if let Some(identity) = operation.identity() {
+        write_plugin_field(&mut output, identity.expose_secret().as_bytes())?;
+    } else {
+        write_plugin_u32(&mut output, 0)?;
+    }
+    let recipients = operation.recipients();
+    if recipients.len() > MAX_PLUGIN_RECIPIENTS {
+        return Err(CryptoError::Plugin);
+    }
+    write_plugin_u32(
+        &mut output,
+        u32::try_from(recipients.len()).map_err(|_| CryptoError::Plugin)?,
+    )?;
+    for recipient in recipients {
+        write_plugin_field(&mut output, recipient.as_bytes())?;
+    }
+    let copied = std::io::copy(
+        &mut input.by_ref().take(operation.input_limit() + 1),
+        &mut output,
+    )
+    .map_err(|_| CryptoError::Plugin)?;
+    if copied > operation.input_limit() {
+        return Err(CryptoError::InputTooLarge);
+    }
+    output.flush().map_err(|_| CryptoError::Plugin)
+}
+
+fn plugin_binary_directories(
+    operation: &PluginOperation<'_>,
+) -> Result<std::ffi::OsString, CryptoError> {
+    let mut names = BTreeSet::new();
+    for recipient in operation.recipients() {
+        if let Ok(parsed) = recipient.parse::<age::plugin::Recipient>() {
+            names.insert(parsed.plugin().to_owned());
+        }
+    }
+    if let Some(identity) = operation.identity()
+        && let Ok(parsed) = identity
+            .expose_secret()
+            .trim()
+            .parse::<age::plugin::Identity>()
+    {
+        names.insert(parsed.plugin().to_owned());
+    }
+    if names.is_empty() {
+        return Err(CryptoError::Plugin);
+    }
+    let path = env::var_os("PATH").ok_or(CryptoError::Plugin)?;
+    let mut directories = BTreeSet::new();
+    for name in names {
+        let binary = format!("age-plugin-{name}");
+        let mut found = None;
+        for directory in env::split_paths(&path) {
+            let candidate = directory.join(&binary);
+            let Ok(canonical) = candidate.canonicalize() else {
+                continue;
+            };
+            let Ok(metadata) = fs::metadata(&canonical) else {
+                continue;
+            };
+            if metadata.is_file() && is_executable(&metadata) {
+                found = canonical.parent().map(Path::to_owned);
+                break;
+            }
+        }
+        directories.insert(found.ok_or(CryptoError::Plugin)?);
+    }
+    env::join_paths(directories).map_err(|_| CryptoError::Plugin)
+}
+
+fn copy_plugin_environment(command: &mut Command) {
+    const ALLOWED: &[&str] = &[
+        "DBUS_SESSION_BUS_ADDRESS",
+        "DISPLAY",
+        "HOME",
+        "SSH_AUTH_SOCK",
+        "WAYLAND_DISPLAY",
+        "XDG_RUNTIME_DIR",
+    ];
+    for key in ALLOWED {
+        let Some(value) = env::var_os(key) else {
+            continue;
+        };
+        if (*key == "HOME" || *key == "SSH_AUTH_SOCK" || *key == "XDG_RUNTIME_DIR")
+            && !Path::new(&value).is_absolute()
+        {
+            continue;
+        }
+        command.env(key, value);
+    }
+}
+
+fn write_plugin_u32<W: Write>(output: &mut W, value: u32) -> Result<(), CryptoError> {
+    output
+        .write_all(&value.to_be_bytes())
+        .map_err(|_| CryptoError::Plugin)
+}
+
+fn write_plugin_field<W: Write>(output: &mut W, value: &[u8]) -> Result<(), CryptoError> {
+    if value.is_empty() || value.len() > MAX_PLUGIN_FIELD_BYTES {
+        return Err(CryptoError::Plugin);
+    }
+    write_plugin_u32(
+        output,
+        u32::try_from(value.len()).map_err(|_| CryptoError::Plugin)?,
+    )?;
+    output.write_all(value).map_err(|_| CryptoError::Plugin)
+}
+
+fn read_plugin_byte<R: Read>(input: &mut R) -> Result<u8, CryptoError> {
+    let mut byte = [0_u8; 1];
+    input
+        .read_exact(&mut byte)
+        .map_err(|_| CryptoError::Plugin)?;
+    Ok(byte[0])
+}
+
+fn read_plugin_u32<R: Read>(input: &mut R) -> Result<u32, CryptoError> {
+    let mut bytes = [0_u8; 4];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|_| CryptoError::Plugin)?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn read_plugin_field<R: Read>(
+    input: &mut R,
+    optional: bool,
+) -> Result<Option<String>, CryptoError> {
+    let length = read_plugin_u32(input)? as usize;
+    if length == 0 {
+        return if optional {
+            Ok(None)
+        } else {
+            Err(CryptoError::Plugin)
+        };
+    }
+    if length > MAX_PLUGIN_FIELD_BYTES {
+        return Err(CryptoError::Plugin);
+    }
+    let mut bytes = vec![0_u8; length];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|_| CryptoError::Plugin)?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| CryptoError::Plugin)
+}
+
+fn copy_bounded<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    limit: u64,
+) -> Result<(), CryptoError> {
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 32 * 1024];
+    loop {
+        let read = input.read(&mut buffer).map_err(|_| CryptoError::Plugin)?;
+        if read == 0 {
+            return Ok(());
+        }
+        copied = copied
+            .checked_add(u64::try_from(read).map_err(|_| CryptoError::Plugin)?)
+            .ok_or(CryptoError::InputTooLarge)?;
+        if copied > limit {
+            return Err(CryptoError::InputTooLarge);
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|_| CryptoError::Io)?;
+    }
+}
+
+fn set_private_worker_directory(path: &Path) -> Result<(), CryptoError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|_| CryptoError::Plugin)?;
+    }
+    Ok(())
+}
+
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
+#[cfg(unix)]
+fn isolate_plugin_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_plugin_process_group(_command: &mut Command) {}
+
+fn terminate_plugin_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if child.try_wait().ok().flatten().is_none()
+            && let Some(pid) = rustix::process::Pid::from_raw(child.id().cast_signed())
+        {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +982,68 @@ body\n\
     }
 
     #[test]
+    fn plugin_worker_rejects_malformed_frames_before_crypto() {
+        assert!(run_plugin_worker_protocol(b"not-a-worker".as_slice(), Vec::new()).is_err());
+
+        let mut oversized = PLUGIN_WORKER_MAGIC.to_vec();
+        oversized.push(1);
+        let field_limit = u32::try_from(MAX_PLUGIN_FIELD_BYTES).unwrap_or(u32::MAX);
+        oversized.extend_from_slice(&(field_limit + 1).to_be_bytes());
+        assert!(run_plugin_worker_protocol(oversized.as_slice(), Vec::new()).is_err());
+
+        let mut too_many_recipients = PLUGIN_WORKER_MAGIC.to_vec();
+        too_many_recipients.push(1);
+        too_many_recipients.extend_from_slice(&0_u32.to_be_bytes());
+        let recipient_limit = u32::try_from(MAX_PLUGIN_RECIPIENTS).unwrap_or(u32::MAX);
+        too_many_recipients.extend_from_slice(&(recipient_limit + 1).to_be_bytes());
+        assert!(run_plugin_worker_protocol(too_many_recipients.as_slice(), Vec::new()).is_err());
+    }
+
+    #[test]
+    fn plugin_identity_public_conversion_fails_closed() -> Result<(), CryptoError> {
+        let identity = secrecy::SecretString::from(
+            age::plugin::Identity::default_for_plugin("foobar")
+                .map_err(|_| CryptoError::Identity)?
+                .to_string(),
+        );
+        assert!(matches!(
+            recipient_from_identity(&identity),
+            Err(CryptoError::PluginIdentityPublic)
+        ));
+        assert!(!identity_matches_recipient(
+            &identity,
+            "age1not-a-plugin-recipient"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_recipient_matching_is_canonical_and_missing_plugins_fail_closed()
+    -> Result<(), CryptoError> {
+        let identity = secrecy::SecretString::from(
+            age::plugin::Identity::default_for_plugin("nixseal-test-missing")
+                .map_err(|_| CryptoError::Identity)?
+                .to_string(),
+        );
+        let recipient = bech32::encode_lower::<bech32::Bech32>(
+            bech32::Hrp::parse("age1nixseal-test-missing").map_err(|_| CryptoError::Recipient)?,
+            &[],
+        )
+        .map_err(|_| CryptoError::Recipient)?;
+        assert_eq!(normalize_recipient(&recipient)?, recipient);
+        assert!(identity_matches_recipient(&identity, &recipient));
+        assert!(matches!(
+            encrypt(
+                b"canary".as_slice(),
+                Vec::new(),
+                std::slice::from_ref(&recipient)
+            ),
+            Err(CryptoError::Plugin)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn x25519_round_trip() -> Result<(), CryptoError> {
         let (identity, recipient) = generate_x25519();
         assert_eq!(recipient_from_identity(&identity)?, recipient);
@@ -394,6 +1070,31 @@ body\n\
         )?;
         assert_eq!(target_plaintext, b"canary");
         assert_eq!(recipient_fingerprint(&target_recipient)?.len(), 64);
+        Ok(())
+    }
+
+    #[test]
+    fn passphrase_identity_round_trip_is_standard_age_ciphertext() -> Result<(), CryptoError> {
+        let (identity, recipient) = generate_x25519();
+        let passphrase =
+            secrecy::SecretString::from("a sufficiently long recovery passphrase".to_owned());
+        let ciphertext = encrypt_passphrase_identity(&identity, &passphrase)?;
+        assert!(ciphertext.starts_with(b"age-encryption.org/v1"));
+        assert!(
+            !ciphertext
+                .windows(16)
+                .any(|window| window == identity.expose_secret().as_bytes())
+        );
+        let decrypted = decrypt_passphrase_identity(ciphertext.as_slice(), &passphrase)?;
+        assert_eq!(decrypted.expose_secret().trim(), identity.expose_secret());
+        assert_eq!(recipient_from_identity(&decrypted)?, recipient);
+        assert!(
+            decrypt_passphrase_identity(
+                ciphertext.as_slice(),
+                &secrecy::SecretString::from("incorrect passphrase".to_owned())
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -434,7 +1135,10 @@ body\n\
         let temporary = tempfile::tempdir()?;
         let identity_path = temporary.path().join("identity.txt");
         let (identity, recipient) = generate_x25519();
-        std::fs::write(&identity_path, identity.expose_secret())?;
+        let mut identity_file = identity.expose_secret().as_bytes().to_vec();
+        identity_file.push(b'\n');
+        std::fs::write(&identity_path, &identity_file)?;
+        identity_file.fill(0);
         let private_permissions = std::fs::Permissions::from_mode(0o600);
         std::fs::set_permissions(&identity_path, private_permissions)?;
         let plaintext = b"nix-seal-age-interop-canary";
@@ -452,13 +1156,17 @@ body\n\
                     &["-d", "-i"],
                     &[identity_path.as_os_str()],
                     &ciphertext
-                )?,
+                )
+                .map_err(|error| format!("external {binary} decrypt failed: {error}"))?,
                 plaintext
             );
 
-            let externally_encrypted = invoke(binary, &["-r"], &[recipient.as_ref()], plaintext)?;
+            let externally_encrypted = invoke(binary, &["-r"], &[recipient.as_ref()], plaintext)
+                .map_err(|error| format!("external {binary} encrypt failed: {error}"))?;
             let mut decrypted = Vec::new();
-            decrypt(externally_encrypted.as_slice(), &mut decrypted, &identity)?;
+            decrypt(externally_encrypted.as_slice(), &mut decrypted, &identity).map_err(
+                |error| format!("native decrypt of external {binary} ciphertext failed: {error}"),
+            )?;
             assert_eq!(decrypted, plaintext);
         }
         Ok(())
@@ -494,7 +1202,7 @@ body\n\
             .args(trailing_arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()?;
         child
             .stdin
@@ -503,7 +1211,17 @@ body\n\
             .write_all(input)?;
         let output = child.wait_with_output()?;
         if !output.status.success() {
-            return Err(format!("interoperability command failed: {binary}").into());
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "interoperability command failed: {binary} ({}){}",
+                output.status,
+                if diagnostic.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {diagnostic}")
+                }
+            )
+            .into());
         }
         Ok(output.stdout)
     }

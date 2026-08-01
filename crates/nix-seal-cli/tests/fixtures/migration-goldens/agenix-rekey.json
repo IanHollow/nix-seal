@@ -1,0 +1,36 @@
+{
+  "dryRun": true,
+  "masterRecipientCount": 1,
+  "recipientPolicy": null,
+  "schema": "nix-seal.migration-report.v1",
+  "secrets": [
+    {
+      "consumers": ["desktop"],
+      "legacyId": "service-token",
+      "nixSealId": "service-token",
+      "repositoryOnly": false,
+      "source": "secrets/service-token.age"
+    },
+    {
+      "consumers": [],
+      "legacyId": "shared/intermediary",
+      "nixSealId": "shared/intermediary",
+      "repositoryOnly": true,
+      "source": "secrets/shared.age"
+    }
+  ],
+  "source": "agenix-rekey",
+  "target": {
+    "kind": "nixos",
+    "legacyId": "desktop",
+    "nixSealId": "desktop",
+    "recipient": "age1ml79lp4sk2gz59n3xux5xhasg7p5qa0pnm634rd8pnw80avag4js2etr0l",
+    "storageMode": "derivation",
+    "system": "x86_64-linux"
+  },
+  "warnings": [
+    "dry run only: no ciphertext, configuration, cache, or source manager was changed",
+    "the export establishes rekeyed administrator-to-target semantics, but runtime ownership, lifecycle, templates, and approval policy require reviewed nix-seal mappings",
+    "intermediary secrets are repository-only and must not be given target consumers without an explicit policy decision"
+  ]
+}

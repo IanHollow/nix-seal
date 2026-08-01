@@ -10,10 +10,13 @@ repository.workspace = true
 age.workspace = true
 blake3.workspace = true
 getrandom.workspace = true
+rustix.workspace = true
+tempfile.workspace = true
 secrecy.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+bech32.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 

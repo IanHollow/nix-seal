@@ -1,0 +1,87 @@
+name: Release
+on:
+  push:
+    tags: ["v*.*.*"]
+permissions:
+  contents: read
+concurrency:
+  group: "release-${{ github.ref }}"
+  cancel-in-progress: false
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-linux
+            runner: ubuntu-latest
+            system: x86_64-linux
+          - name: aarch64-linux
+            runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - name: aarch64-darwin
+            runner: macos-14
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
+      - name: Build the reproducible Nix package
+        run: nix build --print-build-logs ".#packages.${{ matrix.system }}.nix-seal"
+      - name: Stage executable
+        run: |
+          mkdir -p dist
+          cp result/bin/nix-seal "dist/nix-seal-${{ matrix.name }}"
+          chmod 0755 "dist/nix-seal-${{ matrix.name }}"
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: result
+          format: cyclonedx-json
+          output-file: "dist/nix-seal-${{ matrix.name }}.cdx.json"
+      - name: Record checksums and build metadata
+        run: |
+          sha256sum dist/* > "dist/nix-seal-${{ matrix.name }}.sha256"
+          {
+            echo "commit=${GITHUB_SHA}"
+            echo "tag=${GITHUB_REF_NAME}"
+            echo "system=${{ matrix.system }}"
+            echo "runner=${RUNNER_OS}/${RUNNER_ARCH}"
+            echo "rust-toolchain=$(test -f rust-toolchain.toml && sed -n 's/^channel = \"\(.*\)\"$/\1/p' rust-toolchain.toml || true)"
+          } > "dist/nix-seal-${{ matrix.name }}.build-info"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nix-seal-release-${{ matrix.name }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: nix-seal-release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify release inputs
+        run: |
+          set -euo pipefail
+          test -n "${GITHUB_REF_NAME}"
+          test -n "$(find dist -type f -name 'nix-seal-*' -not -name '*.cdx.json' -not -name '*.sha256' -not -name '*.build-info' | head -n1)"
+          sha256sum -c dist/*.sha256
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: dist/nix-seal-*
+      - name: Publish signed release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes --title "nix-seal ${GITHUB_REF_NAME}"

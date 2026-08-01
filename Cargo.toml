@@ -21,10 +21,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/IanHollow/nix-seal"
 
 [workspace.dependencies]
-age = { version = "=0.12.1", default-features = false, features = ["armor", "ssh"] }
+age = { version = "=0.12.1", default-features = false, features = ["armor", "plugin", "ssh"] }
 argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "password-hash"] }
 anyhow = "1.0.98"
 base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
+bech32 = "=0.11.1"
 blake3 = "1.8.2"
 clap = { version = "4.5.40", features = ["derive"] }
 clap_complete = "4.5.54"
@@ -41,7 +42,7 @@ nix-seal-manifest = { path = "crates/nix-seal-manifest", version = "=0.1.0-alpha
 nix-seal-policy = { path = "crates/nix-seal-policy", version = "=0.1.0-alpha.1" }
 nix-seal-rekey = { path = "crates/nix-seal-rekey", version = "=0.1.0-alpha.1" }
 nix-seal-runtime = { path = "crates/nix-seal-runtime", version = "=0.1.0-alpha.1" }
-rustix = { version = "=1.1.4", features = ["fs", "process"] }
+rustix = { version = "=1.1.4", features = ["fs", "process", "termios", "thread"] }
 schemars = "1.0.4"
 secrecy = "0.10.3"
 serde = { version = "1.0.219", features = ["derive"] }
@@ -52,6 +53,7 @@ ssh-key = { version = "=0.6.7", default-features = false, features = ["alloc", "
 tempfile = "3.20.0"
 thiserror = "2.0.12"
 toml = "0.9.2"
+yaml_serde = "=0.10.4"
 uzers = { version = "=0.12.2", default-features = false }
 zeroize = "=1.9.0"
 

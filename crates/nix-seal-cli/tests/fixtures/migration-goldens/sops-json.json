@@ -1,0 +1,20 @@
+{
+  "dryRun": true,
+  "schema": "nix-seal.migration-report.v1",
+  "secrets": [
+    {
+      "ageRecipientCount": 1,
+      "legacyId": "nested/token",
+      "nixSealId": "sops/nested/token",
+      "providers": ["age"],
+      "source": "nested/token.json"
+    }
+  ],
+  "source": "sops-json",
+  "warnings": [
+    "dry run only: no ciphertext, configuration, or source manager was changed",
+    "this inventory validates cleartext SOPS JSON metadata only; it does not decrypt values or authenticate the SOPS MAC",
+    "structured SOPS files may contain multiple logical values; supply an explicit extraction and target-recipient mapping before streaming an individual value into a nix-seal age file",
+    "only regular JSON files with bounded, top-level SOPS metadata were accepted; links and non-regular entries are rejected"
+  ]
+}

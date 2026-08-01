@@ -5,6 +5,17 @@ nix-darwin, and Home Manager. It stores standard age ciphertext in Git, builds a
 strict deterministic public policy plan, and activates plaintext only in
 restricted runtime directories.
 
+The scale benchmark and its reporting protocol are documented in
+[`docs/benchmarks.md`](docs/benchmarks.md). CI publishes raw, machine-readable
+benchmark output with runner metadata; timing numbers are never presented as
+environment-independent claims.
+
+Release build, SBOM, checksum, and OIDC attestation controls are documented in
+[`docs/release.md`](docs/release.md).
+
+Operational recovery, compromise, signer-rotation, cache-loss, and rollback
+procedures are documented in [`docs/runbooks.md`](docs/runbooks.md).
+
 The target decryption identity is always an absolute out-of-store runtime path;
 the Nix modules reject relative paths and `/nix/store` paths for it.
 
@@ -39,6 +50,43 @@ rather than silently running them at an unsafe point. Home Manager orders
 `users`, `activation`, and `services` in its activation DAG with separate
 `$XDG_RUNTIME_DIR/nix-seal` roots; it rejects installer-only `partitioning`.
 
+## Nix plan front-end
+
+The flake library exposes `nixSeal.lib.mkPlan` for public Nix metadata. It has a
+closed top-level argument set (`identities`, `groups`, `targets`, `secrets`,
+`generators`, `templates`, `approvalPolicies`, and `backends`), rejects unknown
+collections and invalid collection IDs during Nix evaluation, and emits the same
+`plan.v1.json` object consumed by the Rust policy validator:
+
+```nix
+let
+  plan = nixSeal.lib.mkPlan {
+    identities.admin = {
+      kind = "administrator";
+      public = "age1example...";
+    };
+    targets.desktop = {
+      kind = "nixOs";
+      system = "x86_64-linux";
+      identity = "admin";
+    };
+  };
+in
+  pkgs.writeText "plan.v1.json" plan
+```
+
+Secret `selectors` can select exact targets or groups and filter by target kind,
+system, username, configuration, environment, and tags. Non-empty selector
+fields are ANDed (values within one field are ORed); tags are all-required, and
+the result is unioned with explicit `consumers`. Selector references are
+validated against the target/group graph before recipient derivation.
+
+Collection values remain public metadata; plaintext values, prompts, and private
+identities must never be placed in a Nix expression. Nested fields are validated
+with the versioned JSON schema and policy rules by `nix-seal check`. When a TOML
+plan is also supplied, the Rust merge is disjoint by collection and ID, so an
+overlap is a fatal error rather than a precedence decision.
+
 Start a repository with an empty, valid public plan; this does not generate keys
 or create secrets and refuses to overwrite an existing file:
 
@@ -54,6 +102,10 @@ nix-seal secret create --plan plan.v1.json --secret db/password \
   --identity ~/.config/age/keys.txt < password.txt
 nix-seal secret edit --plan plan.v1.json --secret db/password \
   --identity ~/.config/age/keys.txt --editor /absolute/path/to/editor
+nix-seal secret rekey --plan plan.v1.json --secret db/password \
+  --identity ~/.config/age/keys.txt --json
+nix-seal secret rekey --plan plan.v1.json --secret db/password \
+  --identity ~/.config/age/keys.txt --yes
 nix-seal secret delete --plan plan.v1.json --secret db/password --yes
 nix-seal rotate --plan plan.v1.json --secret db/password \
   --identity ~/.config/age/keys.txt < replacement.txt
@@ -61,23 +113,38 @@ nix-seal secret list --plan plan.v1.json --due
 ```
 
 `create`, `import`, `rotate`, and `edit` accept `--format json`,
-`--format toml`, or `--format dotenv` to validate a logical collection before it
-is encrypted. The original bytes are retained, so formatting and ordering are
-not rewritten. Structured input is limited to 64 MiB and must be valid UTF-8.
-dotenv validation accepts only unique shell-compatible `KEY=VALUE` entries (with
-an optional `export ` prefix); it does not evaluate shell syntax. An edit that
-fails its declared format check never replaces the existing ciphertext. This
-validation is an authoring guardrail, not field-level secret splitting: each
-canonical source remains one independent standard age file. Keep any plaintext
-input file private and remove it according to your local storage policy.
+`--format toml`, `--format yaml`, or `--format dotenv` to validate a logical
+collection before it is encrypted. The original bytes are retained, so
+formatting and ordering are not rewritten. Structured input is limited to 64 MiB
+and must be valid UTF-8. dotenv validation accepts only unique shell-compatible
+`KEY=VALUE` entries (with an optional `export ` prefix); it does not evaluate
+shell syntax. An edit that fails its declared format check never replaces the
+existing ciphertext. This validation is an authoring guardrail, not field-level
+secret splitting: each canonical source remains one independent standard age
+file. Keep any plaintext input file private and remove it according to your
+local storage policy.
+
+Generate a native recovery identity with `nix-seal key generate`. For a
+human-held recovery copy, `nix-seal key generate --passphrase` writes a standard
+age scrypt-encrypted identity file after two hidden terminal prompts. The
+passphrase is never accepted from argv, stdin, or the environment and is subject
+to a minimum length check. Do not use passphrase-protected identity files for
+unattended activation; use an age plugin, agent, or hardware-backed identity
+instead.
 
 The plan determines canonical administrator/recovery recipients. Direct mode
 additionally includes authorized target recipients and emits a history-exposure
-warning. Every create, import, edit, and rotation is encrypted into a private
+warning. Canonical create, import, edit, rotation, and rekey operations require
+an identity declared as an administrator or recovery identity; a target key may
+decrypt an authorized delivery artifact but cannot author repository ciphertext.
+Every create, import, edit, and rotation is encrypted into a private
 same-directory transaction, round-trip decrypted and hashed, then atomically
 committed. Editor execution uses no shell, inherits no environment, and runs in
-a private ephemeral workspace. `rekey` changes encryption recipients; `rotate`
-changes the application credential.
+a private ephemeral workspace. `secret rekey` changes canonical encryption
+recipients without changing the application credential; `rotate` changes the
+application credential. `secret rekey` is dry-run by default and requires
+`--yes` for its atomic same-source replacement. The top-level `rekey` command is
+separate: it creates signed target artifacts in the ciphertext-only cache.
 
 For the default `rekeyed` delivery, `nix-seal rekey` decrypts canonical
 ciphertext with `--identity` and produces a separately target-encrypted, signed
@@ -107,6 +174,46 @@ nix-seal provision --plan plan.v1.json --target host.example --generation 4 \
 
 Provisioning never transmits plaintext. Use the explicit ciphertext-only cache
 export/import flow or `nix copy` for a remote build or deployment transport.
+
+### Nix/store artifact bridge
+
+After provisioning, export the ciphertext-only cache on the administrator
+machine and import that directory into the deployment checkout or build host:
+
+```console
+nix-seal cache export --destination /tmp/nix-seal-cache-export
+nix-seal cache import --source /tmp/nix-seal-cache-export
+```
+
+Each target artifact is a directory containing exactly `ciphertext.age` and
+`manifest.dsse.json`. The public flake library can import one such directory
+without running a command or reading an identity:
+
+```nix
+let
+  artifact = nixSeal.lib.artifactBundle {
+    path = ./artifacts/host-example/db-password;
+    target = "host.example";
+    secret = "db/password";
+  };
+in
+{
+  nixSeal.secrets."db/password" = {
+    artifact = artifact;
+    sourceCiphertextHash = "…64 lowercase hexadecimal characters…";
+  };
+}
+```
+
+For integrations that need the two public paths directly, use
+`nixSeal.lib.artifactPaths artifact` instead of reconstructing the layout.
+
+The module derives the ciphertext and signed-envelope paths from `artifact` and
+rejects overrides. The helper rejects missing paths, symlinks, extra files, and
+wrong artifact layouts before they enter the store. If an artifact is absent,
+evaluation fails with the exact `nix-seal rekey` command to run; rekeying is
+never implicit in a Nix derivation. Artifact contents are ciphertext and public
+metadata only, so importing them into the store does not place plaintext there.
 
 Deletion never unlinks canonical ciphertext directly. It requires `--yes` and
 atomically moves the ciphertext into a private, collision-safe
@@ -149,8 +256,10 @@ slice provides strict plan parsing and validation, canonical plan hashing,
 native age X25519 encryption/decryption, signed target artifacts, transactional
 ciphertext cache writes, authenticated atomic activation, ownership-aware
 generation changes, activation-time secret templates, post-switch service
-coordination, JSON Schema output, and NixOS/nix-darwin/Home Manager modules. See
-[SPEC.md](SPEC.md) and [ROADMAP.md](ROADMAP.md) before relying on it.
+coordination, isolated standard age-plugin operations, Linux generator network
+namespace isolation with capability fallback, JSON Schema output, and
+NixOS/nix-darwin/Home Manager modules. See [SPEC.md](SPEC.md) and
+[ROADMAP.md](ROADMAP.md) before relying on it.
 
 The Nix package check requires round-trip interoperability with both the
 reference `age` executable and `rage`, in both encryption directions. They are
@@ -161,8 +270,10 @@ It also pins C2SP/CCTV's age corpus in `flake.lock` and runs every supported
 unarmored, uncompressed X25519 and parser vector, including expected rejection
 and partial-payload cases. Unsupported passphrase, armor, and hybrid-recipient
 vectors remain explicitly skipped until their corresponding native adapter
-capabilities are implemented. A bounded structural preflight rejects malformed
-recipient stanzas before delegation to the pinned pre-1.0 age adapter.
+capabilities are implemented. Standard age-plugin recipients and identities are
+handled through the isolated worker described in the security section. A bounded
+structural preflight rejects malformed recipient stanzas before delegation to
+the pinned pre-1.0 age adapter.
 
 ## Installed documentation
 
@@ -298,9 +409,15 @@ that validated public plan. It exposes only each stable ID, role, and public
 recipient, signer, or plugin reference; it never searches for or reads private
 identity files.
 
-Age-plugin identities are deliberately rejected until the Rust sandbox client
-can enforce its descriptor, environment, timeout, and error-redaction contract.
-They are not silently run through `PATH` or accepted as deferred recipients.
+Age-plugin recipients and identities use the standard age plugin protocol
+through an isolated internal worker. The worker resolves only the declared
+`age-plugin-*` binaries, clears the inherited environment, passes an explicit
+allowlist needed by hardware/agent plugins, closes unrelated descriptors,
+enforces bounded streaming I/O and a timeout, and terminates the worker process
+group on failure. Plugin callbacks are non-interactive in this release, so a
+plugin that requires a prompt fails closed. Plugin identities do not expose a
+generic public key; authorization prechecks compare the plugin name and the age
+stanza decryption remains authoritative.
 
 Approval signer identities may use either the native `nix-seal-ed25519-v1:`
 public-key format or a standard `ssh-ed25519` public key. The corresponding
@@ -339,23 +456,30 @@ private scalar in the standard WireGuard base64 format and accepts no
 parameters; UUID accepts none. `builtin:passphrase` uses 12–64 uniformly
 selected, hyphen-separated words from an embedded 64-word list (default 16, 96
 bits of selection entropy). `builtin:argon2id-password-hash` accepts exactly one
-declared nonpersistent, single-line hidden prompt and emits one Argon2id PHC
-string. It defaults to 64 MiB, three iterations, one lane, and a 32-byte output;
-public bounds are 19–512 MiB, 2–10 iterations, and 16–64 output bytes. The
-private prompt value is never put in the plan, arguments, environment, or logs.
+declared single-line hidden prompt and emits one Argon2id PHC string. It
+defaults to 64 MiB, three iterations, one lane, and a 32-byte output; public
+bounds are 19–512 MiB, 2–10 iterations, and 16–64 output bytes. The private
+prompt value is never put in the plan, arguments, environment, or logs.
 `builtin:ssh-ed25519` produces one standard unencrypted OpenSSH Ed25519 private
 key, which is immediately encrypted through the normal canonical-secret
 transaction; its public key is derivable from that secret. Generation is
 create-only unless `--replace` is explicit. Generators may produce multiple
-secret outputs: every output is encrypted and round-trip verified before an
-existing ciphertext is changed, and replacement failures restore prior
-ciphertext. Direct executable generators use an explicit protocol: `executable`
-and every `runtimeInputs` entry must be under `/nix/store`; `arguments` are
-literal public values; and the process runs with a cleared environment, null
-standard streams, a private workspace, and a bounded timeout. It must write
-exactly one regular file named `0`, `1`, and so on for each declared output
-beneath `$NIX_SEAL_OUTPUT_DIR`. Unlisted files, links, oversized output, nonzero
-exits, and timeouts fail the full transaction without exposing process output.
+secret outputs and declared public outputs. Every output is validated before any
+destination changes; secret outputs are encrypted and round-trip verified,
+public outputs are written with mode `0644`, and replacement failures restore
+the complete prior set. Direct executable generators use an explicit protocol:
+`executable` and every `runtimeInputs` entry must be under `/nix/store`;
+`arguments` are literal public values; and the process runs with a cleared
+environment, null standard streams, a private workspace, and a bounded timeout.
+On Unix it also runs in a dedicated process group, so timeout cleanup terminates
+descendants that might otherwise retain staged plaintext. It must write exactly
+one regular file named `0`, `1`, and so on for each declared secret output
+beneath `$NIX_SEAL_OUTPUT_DIR`, plus the same numbered protocol beneath
+`$NIX_SEAL_PUBLIC_OUTPUT_DIR` for declared public outputs. Unlisted files,
+links, oversized output, nonzero exits, and timeouts fail the full transaction
+without exposing process output. Public destinations are repository-relative,
+must not collide with ciphertext sources, and are recorded in the public plan;
+built-in generators currently emit encrypted secret outputs only.
 
 Set a generator's public `validation` value when its generated credential must
 be replaced after a specific non-secret configuration change. nix-seal records
@@ -372,9 +496,46 @@ response with
 file must be owned by the invoking user and mode `0600` (or stricter). The CLI
 rejects missing or unused prompt files and copies responses only into numbered
 files below `$NIX_SEAL_PROMPT_DIR` in the private workspace. Prompt values never
-enter the plan, command arguments, environment, or logs. Persistent prompt
-storage and terminal prompting remain explicitly unavailable until their
-separate storage and TTY hardening designs are complete.
+enter the plan, command arguments, environment, or logs. A prompt marked
+`persistent = true` may be initialized from an explicit `--prompt-file`; after a
+successful generation its response is atomically retained in the owner-only
+repository state path `.nix-seal/prompt-state/v1/<generator>/<prompt>`, and
+later runs may use that stored response without passing it again. Nonpersistent
+prompts are never retained. Persistent state is plaintext and must be protected
+like any other local credential; it is not part of Git, the Nix store, or the
+public plan. For an explicitly interactive workflow, pass `--interactive`.
+nix-seal then opens the controlling `/dev/tty` rather than stdin/stdout, rejects
+non-terminal sessions, sanitizes public prompt labels before display, bounds
+each response to 1 MiB, masks `hidden` prompts with terminal settings restored
+on all errors, and never places the response in argv, ordinary environment
+variables, the plan, or logs. Single-line prompts finish at Enter; multiline
+prompts finish with Ctrl-D and preserve entered line endings. Automation should
+continue to use private response files, because interactive prompting is never
+implicit.
+
+External generators may additionally declare `secretDependencies`. nix-seal
+requires every declared ID to be an existing canonical secret, forbids duplicate
+or self-output dependencies, verifies that the supplied identity is an
+authorized canonical recipient, then streams each dependency into an owned
+`0600` file named `0`, `1`, and so on beneath `$NIX_SEAL_SECRET_DIR` in declared
+order. `$NIX_SEAL_SECRET_COUNT` is public metadata only. Built-in generators
+cannot receive secret dependencies. No undeclared canonical secret is decrypted
+for the generator, and the private workspace is removed whether generation
+succeeds or fails. If an input is itself produced by another generator, that
+producer must be a direct entry in `dependencies`, making generation order
+explicit and checkable. On Linux, nix-seal launches the generator through a Rust
+worker that attempts a fresh network namespace before execution. If the kernel
+or container denies that operation, nix-seal falls back once to the direct
+process-group path and emits a diagnostic warning. macOS and other platforms
+emit the same capability warning because network isolation is not available
+there; generators and their declared runtime inputs must always be treated as
+trusted code.
+
+Set a secret's `repositoryOnly` policy bit for an intermediary output that must
+remain administrator/recovery-encrypted in the repository and cache but must
+never be delivered to a target. Policy validation rejects target consumers and
+advanced direct delivery for such secrets; this explicit bit avoids relying on
+an empty consumer list as a security signal.
 
 ## Migration inspection
 
@@ -384,9 +545,22 @@ the existing index and inspect the stable mapping before touching ciphertext:
 ```console
 nix eval --json .#secretIndex > /tmp/secretctl-index.json
 nix-seal migrate secretctl --index /tmp/secretctl-index.json --json
+# after review, rekey legacy files into a side-by-side native age tree
+nix-seal migrate secretctl --index /tmp/secretctl-index.json \
+  --repository-root . --destination secrets/nix-seal \
+  --identity /absolute/private/legacy.agekey \
+  --recipient age1admin... --recipient age1recovery... --execute
 nix-seal migrate agenix --directory ./secrets --json
 # ragenix uses the same standard age ciphertext inventory format
 nix-seal migrate ragenix --directory ./secrets --json
+# bulk import is side-by-side and remains dry-run-first
+nix-seal migrate agenix --repository-root . --directory legacy/secrets \
+  --destination secrets/nix-seal --identity /absolute/private/admin.agekey \
+  --recipient age1admin... --recipient age1recovery... --json
+# add --execute only after reviewing every mapping and recipient
+nix-seal migrate agenix --repository-root . --directory legacy/secrets \
+  --destination secrets/nix-seal --identity /absolute/private/admin.agekey \
+  --recipient age1admin... --recipient age1recovery... --execute
 # inspect an evaluated agenix-rekey policy export without decrypting data
 nix eval --json .#agenixRekeyMigration > /tmp/agenix-rekey.json
 nix-seal migrate agenix-rekey --metadata /tmp/agenix-rekey.json --json
@@ -399,8 +573,16 @@ nix-seal migrate sops --repository-root . --source legacy/token.yaml \
   --identity /absolute/private/nix-seal-admin.age --recipient age1... --execute
 # inventory Clan's documented per-machine output leaves without reading values
 nix-seal migrate clan-vars --directory ./vars/per-machine --json
+# after reviewing the mapping, stream values into a side-by-side native age tree
+nix-seal migrate clan-vars --directory vars/per-machine \
+  --repository-root . --destination nix-seal-vars \
+  --identity /absolute/private/nix-seal-admin.age \
+  --recipient age1... --execute
 # inventory documented Clan Facts public leaves without reading values
 nix-seal migrate clan-facts --directory ./machines --json
+# after reviewing the mapping, copy public facts side-by-side
+nix-seal migrate clan-facts --directory machines --repository-root . \
+  --destination nix-seal-public --execute
 # First inspect the mutation; then add --execute to stream-reencrypt it.
 nix-seal migrate ciphertext --source legacy/token.age --destination secrets/token.age \
   --identity /absolute/path/to/administrator.age --recipient age1... --json
@@ -409,12 +591,15 @@ nix-seal migrate ciphertext --source legacy/token.age --destination secrets/toke
 It validates legacy paths, scopes, consumers, IDs, groups, and SSH recipient
 metadata. For `secretctl`, it additionally cross-checks every target recipient
 set against its declared group membership and every secret recipient set against
-its consumer targets before reporting normalized nix-seal IDs. It never decrypts
-or rewrites legacy files. New plans should use native age recipients. Existing
-unencrypted OpenSSH Ed25519/RSA identities are supported only as a migration
-compatibility path; encrypted SSH private keys are deliberately rejected in
-non-interactive workflows, so convert them to a reviewed native-age or
-hardware-backed identity before automated import.
+its consumer targets before reporting normalized nix-seal IDs. An explicit
+repository-relative destination, private identity, and replacement recipients
+enable a side-by-side bulk rekey; `--execute` is required before ciphertext is
+opened, and the source tree remains untouched. Without those import flags it
+never decrypts or rewrites legacy files. New plans should use native age
+recipients. Existing unencrypted OpenSSH Ed25519/RSA identities are supported
+only as a migration compatibility path; encrypted SSH private keys are
+deliberately rejected in non-interactive workflows, so convert them to a
+reviewed native-age or hardware-backed identity before automated import.
 
 PGP is migration-only and never a native nix-seal encryption backend. Its
 dry-run-first bridge requires an absolute GnuPG executable and private,
@@ -437,11 +622,25 @@ nix-seal migrate pgp --repository-root . --source legacy/service.pgp \
 The agenix/ragenix adapters recursively inventory only regular `*.age` files,
 validate their age headers, and reject symbolic links or unsafe nesting. Because
 recipient and Nix module policy are not recoverable from ciphertext paths, their
-reports require an explicit nix-seal target/recipient mapping before import. Use
-`migrate ciphertext --execute` only after reviewing that mapping. It streams one
-source ciphertext directly into replacement recipients, verifies the new
-ciphertext with the named identity, and atomically creates or replaces the
-destination. It never writes plaintext to the repository or Nix store.
+reports require an explicit nix-seal recipient mapping before import. Supplying
+`--destination`, `--identity`, and one or more `--recipient` values enables a
+bulk migration preflight; the identity is not opened until `--execute` is
+present. The destination must be a separate repository-relative tree. Every
+source is streamed and round-trip verified into a private staging file before
+any destination changes, then all destination files are committed with backup
+and rollback behavior. Existing legacy files and configuration are never
+rewritten, so the two managers can run side by side during activation and
+rollback verification. `--replace` is explicit and still preserves the legacy
+tree. The same flow is available for ragenix because its ciphertext layout is
+standard age-compatible.
+
+Public migration compatibility goldens are checked into
+`crates/nix-seal-cli/tests/fixtures/migrations` and exercised through the
+released binary. They cover agenix, ragenix, agenix-rekey, SOPS JSON metadata,
+Clan Vars, Clan Facts, and the current `secretctl` index format. The fixtures
+contain only public metadata, empty/public leaves, or ciphertext without its
+private identity; mutation adapters remain dry-run-first and require separate
+round-trip tests before a 1.0 migration claim.
 
 For agenix-rekey, expose one public evaluated configuration with
 `nixSeal.lib.agenixRekeyMigrationExport`. The target must declare `id`, `kind`
@@ -449,14 +648,19 @@ For agenix-rekey, expose one public evaluated configuration with
 (`local` or `derivation`); `masterRecipients` contains only public master
 recipients. Each secret maps to a repository-relative string `rekeyFile` and may
 set `intermediary = true`. The inventory validates all of those public values,
-normalizes recipients, and preserves intermediary secrets as repository-only. It
-does not infer private runtime configuration or rewrite ciphertext.
+normalizes recipients, and preserves intermediary secrets as repository-only.
+Supplying `--destination`, `--identity`, and one or more `--recipient` values
+enables the same dry-run-first, side-by-side bulk rekey flow as agenix/ragenix;
+`--execute` is required before the private identity is opened. Every source is
+staged and round-trip verified before any destination changes, while the legacy
+tree remains intact for rollback. It does not infer private runtime
+configuration or rewrite the legacy ciphertext.
 
 ```nix
 nixSeal.lib.agenixRekeyMigrationExport {
   target = {
     id = "desktop";
-    kind = "nixos";
+    kind = "nixOs";
     system = "x86_64-linux";
     recipient = "ssh-ed25519 AAAA...";
     storageMode = "derivation";
@@ -509,15 +713,23 @@ reviewed extension rather than implicitly inheriting credential environments.
 `migrate clan-vars` recognizes only the documented
 `vars/per-machine/<machine>/<generator>/<output>/value` leaves. It validates the
 complete filesystem walk without following links, reports paths and byte counts,
-and never reads, decrypts, prints, or passes a value to another process. Clan
-storage backend, secret/public classification, target authorization, and runtime
-policy are not encoded by those leaves, so they must be supplied in a reviewed
-mapping before import.
+and never reads, decrypts, prints, or passes a value to another process during
+inventory. Clan storage backend, secret/public classification, target
+authorization, and runtime policy are not encoded by those leaves, so they must
+be supplied in a reviewed mapping before import. Supplying `--repository-root`,
+`--destination`, `--identity`, and one or more `--recipient` values enables a
+side-by-side import; `--execute` is required before values are opened. Every
+value is streamed into a staged age ciphertext, round-trip verified, and
+committed as one recoverable batch while the legacy Vars tree remains unchanged.
 
 `migrate clan-facts` inventories only documented public
 `machines/<machine>/facts/<fact>` leaves, with link/type and 64 MiB bounds. It
-never reads their values. Clan secret facts have configurable stores and paths,
-so they need an explicit reviewed export instead of filesystem inference.
+never reads their values during inventory. Supplying a repository-relative
+destination enables an explicit side-by-side public import; `--execute` streams
+each leaf through a bounded no-follow file transaction, verifies the complete
+batch, and publishes mode-safe outputs while leaving the legacy tree untouched.
+Clan secret facts have configurable stores and paths, so they need an explicit
+reviewed export instead of filesystem inference.
 
 ## Development
 

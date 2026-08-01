@@ -222,12 +222,28 @@
             "$ref": "#/$defs/GeneratorPrompt"
           }
         },
+        "publicOutputs": {
+          "description": "Declared public output files. These are never encrypted and may be\nconsumed by public authoring or Nix evaluation workflows.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GeneratorPublicOutput"
+          }
+        },
         "runtimeInputs": {
           "description": "Nix-store package roots whose `bin` directories form the generator `PATH`.",
           "type": "array",
           "default": [],
           "items": {
             "type": "string"
+          }
+        },
+        "secretDependencies": {
+          "description": "Canonical secret inputs exposed only to a constrained external generator.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Id"
           }
         },
         "timeoutSeconds": {
@@ -290,6 +306,22 @@
           "const": "visible"
         }
       ]
+    },
+    "GeneratorPublicOutput": {
+      "description": "One public output produced by an external generator.\n\nThe destination is repository-relative metadata. The output bytes are\nwritten only after every secret and public output has passed validation and\nthe complete generation transaction is ready to commit.",
+      "type": "object",
+      "properties": {
+        "destination": {
+          "description": "Repository-relative destination for the public output bytes.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Stable output identifier used by the generator protocol and reports.",
+          "$ref": "#/$defs/Id"
+        }
+      },
+      "additionalProperties": false,
+      "required": ["id", "destination"]
     },
     "Group": {
       "description": "Named group of `IDs`.",
@@ -488,6 +520,11 @@
           "$ref": "#/$defs/ActivationPhase",
           "default": "activation"
         },
+        "repositoryOnly": {
+          "description": "Keep this secret in the repository/cache but never authorize a target consumer.",
+          "type": "boolean",
+          "default": false
+        },
         "runtime": {
           "description": "Runtime delivery settings.",
           "$ref": "#/$defs/RuntimeSettings",
@@ -497,6 +534,20 @@
             "owner": "root",
             "reloadUnits": [],
             "restartUnits": []
+          }
+        },
+        "selectors": {
+          "description": "Additional target selection rules. Matches are unioned with `consumers`.",
+          "$ref": "#/$defs/TargetSelectors",
+          "default": {
+            "configurations": [],
+            "environments": [],
+            "groups": [],
+            "kinds": [],
+            "systems": [],
+            "tags": [],
+            "targets": [],
+            "usernames": []
           }
         },
         "source": {
@@ -511,6 +562,16 @@
       "description": "Target platform consumer.",
       "type": "object",
       "properties": {
+        "configuration": {
+          "description": "Optional Nix configuration name used by selectors.",
+          "type": ["string", "null"],
+          "default": null
+        },
+        "environment": {
+          "description": "Optional deployment environment used by selectors.",
+          "type": ["string", "null"],
+          "default": null
+        },
         "identity": {
           "description": "Recipient identity `ID`.",
           "$ref": "#/$defs/Id"
@@ -533,7 +594,8 @@
         },
         "username": {
           "description": "Optional Home Manager user.",
-          "type": ["string", "null"]
+          "type": ["string", "null"],
+          "default": null
         }
       },
       "additionalProperties": false,
@@ -558,6 +620,77 @@
           "const": "homeManager"
         }
       ]
+    },
+    "TargetSelectors": {
+      "description": "Public selectors for expanding a secret's authorized target set.\n\nNon-empty fields are `ANDed`, while values within one field are `ORed`. The\n`tags` field is the exception: every listed tag is required. Explicit\nconsumers remain a separate union, so adding a selector never removes an\nexisting target authorization.",
+      "type": "object",
+      "properties": {
+        "configurations": {
+          "description": "Nix configuration names.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "environments": {
+          "description": "Deployment environments.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "groups": {
+          "description": "Target groups whose leaves are selected.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "kinds": {
+          "description": "Target platform kinds.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TargetKind"
+          }
+        },
+        "systems": {
+          "description": "Nix system values such as `x86_64-linux`.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "tags": {
+          "description": "Tags; every listed tag must be present on a target.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "targets": {
+          "description": "Exact target IDs.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "usernames": {
+          "description": "Home Manager usernames.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "Template": {
       "description": "Runtime template declaration.",

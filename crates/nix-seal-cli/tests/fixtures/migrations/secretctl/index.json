@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "groups": {
+    "operators": [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEolRZAKwwqDLSkgezpqNK4WYLjMsE1qp8f3k7nYMVgq"
+    ]
+  },
+  "targets": {
+    "host:nixos:desktop": {
+      "type": "host",
+      "groups": ["operators"],
+      "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEolRZAKwwqDLSkgezpqNK4WYLjMsE1qp8f3k7nYMVgq",
+      "recipients": [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEolRZAKwwqDLSkgezpqNK4WYLjMsE1qp8f3k7nYMVgq"
+      ]
+    }
+  },
+  "secrets": {
+    "operators.host.desktop.token": {
+      "id": "operators.host.desktop.token",
+      "group": "operators",
+      "scope": "host",
+      "selector": null,
+      "agenixName": "token",
+      "file": "secrets/operators/host/desktop/token.age",
+      "recipients": [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEolRZAKwwqDLSkgezpqNK4WYLjMsE1qp8f3k7nYMVgq"
+      ],
+      "consumers": ["host:nixos:desktop"]
+    }
+  }
+}
