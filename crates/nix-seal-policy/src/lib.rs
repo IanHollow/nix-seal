@@ -930,6 +930,7 @@ fn validate_generator_execution(
             | "builtin:base64"
             | "builtin:token"
             | "builtin:passphrase"
+            | "builtin:ssh-ed25519"
             | "builtin:wireguard-private-key"
             | "builtin:uuid"
     );
@@ -1128,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn passphrase_is_an_admitted_builtin_generator() -> Result<(), PolicyError> {
+    fn passphrase_and_ssh_are_admitted_builtin_generators() -> Result<(), PolicyError> {
         let generator = nix_seal_core::Generator {
             executable: "builtin:passphrase".to_owned(),
             arguments: Vec::new(),
@@ -1144,6 +1145,15 @@ mod tests {
         let id =
             Id::parse("passphrase").map_err(|error| PolicyError::Violation(error.to_string()))?;
         validate_generator_execution(&id, &generator)?;
+        let ssh = nix_seal_core::Generator {
+            executable: "builtin:ssh-ed25519".to_owned(),
+            parameters: BTreeMap::new(),
+            ..generator
+        };
+        validate_generator_execution(
+            &Id::parse("ssh").map_err(|error| PolicyError::Violation(error.to_string()))?,
+            &ssh,
+        )?;
         Ok(())
     }
 

@@ -7,6 +7,7 @@ use base64::{
     engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use ed25519_dalek::SigningKey;
 use fs2::FileExt;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 use std::{
@@ -19,6 +20,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use zeroize::Zeroizing;
 
 const SOPS_MIGRATION_MAX_PLAINTEXT_BYTES: u64 = 64 * 1024 * 1024;
 const SOPS_MIGRATION_TIMEOUT: Duration = Duration::from_mins(2);
@@ -3866,6 +3868,7 @@ fn generate_builtin_value(generator: &nix_seal_core::Generator) -> Result<Secret
             )))
         }
         "builtin:passphrase" => generate_passphrase(generator),
+        "builtin:ssh-ed25519" => generate_ssh_ed25519_private_key(generator),
         "builtin:wireguard-private-key" => {
             if !generator.parameters.is_empty() {
                 bail!("builtin:wireguard-private-key does not accept parameters");
@@ -3900,7 +3903,7 @@ fn generate_builtin_value(generator: &nix_seal_core::Generator) -> Result<Secret
             Ok(SecretBox::new(Box::new(output)))
         }
         _ => bail!(
-            "generator executable is unsupported; v1 accepts builtin:random, builtin:hex, builtin:base64, builtin:token, builtin:passphrase, builtin:wireguard-private-key, or builtin:uuid"
+            "generator executable is unsupported; v1 accepts builtin:random, builtin:hex, builtin:base64, builtin:token, builtin:passphrase, builtin:ssh-ed25519, builtin:wireguard-private-key, or builtin:uuid"
         ),
     }
 }
@@ -3929,6 +3932,96 @@ fn generate_passphrase(generator: &nix_seal_core::Generator) -> Result<SecretBox
         value.extend_from_slice(PASSPHRASE_WORDS[usize::from(byte & 0x3f)].as_bytes());
     }
     Ok(SecretBox::new(Box::new(value)))
+}
+
+/// Generates one standard unencrypted OpenSSH Ed25519 private key. The private
+/// serialization is itself treated as a secret and immediately passed to the
+/// normal age authoring transaction; the public key is derivable from it.
+fn generate_ssh_ed25519_private_key(
+    generator: &nix_seal_core::Generator,
+) -> Result<SecretBox<Vec<u8>>> {
+    if !generator.parameters.is_empty() || generator.outputs.len() != 1 {
+        bail!("builtin:ssh-ed25519 accepts no parameters and requires exactly one secret output");
+    }
+    let seed = nix_seal_crypto::random_bytes(32)?;
+    let mut secret_seed = Zeroizing::new([0_u8; 32]);
+    secret_seed.copy_from_slice(seed.expose_secret());
+    let signing_key = SigningKey::from_bytes(&secret_seed);
+    let public = signing_key.verifying_key().to_bytes();
+
+    let mut public_blob = Vec::with_capacity(64);
+    ssh_write_string(&mut public_blob, b"ssh-ed25519")?;
+    ssh_write_string(&mut public_blob, &public)?;
+
+    let check_bytes = nix_seal_crypto::random_bytes(4)?;
+    let check = u32::from_be_bytes(
+        check_bytes
+            .expose_secret()
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid SSH key check value"))?,
+    );
+    let mut private_blob = Zeroizing::new(Vec::with_capacity(160));
+    ssh_write_u32(&mut private_blob, check);
+    ssh_write_u32(&mut private_blob, check);
+    ssh_write_string(&mut private_blob, b"ssh-ed25519")?;
+    ssh_write_string(&mut private_blob, &public)?;
+    let mut private_material = Zeroizing::new([0_u8; 64]);
+    private_material[..32].copy_from_slice(secret_seed.as_ref());
+    private_material[32..].copy_from_slice(&public);
+    ssh_write_string(&mut private_blob, private_material.as_ref())?;
+    ssh_write_string(&mut private_blob, b"nix-seal")?;
+    let padding = 8_usize
+        .checked_sub(private_blob.len() % 8)
+        .context("SSH private-key padding underflow")?;
+    for value in 1..=padding {
+        private_blob.push(u8::try_from(value).context("SSH private-key padding overflow")?);
+    }
+
+    let mut container = Zeroizing::new(Vec::with_capacity(
+        15_usize
+            .saturating_add(public_blob.len())
+            .saturating_add(private_blob.len()),
+    ));
+    container.extend_from_slice(b"openssh-key-v1\0");
+    ssh_write_string(&mut container, b"none")?;
+    ssh_write_string(&mut container, b"none")?;
+    ssh_write_string(&mut container, b"")?;
+    ssh_write_u32(&mut container, 1);
+    ssh_write_string(&mut container, &public_blob)?;
+    ssh_write_string(&mut container, &private_blob)?;
+
+    let encoded_length = container
+        .len()
+        .checked_add(2)
+        .context("SSH private-key encoding length overflow")?
+        .checked_div(3)
+        .context("SSH private-key encoding division failed")?
+        .checked_mul(4)
+        .context("SSH private-key encoding length overflow")?;
+    let mut encoded = Zeroizing::new(vec![0_u8; encoded_length]);
+    let written = BASE64_STANDARD
+        .encode_slice(&container, &mut encoded)
+        .context("could not encode generated SSH private key")?;
+    let mut output = Vec::with_capacity(written.saturating_add(96));
+    output.extend_from_slice(b"-----BEGIN OPENSSH PRIVATE KEY-----\n");
+    for line in encoded[..written].chunks(70) {
+        output.extend_from_slice(line);
+        output.push(b'\n');
+    }
+    output.extend_from_slice(b"-----END OPENSSH PRIVATE KEY-----\n");
+    Ok(SecretBox::new(Box::new(output)))
+}
+
+fn ssh_write_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn ssh_write_string(output: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    let length = u32::try_from(value.len()).context("SSH private-key field exceeds 4 GiB")?;
+    ssh_write_u32(output, length);
+    output.extend_from_slice(value);
+    Ok(())
 }
 
 fn generator_byte_length(generator: &nix_seal_core::Generator) -> Result<usize> {
@@ -5790,6 +5883,40 @@ mod tests {
         assert!(
             generate_passphrase(&nix_seal_core::Generator {
                 parameters: BTreeMap::from([("words".to_owned(), "11".to_owned())]),
+                ..generator
+            })
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_ed25519_generator_emits_a_standard_age_compatible_private_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let generator = nix_seal_core::Generator {
+            executable: "builtin:ssh-ed25519".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            outputs: vec![nix_seal_core::Id::parse("application/ssh-private-key")?],
+            prompts: Vec::new(),
+            parameters: BTreeMap::new(),
+            validation: None,
+        };
+        let value = generate_builtin_value(&generator)?;
+        let text = String::from_utf8(value.expose_secret().clone())?;
+        assert!(text.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----\n"));
+        assert!(text.ends_with("-----END OPENSSH PRIVATE KEY-----\n"));
+        let recipient = nix_seal_crypto::recipient_from_identity(&SecretString::from(text))?;
+        assert!(recipient.starts_with("ssh-ed25519 "));
+        assert!(
+            generate_ssh_ed25519_private_key(&nix_seal_core::Generator {
+                outputs: vec![
+                    nix_seal_core::Id::parse("application/first")?,
+                    nix_seal_core::Id::parse("application/second")?,
+                ],
                 ..generator
             })
             .is_err()
