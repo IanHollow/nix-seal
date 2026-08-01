@@ -84,6 +84,30 @@ jobs:
       - name: Fuzz transactional cache state
         working-directory: fuzz
         run: cargo fuzz run cache-state-v1 -- -max_total_time=60
+  benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          toolchain: 1.97.0
+      - name: Record runner metadata
+        run: |
+          {
+            echo "commit=${GITHUB_SHA}"
+            echo "runner=${RUNNER_OS}/${RUNNER_ARCH}"
+            echo "kernel=$(uname -a)"
+            echo "rust=$(rustc --version --verbose)"
+            echo "cpu=$(grep -m1 'model name' /proc/cpuinfo || true)"
+          } > benchmark-environment.txt
+      - name: Run scale benchmark
+        run: cargo bench -p nix-seal-policy --bench scale --locked > benchmark.jsonl
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nix-seal-benchmarks-${{ github.sha }}
+          path: |
+            benchmark.jsonl
+            benchmark-environment.txt
   policy:
     runs-on: ubuntu-latest
     steps:

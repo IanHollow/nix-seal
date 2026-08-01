@@ -13,7 +13,9 @@
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
   starting with a synthetic low-risk secret.
 - Phase 5: attack-path review, sustained fuzz/mutation/platform/performance
-  work, release candidate, independent audit and remediation, then 1.0.
+  work (the reproducible scale benchmark protocol and scheduled Miri,
+  sanitizer, and mutation jobs are now published), release candidate,
+  independent audit and remediation, then 1.0.
 
 ## Verified supply-chain follow-ups
 

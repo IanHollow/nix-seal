@@ -1,0 +1,46 @@
+name: Assurance
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * 6"
+permissions:
+  contents: read
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: false
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+      - name: Run Miri on the memory-safe core
+        run: cargo miri test -p nix-seal-core --lib
+  address-sanitizer:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+      RUSTDOCFLAGS: -Zsanitizer=address
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          toolchain: nightly
+          components: rust-src
+      - name: Run address sanitizer on the parser core
+        run: cargo test -p nix-seal-core --lib -Zbuild-std --target x86_64-unknown-linux-gnu
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          toolchain: 1.97.0
+      - name: Install cargo-mutants
+        run: cargo install --locked --version 27.1.0 cargo-mutants
+      - name: Mutate policy and core crates
+        run: cargo mutants --package nix-seal-core --package nix-seal-policy --timeout 120 --jobs 2
