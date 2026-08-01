@@ -138,6 +138,9 @@ enum Command {
     /// Manage public identities declared by a TOML plan.
     #[command(subcommand)]
     Identity(IdentityCommand),
+    /// Manage public groups declared by a TOML plan.
+    #[command(subcommand)]
+    Group(GroupCommand),
     /// Signed target-artifact operations.
     #[command(subcommand)]
     Artifact(ArtifactCommand),
@@ -235,6 +238,31 @@ enum IdentityCommand {
         #[arg(long)]
         public: String,
         /// Acknowledge that artifacts must be rekeyed or reapproved afterwards.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum GroupCommand {
+    /// List groups from the validated merged plan.
+    List(IdentityPlanArgs),
+    /// Add a named group with explicit public object IDs.
+    Add {
+        #[command(flatten)]
+        plan: IdentityPlanArgs,
+        #[arg(long)]
+        id: nix_seal_core::Id,
+        /// Identity, target, or existing group member; repeat as needed.
+        #[arg(long = "member", required = true)]
+        members: Vec<nix_seal_core::Id>,
+    },
+    /// Remove an unreferenced group from the TOML plan.
+    Remove {
+        #[command(flatten)]
+        plan: IdentityPlanArgs,
+        #[arg(long)]
+        id: nix_seal_core::Id,
         #[arg(long)]
         yes: bool,
     },
@@ -653,6 +681,7 @@ fn run() -> Result<()> {
         } => run_doctor(&plan, &repository_root, cache_root, cli.json)?,
         Command::Key(command) => run_key(command, cli.json)?,
         Command::Identity(command) => run_identity(command, cli.json)?,
+        Command::Group(command) => run_group(command, cli.json)?,
         Command::Artifact(command) => run_artifact(command, cli.json)?,
         Command::Rekey(arguments) => run_rekey(arguments, cli.json)?,
         Command::Generate(arguments) => run_generate(&arguments, cli.json)?,
@@ -2596,6 +2625,95 @@ fn run_identity(command: IdentityCommand, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_group(command: GroupCommand, json: bool) -> Result<()> {
+    match command {
+        GroupCommand::List(plan) => {
+            let plan = load_plan(&plan.toml, plan.nix_plan.as_deref())?;
+            nix_seal_policy::validate(&plan)?;
+            let groups = plan
+                .groups
+                .iter()
+                .map(|(id, group)| serde_json::json!({"id":id,"members":group.members}))
+                .collect::<Vec<_>>();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema":"nix-seal.groups.v1","groups":groups})
+                );
+            } else {
+                for group in groups {
+                    println!(
+                        "{}\t{}",
+                        group["id"].as_str().unwrap_or("unknown"),
+                        group["members"]
+                    );
+                }
+            }
+        }
+        GroupCommand::Add { plan, id, members } => {
+            mutate_toml_plan(&plan, |toml_plan| {
+                if toml_plan.groups.contains_key(&id) {
+                    bail!("group {id} already exists in the TOML plan");
+                }
+                toml_plan
+                    .groups
+                    .insert(id.clone(), nix_seal_core::Group { members });
+                Ok(())
+            })?;
+            print_group_mutation("added", &id, json);
+        }
+        GroupCommand::Remove { plan, id, yes } => {
+            if !yes {
+                bail!("group removal requires --yes");
+            }
+            mutate_toml_plan(&plan, |toml_plan| {
+                if !toml_plan.groups.contains_key(&id) {
+                    bail!("group {id} does not exist in the TOML plan");
+                }
+                let references = group_references(toml_plan, &id);
+                if !references.is_empty() {
+                    bail!(
+                        "group {id} is still referenced by {}",
+                        references.join(", ")
+                    );
+                }
+                toml_plan.groups.remove(&id);
+                Ok(())
+            })?;
+            print_group_mutation("removed", &id, json);
+        }
+    }
+    Ok(())
+}
+
+fn print_group_mutation(operation: &str, id: &nix_seal_core::Id, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"schema":"nix-seal.output.v1","operation":operation,"group":id})
+        );
+    } else {
+        println!("group {operation}: {id}");
+    }
+}
+
+fn group_references(plan: &nix_seal_core::PlanV1, id: &nix_seal_core::Id) -> Vec<String> {
+    let mut references = Vec::new();
+    for (group_id, group) in &plan.groups {
+        if group_id != id && group.members.iter().any(|member| member == id) {
+            references.push(format!("group {group_id}"));
+        }
+    }
+    for (secret_id, secret) in &plan.secrets {
+        if secret.administrators.iter().any(|member| member == id)
+            || secret.consumers.iter().any(|member| member == id)
+        {
+            references.push(format!("secret {secret_id}"));
+        }
+    }
+    references
 }
 
 fn print_identity_records(identities: Vec<PublicIdentityRecord>, json: bool) {
@@ -4756,6 +4874,45 @@ mod tests {
             nix_seal_policy::load_toml(&toml_path)?
                 .identities
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn group_removal_refuses_nested_or_secret_references() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let group = nix_seal_core::Id::parse("operators")?;
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.groups.insert(
+            group.clone(),
+            nix_seal_core::Group {
+                members: Vec::new(),
+            },
+        );
+        plan.groups.insert(
+            nix_seal_core::Id::parse("nested")?,
+            nix_seal_core::Group {
+                members: vec![group.clone()],
+            },
+        );
+        assert_eq!(group_references(&plan, &group), vec!["group nested"]);
+        plan.groups.remove(&nix_seal_core::Id::parse("nested")?);
+        plan.secrets.insert(
+            nix_seal_core::Id::parse("service/token")?,
+            nix_seal_core::Secret {
+                source: "secrets/token.age".to_owned(),
+                delivery: nix_seal_core::DeliveryMode::Rekeyed,
+                administrators: vec![group.clone()],
+                consumers: Vec::new(),
+                phase: nix_seal_core::ActivationPhase::Activation,
+                runtime: nix_seal_core::RuntimeSettings::default(),
+                lifecycle: nix_seal_core::Lifecycle::default(),
+                approval_policy: None,
+            },
+        );
+        assert_eq!(
+            group_references(&plan, &group),
+            vec!["secret service/token"]
         );
         Ok(())
     }
