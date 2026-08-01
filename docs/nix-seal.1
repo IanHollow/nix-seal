@@ -1,0 +1,59 @@
+.TH NIX-SEAL 1 "2026-07-31" "nix-seal 0.1.0-alpha.1" "User Commands"
+.SH NAME
+nix-seal \- security-first, offline-first secret management for Nix
+.SH SYNOPSIS
+.B nix-seal
+[B--jsonR]
+\fICOMMAND\fR [\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B nix-seal
+manages standard age ciphertext for NixOS, nix-darwin, and Home Manager. Public
+policy is compiled deterministically; plaintext is accepted only from standard
+input or an explicit private editor transaction and is activated only in a
+restricted runtime generation.
+.PP
+The default delivery mode is administrator-to-target rekeying with signed target
+artifacts. Direct target-recipient delivery is advanced and retains the risk
+that a stolen target identity can decrypt historical ciphertext addressed to it.
+.SH SAFETY
+Secret values are never accepted through command-line arguments or ordinary
+environment variables. JSON output never contains plaintext. The explicitly
+named \fBsecret reveal\fR operation is the sole command that writes plaintext
+to standard output.
+.SH COMMANDS
+.TP
+.B init
+Create an empty valid public plan without creating keys or secrets.
+.TP
+.B plan, check, doctor
+Compile, inspect, validate, and diagnose public policy.
+.TP
+.B key, identity, group
+Manage identities and public policy metadata.
+.TP
+.B secret, rotate
+Create, import, edit, reveal, inspect, delete, and rotate canonical secrets.
+.TP
+.B rekey, artifact, provision, cache
+Create, verify, exchange, and garbage-collect signed ciphertext-only artifacts.
+.TP
+.B generate, template
+Run constrained declared generators and validate public templates.
+.TP
+.B migrate
+Perform dry-run-first migration inspection or explicit stream re-encryption.
+.TP
+.B schema, completions
+Print versioned JSON Schemas and shell completions.
+.SH FILES
+.TP
+.I $XDG_CACHE_HOME/nix-seal/v1
+Ciphertext-only rekey cache.
+.SH EXIT STATUS
+Exit code 0 indicates success. Code 2 is command-line usage. Codes 3 through 6
+respectively identify policy, cryptographic/approval, cache/storage, and runtime
+activation failures.
+.SH SEE ALSO
+.BR age (1)
+.PP
+Project documentation: https://github.com/IanHollow/nix-seal

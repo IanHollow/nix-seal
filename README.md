@@ -141,6 +141,17 @@ generation changes, activation-time secret templates, post-switch service
 coordination, JSON Schema output, and NixOS/nix-darwin/Home Manager modules. See
 [SPEC.md](SPEC.md) and [ROADMAP.md](ROADMAP.md) before relying on it.
 
+## Installed documentation
+
+The flake's `packages.<system>.documentation` output installs the versioned
+`plan`, `target-policy`, `secret-recipients`, and `activation` JSON Schemas,
+Bash/Zsh/Fish/Nushell completion definitions generated from the released CLI,
+and `nix-seal(1)`. Build it directly with:
+
+```console
+nix build github:IanHollow/nix-seal#documentation
+```
+
 ## Fuzzing
 
 The checked-in `fuzz` workspace begins at the strict public `plan.v1` boundary:
