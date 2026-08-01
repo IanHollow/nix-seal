@@ -370,9 +370,11 @@ in
       touch "$out"
     '';
   module-artifact-bundle =
-    assert nixosArtifactBundle.config.nixSeal.secrets."db/password".ciphertext
+    assert
+      nixosArtifactBundle.config.nixSeal.secrets."db/password".ciphertext
       == "${importedArtifact}/ciphertext.age";
-    assert nixosArtifactBundle.config.nixSeal.secrets."db/password".envelope
+    assert
+      nixosArtifactBundle.config.nixSeal.secrets."db/password".envelope
       == "${importedArtifact}/manifest.dsse.json";
     pkgs.runCommand "nix-seal-module-artifact-bundle" { nativeBuildInputs = [ pkgs.jq ]; } ''
       jq -e '.artifacts[0].ciphertext == "${importedArtifact}/ciphertext.age" and .artifacts[0].envelope == "${importedArtifact}/manifest.dsse.json"' \
