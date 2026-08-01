@@ -265,6 +265,11 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
         ));
     }
     for (id, identity) in &plan.identities {
+        if matches!(identity.kind, IdentityKind::Plugin) {
+            return Err(PolicyError::Violation(format!(
+                "identity {id} uses an age plugin, but the sandboxed plugin client is not implemented"
+            )));
+        }
         if matches!(
             identity.kind,
             IdentityKind::Administrator | IdentityKind::Target | IdentityKind::Recovery
@@ -299,9 +304,9 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
                 target.identity
             ))
         })?;
-        if !matches!(identity.kind, IdentityKind::Target | IdentityKind::Plugin) {
+        if !matches!(identity.kind, IdentityKind::Target) {
             return Err(PolicyError::Violation(format!(
-                "target {id} identity {} is not target/plugin kind",
+                "target {id} identity {} is not target kind",
                 target.identity
             )));
         }
@@ -353,7 +358,7 @@ fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
             !plan.identities.get(identity_id).is_some_and(|identity| {
                 matches!(
                     identity.kind,
-                    IdentityKind::Administrator | IdentityKind::Recovery | IdentityKind::Plugin
+                    IdentityKind::Administrator | IdentityKind::Recovery
                 )
             })
         }) {
@@ -760,7 +765,7 @@ pub fn secret_recipients(plan: &PlanV1, secret_id: &Id) -> Result<SecretRecipien
         })?;
         if !matches!(
             identity.kind,
-            IdentityKind::Administrator | IdentityKind::Recovery | IdentityKind::Plugin
+            IdentityKind::Administrator | IdentityKind::Recovery
         ) {
             return Err(PolicyError::Violation(format!(
                 "administrator reference {identity_id} has an incompatible identity kind"
@@ -1351,6 +1356,22 @@ mod tests {
             Identity {
                 kind: IdentityKind::Signer,
                 public: "not-an-approval-key".to_owned(),
+            },
+        );
+        assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_identities_fail_closed_until_the_sandbox_client_exists() -> Result<(), PolicyError> {
+        let mut plan = PlanV1::default();
+        let id = Id::parse("hardware-token")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        plan.identities.insert(
+            id,
+            Identity {
+                kind: IdentityKind::Plugin,
+                public: "age1examplepluginrecipient".to_owned(),
             },
         );
         assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
