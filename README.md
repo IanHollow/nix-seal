@@ -433,8 +433,14 @@ repository state path `.nix-seal/prompt-state/v1/<generator>/<prompt>`, and
 later runs may use that stored response without passing it again. Nonpersistent
 prompts are never retained. Persistent state is plaintext and must be protected
 like any other local credential; it is not part of Git, the Nix store, or the
-public plan. Terminal prompting remains unavailable until a separately reviewed
-TTY hardening design is complete.
+public plan. For an explicitly interactive workflow, pass `--interactive`.
+nix-seal then opens the controlling `/dev/tty` rather than stdin/stdout, rejects
+non-terminal sessions, sanitizes public prompt labels before display, bounds each
+response to 1 MiB, masks `hidden` prompts with terminal settings restored on all
+errors, and never places the response in argv, ordinary environment variables,
+the plan, or logs. Single-line prompts finish at Enter; multiline prompts finish
+with Ctrl-D and preserve entered line endings. Automation should continue to use
+private response files, because interactive prompting is never implicit.
 
 External generators may additionally declare `secretDependencies`. nix-seal
 requires every declared ID to be an existing canonical secret, forbids duplicate

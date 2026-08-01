@@ -1,6 +1,6 @@
 # ADR 0005: Plugins and generators
 
-Status: accepted; standard age plugin worker implemented
+Status: accepted; standard age plugin worker and hardened generator prompts implemented
 
 Age identities use the standard plugin protocol. Generators are built-in Rust or
 direct declared executables from Nix packages; no shell evaluation. Processes
@@ -29,3 +29,12 @@ while age stanza decryption is the authoritative key proof. Malformed frames,
 oversized fields, excessive recipients, missing binaries, non-zero exits, output
 overflows, and timeout/cleanup failures are redacted as one
 `CryptoError::Plugin` category.
+
+Generator prompts remain non-interactive unless the operator explicitly passes
+`nix-seal generate --interactive`. The CLI opens `/dev/tty` directly, verifies
+that it is a terminal, sanitizes public prompt labels, bounds input to 1 MiB, and
+uses an RAII terminal-mode guard for hidden prompts so echo is restored on every
+failure path. Single-line prompts read one canonical terminal line; multiline
+prompts require Ctrl-D and preserve entered line endings. Prompt input never
+passes through stdin/stdout, argv, ordinary environment variables, the plan, or
+logs. Platforms without the reviewed termios implementation fail closed.

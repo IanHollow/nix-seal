@@ -495,6 +495,10 @@ struct GenerateArgs {
     /// Private response file bound to one declared generator prompt as `ID=PATH`.
     #[arg(long = "prompt-file", value_name = "ID=PATH")]
     prompt_files: Vec<String>,
+    /// Read missing prompt responses from the controlling terminal. This is
+    /// explicit because interactive input is never appropriate for automation.
+    #[arg(long)]
+    interactive: bool,
 }
 
 #[derive(Args)]
@@ -4155,6 +4159,7 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
         &order,
         &arguments.prompt_files,
         &arguments.repository_root,
+        arguments.interactive,
     )?;
     let mut outputs = Vec::new();
     for generator_id in order {
@@ -4669,7 +4674,8 @@ fn validate_generator_prompt_files(
     order: &[nix_seal_core::Id],
     values: &[String],
     repository_root: &Path,
-) -> Result<BTreeMap<nix_seal_core::Id, PathBuf>> {
+    interactive: bool,
+) -> Result<BTreeMap<nix_seal_core::Id, Option<PathBuf>>> {
     let explicit = parse_prompt_files(values)?;
     let mut declared = BTreeMap::new();
     for generator_id in order {
@@ -4691,18 +4697,23 @@ fn validate_generator_prompt_files(
     let mut resolved = BTreeMap::new();
     for (prompt_id, (generator_id, persistent)) in declared {
         if let Some(path) = explicit.get(&prompt_id) {
-            resolved.insert(prompt_id, path.clone());
+            resolved.insert(prompt_id, Some(path.clone()));
         } else if persistent {
             let path = generator_prompt_state_path(repository_root, &generator_id, &prompt_id)?;
-            if !path.exists() {
+            if path.exists() {
+                resolved.insert(prompt_id, Some(path));
+            } else if interactive {
+                resolved.insert(prompt_id, None);
+            } else {
                 bail!(
-                    "persistent prompt {prompt_id} has no stored response; initialize it with --prompt-file {prompt_id}=PATH"
+                    "persistent prompt {prompt_id} has no stored response; initialize it with --prompt-file {prompt_id}=PATH or pass --interactive"
                 );
             }
-            resolved.insert(prompt_id, path);
+        } else if interactive {
+            resolved.insert(prompt_id, None);
         } else {
             bail!(
-                "prompt {prompt_id} requires an explicit private response file (--prompt-file {prompt_id}=PATH)"
+                "prompt {prompt_id} requires an explicit private response file (--prompt-file {prompt_id}=PATH) or --interactive"
             );
         }
     }
@@ -4997,7 +5008,7 @@ fn parse_prompt_files(values: &[String]) -> Result<BTreeMap<nix_seal_core::Id, P
 
 fn read_generator_prompts(
     generator: &nix_seal_core::Generator,
-    prompt_files: &BTreeMap<nix_seal_core::Id, PathBuf>,
+    prompt_files: &BTreeMap<nix_seal_core::Id, Option<PathBuf>>,
 ) -> Result<Vec<SecretBox<Vec<u8>>>> {
     generator
         .prompts
@@ -5005,20 +5016,149 @@ fn read_generator_prompts(
         .map(|prompt| {
             let path = prompt_files
                 .get(&prompt.id)
-                .context("declared generator prompt has no private response file")?;
-            let mut input = open_private_identity(path)
-                .context("generator prompt response file has unsafe ownership or permissions")?;
-            let mut value = Vec::new();
-            std::io::Read::by_ref(&mut input)
-                .take(1024 * 1024 + 1)
-                .read_to_end(&mut value)
-                .context("could not read generator prompt response")?;
-            if value.len() > 1024 * 1024 {
-                bail!("generator prompt response exceeds the 1 MiB safety limit");
+                .context("declared generator prompt has no response source")?;
+            match path {
+                Some(path) => {
+                    let mut input = open_private_identity(path).context(
+                        "generator prompt response file has unsafe ownership or permissions",
+                    )?;
+                    let mut value = Vec::new();
+                    std::io::Read::by_ref(&mut input)
+                        .take(1024 * 1024 + 1)
+                        .read_to_end(&mut value)
+                        .context("could not read generator prompt response")?;
+                    if value.len() > 1024 * 1024 {
+                        bail!("generator prompt response exceeds the 1 MiB safety limit");
+                    }
+                    Ok(SecretBox::new(Box::new(value)))
+                }
+                None => read_tty_prompt(prompt),
             }
-            Ok(SecretBox::new(Box::new(value)))
         })
         .collect()
+}
+
+const MAX_INTERACTIVE_PROMPT_BYTES: usize = 1024 * 1024;
+
+/// Read one declared prompt from a controlling terminal. This frontend is
+/// intentionally separate from stdin/stdout so generator pipes cannot consume
+/// prompt input or receive prompt bytes. Multiline prompts terminate on an
+/// explicit Ctrl-D, while single-line prompts consume one terminal line.
+#[cfg(unix)]
+fn read_tty_prompt(prompt: &nix_seal_core::GeneratorPrompt) -> Result<SecretBox<Vec<u8>>> {
+    use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+
+    let mut tty = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .context("interactive prompting requires a controlling terminal")?;
+    if !rustix::termios::isatty(&tty) {
+        bail!("interactive prompting requires a controlling terminal");
+    }
+
+    let message = prompt
+        .message
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    tty.write_all(message.as_bytes())
+        .and_then(|()| {
+            if prompt.multiline {
+                tty.write_all(b" (finish with Ctrl-D): ")
+            } else {
+                tty.write_all(b": ")
+            }
+        })
+        .and_then(|()| tty.flush())
+        .context("could not write interactive prompt")?;
+
+    let original = tcgetattr(&tty).context("could not inspect terminal settings")?;
+    let restore_tty = tty
+        .try_clone()
+        .context("could not duplicate terminal handle")?;
+    let restore = TerminalModeGuard {
+        tty: restore_tty,
+        original: Some(original.clone()),
+    };
+    if matches!(prompt.mode, nix_seal_core::GeneratorPromptMode::Hidden) {
+        let mut masked = original;
+        masked
+            .local_modes
+            .remove(LocalModes::ECHO | LocalModes::ECHONL);
+        tcsetattr(&tty, OptionalActions::Flush, &masked)
+            .context("could not disable terminal echo for hidden prompt")?;
+    }
+
+    let mut value = Vec::new();
+    if prompt.multiline {
+        (&mut tty)
+            .take((MAX_INTERACTIVE_PROMPT_BYTES + 1) as u64)
+            .read_to_end(&mut value)
+            .context("could not read interactive prompt response")?;
+    } else {
+        loop {
+            let mut buffer = [0_u8; 4096];
+            let read = tty
+                .read(&mut buffer)
+                .context("could not read interactive prompt response")?;
+            if read == 0 {
+                break;
+            }
+            let end = buffer[..read]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(read, |position| position + 1);
+            value.extend_from_slice(&buffer[..end]);
+            if value.len() > MAX_INTERACTIVE_PROMPT_BYTES || end != read {
+                break;
+            }
+        }
+    }
+    if value.len() > MAX_INTERACTIVE_PROMPT_BYTES {
+        bail!("interactive prompt response exceeds the 1 MiB safety limit");
+    }
+    if !prompt.multiline && value.ends_with(b"\n") {
+        value.pop();
+        if value.ends_with(b"\r") {
+            value.pop();
+        }
+    }
+    drop(restore);
+    tty.write_all(b"\n")
+        .and_then(|()| tty.flush())
+        .context("could not finish interactive prompt")?;
+    Ok(SecretBox::new(Box::new(value)))
+}
+
+#[cfg(unix)]
+struct TerminalModeGuard {
+    tty: fs::File,
+    original: Option<rustix::termios::Termios>,
+}
+
+#[cfg(unix)]
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            let _ = rustix::termios::tcsetattr(
+                &self.tty,
+                rustix::termios::OptionalActions::Drain,
+                &original,
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn read_tty_prompt(_prompt: &nix_seal_core::GeneratorPrompt) -> Result<SecretBox<Vec<u8>>> {
+    bail!("interactive prompting is unavailable on this platform")
 }
 
 fn collect_generator_order(
@@ -7586,6 +7726,43 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
     }
 
     #[test]
+    fn interactive_prompt_resolution_is_explicit_and_keeps_noninteractive_runs_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(&repository)?;
+        let generator_id = nix_seal_core::Id::parse("application/bootstrap")?;
+        let prompt_id = nix_seal_core::Id::parse("database/password")?;
+        let generator = nix_seal_core::Generator {
+            executable: "/nix/store/example/bin/generator".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
+            outputs: vec![nix_seal_core::Id::parse("application/token")?],
+            public_outputs: Vec::new(),
+            prompts: vec![nix_seal_core::GeneratorPrompt {
+                id: prompt_id.clone(),
+                mode: nix_seal_core::GeneratorPromptMode::Hidden,
+                message: "Database password".to_owned(),
+                multiline: false,
+                persistent: false,
+            }],
+            parameters: BTreeMap::new(),
+            validation: None,
+        };
+        let mut plan = nix_seal_core::PlanV1::default();
+        plan.generators.insert(generator_id.clone(), generator);
+        let order = vec![generator_id];
+        assert!(validate_generator_prompt_files(&plan, &order, &[], &repository, false).is_err());
+        let resolved = validate_generator_prompt_files(&plan, &order, &[], &repository, true)?;
+        assert_eq!(resolved.get(&prompt_id), Some(&None));
+        Ok(())
+    }
+
+    #[test]
     fn persistent_prompt_state_is_private_and_reused() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let repository = temporary.path().join("repository");
@@ -7630,6 +7807,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             std::slice::from_ref(&generator_id),
             &[],
             &repository,
+            false,
         )?;
         let restored = read_generator_prompts(&generator, &files)?;
         assert_eq!(restored[0].expose_secret(), b"persistent-prompt");
@@ -8126,6 +8304,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             identity: identity_path.clone(),
             replace: false,
             prompt_files: Vec::new(),
+            interactive: false,
         };
         run_generate(&request, false)?;
         let ciphertext = repository.join("secrets/application-token.age");
