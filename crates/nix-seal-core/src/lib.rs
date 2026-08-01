@@ -223,7 +223,7 @@ pub enum DeliveryMode {
 }
 
 /// Activation lifecycle phase.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ActivationPhase {
     /// Disk/installation phase.

@@ -3904,7 +3904,11 @@ fn verify_activation_projection(
         .iter()
         .map(|artifact| &artifact.secret_id)
         .collect();
-    let policy_secret_ids: BTreeSet<_> = policy.secrets.keys().collect();
+    let policy_secret_ids: BTreeSet<_> = policy
+        .secrets
+        .iter()
+        .filter_map(|(id, secret)| (secret.phase == spec.phase).then_some(id))
+        .collect();
     if artifact_ids != policy_secret_ids {
         bail!("activation artifact set does not exactly match target policy");
     }
@@ -3915,7 +3919,8 @@ fn verify_activation_projection(
                 artifact.secret_id
             )
         })?;
-        if artifact.owner != secret.runtime.owner
+        if artifact.phase != secret.phase
+            || artifact.owner != secret.runtime.owner
             || artifact.group != secret.runtime.group
             || artifact.mode != secret.runtime.mode
         {
@@ -3931,7 +3936,11 @@ fn verify_activation_projection(
         .iter()
         .map(|template| &template.template_id)
         .collect();
-    let policy_template_ids: BTreeSet<_> = policy.templates.keys().collect();
+    let policy_template_ids: BTreeSet<_> = policy
+        .templates
+        .iter()
+        .filter_map(|(id, template)| (template.phase == spec.phase).then_some(id))
+        .collect();
     if template_ids != policy_template_ids {
         bail!("activation template set does not exactly match target policy");
     }
@@ -3971,7 +3980,8 @@ fn verify_activation_projection(
                         )
                 })
             });
-        if template.source != expected_source
+        if template.phase != expected.phase
+            || template.source != expected_source
             || template.owner != expected.runtime.owner
             || template.group != expected.runtime.group
             || template.mode != expected.runtime.mode
@@ -3996,8 +4006,15 @@ fn verify_service_projection(
     for runtime in policy
         .secrets
         .values()
+        .filter(|secret| secret.phase == spec.phase)
         .map(|secret| &secret.runtime)
-        .chain(policy.templates.values().map(|template| &template.runtime))
+        .chain(
+            policy
+                .templates
+                .values()
+                .filter(|template| template.phase == spec.phase)
+                .map(|template| &template.runtime),
+        )
     {
         restart_units.extend(runtime.restart_units.iter().cloned());
         reload_units.extend(runtime.reload_units.iter().cloned());
@@ -7494,11 +7511,13 @@ mod tests {
             runtime_generation: None,
             plan: plan_path,
             target_id,
+            phase: nix_seal_core::ActivationPhase::Activation,
             allowed_clock_skew: 0,
             artifacts: vec![nix_seal_runtime::ActivationArtifactSpecV2 {
                 ciphertext: ciphertext_path,
                 envelope: envelope_path,
                 secret_id: secret_id.clone(),
+                phase: nix_seal_core::ActivationPhase::Activation,
                 source_ciphertext_hash: source_hash,
                 artifact_generation: 1,
                 mode: "0400".to_owned(),
@@ -7508,6 +7527,7 @@ mod tests {
             templates: vec![nix_seal_runtime::ActivationTemplateSpecV1 {
                 source: template_path,
                 template_id,
+                phase: nix_seal_core::ActivationPhase::Activation,
                 placeholders: BTreeMap::from([(
                     "password-base64".to_owned(),
                     nix_seal_runtime::TemplatePlaceholderSpecV1 {
@@ -7542,8 +7562,8 @@ mod tests {
         std::fs::write(&spec_path, serde_json::to_vec(&spec)?)?;
         let error = match run_activate(
             &ActivateArgs {
-                spec: spec_path,
-                identity: identity_path,
+                spec: spec_path.clone(),
+                identity: identity_path.clone(),
                 runtime_root: None,
             },
             false,
@@ -7555,6 +7575,31 @@ mod tests {
             error
                 .to_string()
                 .contains("differs from the canonical plan")
+        );
+        assert_eq!(
+            std::fs::read(runtime_root.join("current/db/password"))?,
+            b"cli-activation-canary"
+        );
+        spec.artifacts[0].mode = "0400".to_owned();
+        spec.phase = nix_seal_core::ActivationPhase::Users;
+        spec.artifacts[0].phase = nix_seal_core::ActivationPhase::Users;
+        spec.templates[0].phase = nix_seal_core::ActivationPhase::Users;
+        std::fs::write(&spec_path, serde_json::to_vec(&spec)?)?;
+        let error = match run_activate(
+            &ActivateArgs {
+                spec: spec_path,
+                identity: identity_path,
+                runtime_root: None,
+            },
+            false,
+        ) {
+            Ok(()) => return Err("caller-supplied activation phase drift was accepted".into()),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("activation artifact set does not exactly match target policy")
         );
         assert_eq!(
             std::fs::read(runtime_root.join("current/db/password"))?,

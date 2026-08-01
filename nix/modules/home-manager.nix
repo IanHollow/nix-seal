@@ -51,6 +51,18 @@ in
           || lib.all (secret: secret.serviceCredentials == [ ]) (builtins.attrValues config.nixSeal.secrets);
         message = "Home Manager nixSeal serviceCredentials require Linux systemd user services";
       }
+      {
+        assertion = lib.all (secret: secret.phase == "activation") (
+          builtins.attrValues config.nixSeal.secrets
+        );
+        message = "nixSeal activation phases other than activation are not yet scheduled by Home Manager";
+      }
+      {
+        assertion = lib.all (template: template.phase == "activation") (
+          builtins.attrValues config.nixSeal.templates
+        );
+        message = "nixSeal template activation phases other than activation are not yet scheduled by Home Manager";
+      }
     ];
     home.activation.nixSeal = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
       if [ -z "''${XDG_RUNTIME_DIR:-}" ]; then

@@ -112,6 +112,55 @@ let
       }
     ];
   };
+  nixosPhased = inputs.nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = [
+      self.nixosModules.default
+      common
+      {
+        system.stateVersion = "26.05";
+        nixSeal.secrets."bootstrap/token" = {
+          inherit ciphertext envelope;
+          sourceCiphertextHash = digest "6";
+          phase = "users";
+        };
+      }
+    ];
+  };
+  partitioningPhase = inputs.nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = [
+      self.nixosModules.default
+      common
+      {
+        system.stateVersion = "26.05";
+        nixSeal.secrets."disk/token" = {
+          inherit ciphertext envelope;
+          sourceCiphertextHash = digest "7";
+          phase = "partitioning";
+        };
+      }
+    ];
+  };
+  phaseTemplateViolation = inputs.nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = [
+      self.nixosModules.default
+      common
+      {
+        system.stateVersion = "26.05";
+        nixSeal.secrets."bootstrap/token" = {
+          inherit ciphertext envelope;
+          sourceCiphertextHash = digest "8";
+          phase = "users";
+        };
+        nixSeal.templates."bootstrap/config" = {
+          source = templateSource;
+          placeholders.password.secret = "bootstrap/token";
+        };
+      }
+    ];
+  };
   home = inputs.home-manager.lib.homeManagerConfiguration {
     inherit pkgs;
     modules = [
@@ -168,6 +217,7 @@ let
       touch "$out"
     '';
   nixosActivation = pkgs.writeText "nix-seal-nixos-activation" nixos.config.system.activationScripts.nixSeal.text;
+  nixosUsersActivation = pkgs.writeText "nix-seal-nixos-users-activation" nixosPhased.config.system.activationScripts.nixSealUsers.text;
   homeActivation = pkgs.writeText "nix-seal-home-activation" home.config.home.activation.nixSeal.data;
   nixosCredentialSpec = pkgs.writeText "nix-seal-nixos-credential.json" (
     builtins.toJSON {
@@ -229,6 +279,28 @@ in
     assert hasFailedAssertion "nixSeal.identityFile must be an absolute path outside /nix/store"
       unsafeIdentityPath;
     pkgs.runCommand "nix-seal-module-identity-policy" { } ''
+      touch "$out"
+    '';
+  module-phase-scheduling =
+    assert
+      nixosPhased.config.nixSeal.secrets."bootstrap/token".path
+      == "/run/nix-seal/users/current/bootstrap/token";
+    assert hasFailedAssertion
+      "nixSeal partitioning-phase secrets are not scheduled by generic NixOS activation; provision config.nixSeal.activationSpecs.partitioning over a protected installation channel"
+      partitioningPhase;
+    assert hasFailedAssertion
+      "every nixSeal template may reference secrets from exactly its own activation phase"
+      phaseTemplateViolation;
+    pkgs.runCommand "nix-seal-module-phase-scheduling" { nativeBuildInputs = [ pkgs.jq ]; } ''
+      jq -e '
+        .phase == "users" and
+        .runtimeRoot == "/run/nix-seal/users" and
+        (.artifacts | length) == 1 and
+        .artifacts[0].secretId == "bootstrap/token" and
+        .artifacts[0].phase == "users" and
+        (.templates | length) == 0
+      ' ${nixosPhased.config.nixSeal.activationSpecs.users} >/dev/null
+      grep -F -- "--identity /run/keys/nix-seal-target" ${nixosUsersActivation} >/dev/null
       touch "$out"
     '';
 }

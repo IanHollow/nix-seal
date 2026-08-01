@@ -17,6 +17,22 @@ fsynced and published under an immutable name before an atomic `current` symlink
 switch. Authentication or decryption failure drops the transaction and leaves
 the previous generation active.
 
+Each activation document carries one required phase. Its artifact and template
+entries must match that phase, and a template can reference only secret outputs
+within the same phase. This gives every phase a separate lock, generation
+directory, and `current` symlink. The ordinary `activation` phase retains the
+historical runtime root; other phases receive a child root such as
+`/run/nix-seal/users`. This avoids overwriting a previously activated early
+generation while preventing a later phase from implicitly consuming it.
+
+On NixOS, `users` runs after `specialfs` and before the standard user-creation
+activation script, so its output must be `root:root`. The normal `activation`
+phase runs after `users`; `services` runs after it. `partitioning` is never
+scheduled by the generic module because its correct timing and transport depend
+on the installer. It remains an explicit public activation spec to be invoked
+only by reviewed installation orchestration. nix-darwin and Home Manager reject
+non-normal phases until they have platform-specific safe ordering contracts.
+
 Nix modules emit a strict `nix-seal.activation.v2` public document containing a
 canonical plan path, target ID, ciphertext/envelope paths, source hashes, and
 runtime materialization metadata. Plan hash, target-policy hash, recipient, and

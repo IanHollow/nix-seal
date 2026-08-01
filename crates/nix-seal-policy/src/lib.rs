@@ -124,6 +124,8 @@ pub struct TargetApprovalPolicyV1 {
 pub struct TargetTemplatePolicyV1 {
     /// Public template source path from the plan.
     pub source: String,
+    /// Required activation phase derived from every referenced secret.
+    pub phase: ActivationPhase,
     /// Strict placeholder-to-secret bindings.
     pub placeholders: BTreeMap<String, TemplatePlaceholder>,
     /// Runtime owner, group, mode, and service actions.
@@ -516,6 +518,7 @@ fn validate_templates(plan: &PlanV1) -> Result<(), PolicyError> {
                 )));
             }
         }
+        template_phase(plan, id, template)?;
         if !is_private_runtime_mode(&template.runtime.mode) {
             return Err(PolicyError::Violation(format!(
                 "template {id} runtime mode must be a nonzero owner-only four-digit octal mode"
@@ -530,6 +533,35 @@ fn validate_templates(plan: &PlanV1) -> Result<(), PolicyError> {
         }
     }
     Ok(())
+}
+
+fn template_phase(
+    plan: &PlanV1,
+    template_id: &Id,
+    template: &nix_seal_core::Template,
+) -> Result<ActivationPhase, PolicyError> {
+    let mut phases = template.placeholders.values().map(|placeholder| {
+        plan.secrets
+            .get(&placeholder.secret)
+            .map(|secret| secret.phase)
+            .ok_or_else(|| {
+                PolicyError::Violation(format!(
+                    "template {template_id} references missing secret {}",
+                    placeholder.secret
+                ))
+            })
+    });
+    let phase = phases.next().transpose()?.ok_or_else(|| {
+        PolicyError::Violation(format!("template {template_id} has no placeholders"))
+    })?;
+    for candidate in phases {
+        if candidate? != phase {
+            return Err(PolicyError::Violation(format!(
+                "template {template_id} references secrets from multiple activation phases"
+            )));
+        }
+    }
+    Ok(phase)
 }
 
 fn is_private_runtime_mode(value: &str) -> bool {
@@ -1067,7 +1099,7 @@ pub fn target_policy(plan: &PlanV1, target_id: &Id) -> Result<TargetPolicyV1, Po
                 TargetSecretPolicyV1 {
                     source: secret.source.clone(),
                     delivery: secret.delivery.clone(),
-                    phase: secret.phase.clone(),
+                    phase: secret.phase,
                     runtime: secret.runtime.clone(),
                     approval: target_approval_policy(plan, secret.approval_policy.as_ref())?,
                 },
@@ -1084,16 +1116,17 @@ pub fn target_policy(plan: &PlanV1, target_id: &Id) -> Result<TargetPolicyV1, Po
                 .all(|placeholder| secrets.contains_key(&placeholder.secret))
         })
         .map(|(template_id, template)| {
-            (
+            Ok((
                 template_id.clone(),
                 TargetTemplatePolicyV1 {
                     source: template.source.clone(),
+                    phase: template_phase(plan, template_id, template)?,
                     placeholders: template.placeholders.clone(),
                     runtime: template.runtime.clone(),
                 },
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<BTreeMap<_, _>, PolicyError>>()?;
     Ok(TargetPolicyV1 {
         schema: TARGET_POLICY_SCHEMA.to_owned(),
         plan_hash: plan_hash(plan)?,
@@ -1324,6 +1357,33 @@ mod tests {
         );
         validate(&plan)?;
 
+        let users_secret_id = Id::parse("db/users-password")
+            .map_err(|error| PolicyError::Violation(error.to_string()))?;
+        let mut users_secret = secret.clone();
+        users_secret.source = "secrets/db-users-password.age".to_owned();
+        users_secret.phase = ActivationPhase::Users;
+        plan.secrets.insert(users_secret_id.clone(), users_secret);
+        plan.templates
+            .values_mut()
+            .next()
+            .ok_or_else(|| PolicyError::Violation("template missing".to_owned()))?
+            .placeholders
+            .insert(
+                "users-password".to_owned(),
+                TemplatePlaceholder {
+                    secret: users_secret_id.clone(),
+                    encoding: TemplateEncoding::Utf8,
+                },
+            );
+        assert!(matches!(validate(&plan), Err(PolicyError::Violation(_))));
+        plan.secrets.remove(&users_secret_id);
+        plan.templates
+            .values_mut()
+            .next()
+            .ok_or_else(|| PolicyError::Violation("template missing".to_owned()))?
+            .placeholders
+            .remove("users-password");
+
         let missing_id = Id::parse("missing/secret")
             .map_err(|error| PolicyError::Violation(error.to_string()))?;
         plan.templates
@@ -1470,6 +1530,15 @@ mod tests {
         assert!(projection.secrets.contains_key(&authorized_id));
         assert!(!projection.secrets.contains_key(&inaccessible_id));
         assert_eq!(projection.templates.len(), 1);
+        assert_eq!(
+            projection
+                .templates
+                .values()
+                .next()
+                .ok_or_else(|| PolicyError::Violation("template missing".to_owned()))?
+                .phase,
+            ActivationPhase::Activation
+        );
         let approval = &projection
             .secrets
             .get(&authorized_id)

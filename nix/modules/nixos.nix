@@ -1,6 +1,7 @@
 self:
 { config, lib, ... }:
 let
+  cfg = config.nixSeal;
   credentialId = value: builtins.head (lib.splitString ":" (toString value));
   groupCredentials = lib.foldl' (
     grouped: binding:
@@ -9,6 +10,11 @@ let
     in
     grouped // { ${unit} = (grouped.${unit} or [ ]) ++ [ "${binding.name}:${binding.path}" ]; }
   ) { };
+  activate = spec: ''
+    ${lib.getExe cfg.package} activate \
+      --spec ${spec} \
+      --identity ${lib.escapeShellArg cfg.identityFile}
+  '';
 in
 {
   imports = [
@@ -45,14 +51,48 @@ in
         };
     })
   ];
-  config = lib.mkIf config.nixSeal.enable {
-    system.activationScripts.nixSeal = {
-      deps = [ ];
-      text = ''
-        ${lib.getExe config.nixSeal.package} activate \
-          --spec ${config.nixSeal.activationSpec} \
-          --identity ${lib.escapeShellArg config.nixSeal.identityFile}
-      '';
-    };
+  config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !(cfg.activationSpecs ? partitioning);
+        message = "nixSeal partitioning-phase secrets are not scheduled by generic NixOS activation; provision config.nixSeal.activationSpecs.partitioning over a protected installation channel";
+      }
+      {
+        assertion =
+          !(cfg.activationSpecs ? users)
+          || lib.all (secret: secret.owner == "root" && secret.group == "root") (
+            builtins.attrValues (lib.filterAttrs (_: secret: secret.phase == "users") cfg.secrets)
+          );
+        message = "nixSeal users-phase secrets must be owned by root:root until user accounts exist";
+      }
+      {
+        assertion =
+          !(cfg.activationSpecs ? users)
+          || lib.all (template: template.owner == "root" && template.group == "root") (
+            builtins.attrValues (lib.filterAttrs (_: template: template.phase == "users") cfg.templates)
+          );
+        message = "nixSeal users-phase templates must be owned by root:root until user accounts exist";
+      }
+    ];
+    system.activationScripts = lib.mkMerge [
+      (lib.mkIf (cfg.activationSpecs ? users) {
+        nixSealUsers = {
+          deps = [ "specialfs" ];
+          text = activate cfg.activationSpecs.users;
+        };
+      })
+      (lib.mkIf (cfg.activationSpecs ? activation) {
+        nixSeal = {
+          deps = [ "users" ];
+          text = activate cfg.activationSpecs.activation;
+        };
+      })
+      (lib.mkIf (cfg.activationSpecs ? services) {
+        nixSealServices = {
+          deps = if cfg.activationSpecs ? activation then [ "nixSeal" ] else [ "users" ];
+          text = activate cfg.activationSpecs.services;
+        };
+      })
+    ];
   };
 }

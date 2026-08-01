@@ -21,6 +21,18 @@ let
   idIsValid =
     value: builtins.match "[a-z0-9._-]+(/[a-z0-9._-]+)*" value != null && !lib.hasInfix ".." value;
   idType = types.addCheck types.str idIsValid;
+  activationPhaseType = types.enum [
+    "partitioning"
+    "users"
+    "activation"
+    "services"
+  ];
+  activationPhases = [
+    "partitioning"
+    "users"
+    "activation"
+    "services"
+  ];
   privateIdentityPathIsSafe = value: lib.hasPrefix "/" value && !(lib.hasPrefix "/nix/store/" value);
   unitType = types.strMatching "[A-Za-z0-9_.@:-]{1,256}";
   serviceUnitType = types.strMatching "[A-Za-z0-9_.@:-]{1,247}\\.service";
@@ -29,65 +41,103 @@ let
   );
   configuredSecrets = lib.filterAttrs (_: secret: secret.ciphertext != null) cfg.secrets;
   configuredTemplates = lib.filterAttrs (_: template: template.source != null) cfg.templates;
-  explicitReloadUnits = lib.unique (
-    lib.concatMap (item: item.reloadUnits) (
-      builtins.attrValues configuredSecrets ++ builtins.attrValues configuredTemplates
-    )
-  );
-  explicitRestartUnits = lib.unique (
-    lib.concatMap (item: item.restartUnits) (
-      builtins.attrValues configuredSecrets ++ builtins.attrValues configuredTemplates
-    )
-  );
-  serviceCredentialBindings = lib.concatMap (
-    secretId:
-    map (credential: {
-      inherit secretId;
-      inherit (credential) unit name;
-      path = cfg.secrets.${secretId}.path;
-    }) cfg.secrets.${secretId}.serviceCredentials
-  ) (builtins.attrNames configuredSecrets);
+  phaseRuntimeDirectory =
+    phase: if phase == "activation" then cfg.runtimeDirectory else "${cfg.runtimeDirectory}/${phase}";
+  configuredSecretsForPhase =
+    phase: lib.filterAttrs (_: secret: secret.phase == phase) configuredSecrets;
+  configuredTemplatesForPhase =
+    phase: lib.filterAttrs (_: template: template.phase == phase) configuredTemplates;
+  explicitReloadUnitsForPhase =
+    phase:
+    lib.unique (
+      lib.concatMap (item: item.reloadUnits) (
+        builtins.attrValues (configuredSecretsForPhase phase)
+        ++ builtins.attrValues (configuredTemplatesForPhase phase)
+      )
+    );
+  explicitRestartUnitsForPhase =
+    phase:
+    lib.unique (
+      lib.concatMap (item: item.restartUnits) (
+        builtins.attrValues (configuredSecretsForPhase phase)
+        ++ builtins.attrValues (configuredTemplatesForPhase phase)
+      )
+    );
+  serviceCredentialBindingsForPhase =
+    phase:
+    lib.concatMap (
+      secretId:
+      map (credential: {
+        inherit secretId;
+        inherit (credential) unit name;
+        path = cfg.secrets.${secretId}.path;
+      }) cfg.secrets.${secretId}.serviceCredentials
+    ) (builtins.attrNames (configuredSecretsForPhase phase));
+  serviceCredentialBindings = lib.concatMap serviceCredentialBindingsForPhase activationPhases;
   serviceCredentialKeys = map (binding: "${binding.unit}:${binding.name}") serviceCredentialBindings;
-  reloadUnits = explicitReloadUnits;
-  restartUnits = lib.unique (
-    explicitRestartUnits ++ map (binding: binding.unit) serviceCredentialBindings
-  );
-  activationDocument = {
-    schema = "nix-seal.activation.v2";
-    runtimeRoot = cfg.runtimeDirectory;
-    plan = toString cfg.planFile;
-    inherit (cfg) targetId;
-    inherit (cfg) allowedClockSkew;
-    artifacts = lib.mapAttrsToList (name: secret: {
-      ciphertext = toString secret.ciphertext;
-      envelope = toString secret.envelope;
-      secretId = name;
-      inherit (secret) sourceCiphertextHash;
-      inherit (secret) artifactGeneration;
-      inherit (secret) mode;
-      inherit (secret) owner;
-      inherit (secret) group;
-    }) configuredSecrets;
-    templates = lib.mapAttrsToList (name: template: {
-      source = toString template.source;
-      templateId = name;
-      placeholders = lib.mapAttrs (_: placeholder: {
-        secretId = placeholder.secret;
-        inherit (placeholder) encoding;
-      }) template.placeholders;
-      inherit (template) mode owner group;
-    }) configuredTemplates;
-    postSwitch =
-      if reloadUnits == [ ] && restartUnits == [ ] then
-        null
-      else
-        {
-          executable = serviceExecutable;
-          manager = serviceManager;
-          inherit reloadUnits restartUnits;
-          timeoutSeconds = cfg.serviceActionTimeout;
-        };
-  };
+  reloadUnitsForPhase = phase: explicitReloadUnitsForPhase phase;
+  restartUnitsForPhase =
+    phase:
+    lib.unique (
+      explicitRestartUnitsForPhase phase
+      ++ map (binding: binding.unit) (serviceCredentialBindingsForPhase phase)
+    );
+  reloadUnits = lib.concatMap reloadUnitsForPhase activationPhases;
+  restartUnits = lib.concatMap restartUnitsForPhase activationPhases;
+  activationDocumentFor =
+    phase:
+    let
+      secrets = configuredSecretsForPhase phase;
+      templates = configuredTemplatesForPhase phase;
+      reloadUnits = reloadUnitsForPhase phase;
+      restartUnits = restartUnitsForPhase phase;
+    in
+    {
+      schema = "nix-seal.activation.v2";
+      runtimeRoot = phaseRuntimeDirectory phase;
+      plan = toString cfg.planFile;
+      inherit (cfg) targetId;
+      inherit phase;
+      inherit (cfg) allowedClockSkew;
+      artifacts = lib.mapAttrsToList (name: secret: {
+        ciphertext = toString secret.ciphertext;
+        envelope = toString secret.envelope;
+        secretId = name;
+        inherit (secret) sourceCiphertextHash;
+        inherit (secret) artifactGeneration;
+        inherit (secret) phase;
+        inherit (secret) mode;
+        inherit (secret) owner;
+        inherit (secret) group;
+      }) secrets;
+      templates = lib.mapAttrsToList (name: template: {
+        source = toString template.source;
+        templateId = name;
+        placeholders = lib.mapAttrs (_: placeholder: {
+          secretId = placeholder.secret;
+          inherit (placeholder) encoding;
+        }) template.placeholders;
+        inherit (template) phase;
+        inherit (template) mode owner group;
+      }) templates;
+      postSwitch =
+        if reloadUnits == [ ] && restartUnits == [ ] then
+          null
+        else
+          {
+            executable = serviceExecutable;
+            manager = serviceManager;
+            inherit reloadUnits restartUnits;
+            timeoutSeconds = cfg.serviceActionTimeout;
+          };
+    };
+  activationDocument = activationDocumentFor "activation";
+  activationSpecFor =
+    phase:
+    pkgs.writeText "nix-seal-activation-v2-${phase}.json" (
+      builtins.toJSON (activationDocumentFor phase)
+    );
+  configuredPhases = lib.filter (phase: configuredSecretsForPhase phase != { }) activationPhases;
 in
 {
   options.nixSeal = {
@@ -137,8 +187,13 @@ in
               path = mkOption {
                 type = types.str;
                 readOnly = true;
-                default = "${runtimeDirectory}/current/${name}";
+                default = "${phaseRuntimeDirectory config.nixSeal.secrets.${name}.phase}/current/${name}";
                 description = "Runtime path of the activated secret.";
+              };
+              phase = mkOption {
+                type = activationPhaseType;
+                default = "activation";
+                description = "Activation generation that materializes this secret.";
               };
               owner = mkOption {
                 type = types.str;
@@ -223,8 +278,15 @@ in
               path = mkOption {
                 type = types.str;
                 readOnly = true;
-                default = "${runtimeDirectory}/current/templates/${name}";
+                default = "${
+                  phaseRuntimeDirectory config.nixSeal.templates.${name}.phase
+                }/current/templates/${name}";
                 description = "Runtime path of the atomically rendered template.";
+              };
+              phase = mkOption {
+                type = activationPhaseType;
+                default = "activation";
+                description = "Activation generation that renders this template.";
               };
               source = mkOption {
                 type = types.nullOr types.path;
@@ -291,6 +353,12 @@ in
       readOnly = true;
       default = pkgs.writeText "nix-seal-activation-v2.json" (builtins.toJSON activationDocument);
       description = "Strict public activation document consumed by the Rust runtime.";
+    };
+    activationSpecs = mkOption {
+      type = types.attrsOf types.path;
+      readOnly = true;
+      default = lib.genAttrs configuredPhases activationSpecFor;
+      description = "Strict phase-isolated activation documents consumed by the Rust runtime.";
     };
   };
 
@@ -366,6 +434,17 @@ in
             message = "every nixSeal template placeholder must reference a configured secret";
           }
           {
+            assertion = lib.all (
+              template:
+              lib.all (
+                placeholder:
+                builtins.hasAttr placeholder.secret configuredSecrets
+                && cfg.secrets.${placeholder.secret}.phase == template.phase
+              ) (builtins.attrValues template.placeholders)
+            ) (builtins.attrValues configuredTemplates);
+            message = "every nixSeal template may reference secrets from exactly its own activation phase";
+          }
+          {
             assertion =
               lib.intersectLists (builtins.attrNames configuredSecrets) (
                 map (name: "templates/${name}") (builtins.attrNames configuredTemplates)
@@ -378,7 +457,9 @@ in
             message = "nixSeal reloadUnits are unsupported by launchd; use restartUnits";
           }
           {
-            assertion = lib.intersectLists reloadUnits restartUnits == [ ];
+            assertion = lib.all (
+              phase: lib.intersectLists (reloadUnitsForPhase phase) (restartUnitsForPhase phase) == [ ]
+            ) configuredPhases;
             message = "a nixSeal unit cannot appear in both reloadUnits and restartUnits";
           }
           {

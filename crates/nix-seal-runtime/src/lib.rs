@@ -2,7 +2,7 @@
 //! Authenticated, transactional runtime activation primitives.
 
 use fs2::FileExt;
-use nix_seal_core::Id;
+use nix_seal_core::{ActivationPhase, Id};
 use nix_seal_manifest::{ExpectedBinding, SignedEnvelopeV1, TrustedKeys};
 use schemars::JsonSchema;
 use secrecy::SecretString;
@@ -42,6 +42,9 @@ pub struct ActivationSpecV2 {
     pub plan: PathBuf,
     /// Exact target binding.
     pub target_id: Id,
+    /// Phase materialized by this isolated generation directory.
+    #[serde(default = "default_activation_phase")]
+    pub phase: ActivationPhase,
     /// Maximum accepted issue-time lead.
     #[serde(default = "default_clock_skew")]
     pub allowed_clock_skew: u64,
@@ -99,6 +102,9 @@ pub struct ActivationArtifactSpecV2 {
     pub envelope: PathBuf,
     /// Signed secret and runtime destination ID.
     pub secret_id: Id,
+    /// Required canonical activation phase for this secret.
+    #[serde(default = "default_activation_phase")]
+    pub phase: ActivationPhase,
     /// Expected canonical source ciphertext hash.
     pub source_ciphertext_hash: String,
     /// Exact artifact generation.
@@ -119,6 +125,9 @@ pub struct ActivationTemplateSpecV1 {
     pub source: PathBuf,
     /// Public template ID; output is `templates/<template_id>` in a generation.
     pub template_id: Id,
+    /// Phase derived from every referenced secret.
+    #[serde(default = "default_activation_phase")]
+    pub phase: ActivationPhase,
     /// Strict placeholder declarations keyed by placeholder name.
     pub placeholders: BTreeMap<String, TemplatePlaceholderSpecV1>,
     /// Restrictive octal mode such as `0400`.
@@ -169,6 +178,10 @@ const fn default_clock_skew() -> u64 {
     300
 }
 
+const fn default_activation_phase() -> ActivationPhase {
+    ActivationPhase::Activation
+}
+
 const fn default_action_timeout() -> u64 {
     30
 }
@@ -192,6 +205,7 @@ impl ActivationSpecV2 {
         for artifact in &self.artifacts {
             if !artifact.ciphertext.is_absolute()
                 || !artifact.envelope.is_absolute()
+                || artifact.phase != self.phase
                 || !is_digest(&artifact.source_ciphertext_hash)
                 || artifact.artifact_generation == 0
                 || !destinations.insert(artifact.secret_id.as_str().to_owned())
@@ -206,6 +220,7 @@ impl ActivationSpecV2 {
         for template in &self.templates {
             let destination = template_output_id(&template.template_id)?;
             if !template.source.is_absolute()
+                || template.phase != self.phase
                 || !destinations.insert(destination.as_str().to_owned())
                 || template.placeholders.is_empty()
                 || template.placeholders.len() > 256
@@ -1994,6 +2009,7 @@ mod tests {
             ciphertext: fixture.ciphertext.clone(),
             envelope: fixture.envelope.clone(),
             secret_id: fixture.secret_id.clone(),
+            phase: ActivationPhase::Activation,
             source_ciphertext_hash: SOURCE_HASH.to_owned(),
             artifact_generation: 1,
             mode: "0400".to_owned(),
@@ -2003,6 +2019,7 @@ mod tests {
         let template = ActivationTemplateSpecV1 {
             source: fixture.temporary.path().join("public-template"),
             template_id: Id::parse("application/config")?,
+            phase: ActivationPhase::Activation,
             placeholders: BTreeMap::from([(
                 "password".to_owned(),
                 TemplatePlaceholderSpecV1 {
@@ -2020,6 +2037,7 @@ mod tests {
             runtime_generation: None,
             plan: fixture.temporary.path().join("plan.v1.json"),
             target_id: fixture.target_id,
+            phase: ActivationPhase::Activation,
             allowed_clock_skew: 300,
             artifacts: vec![artifact.clone()],
             templates: vec![template],
@@ -2030,6 +2048,18 @@ mod tests {
         duplicate.artifacts.push(artifact);
         assert!(matches!(
             duplicate.validate(),
+            Err(RuntimeError::InvalidSpec)
+        ));
+        let mut phase_mismatch = spec.clone();
+        phase_mismatch.artifacts[0].phase = ActivationPhase::Users;
+        assert!(matches!(
+            phase_mismatch.validate(),
+            Err(RuntimeError::InvalidSpec)
+        ));
+        let mut template_phase_mismatch = spec.clone();
+        template_phase_mismatch.templates[0].phase = ActivationPhase::Services;
+        assert!(matches!(
+            template_phase_mismatch.validate(),
             Err(RuntimeError::InvalidSpec)
         ));
         let mut output_collision = spec.clone();
