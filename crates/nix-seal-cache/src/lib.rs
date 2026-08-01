@@ -769,28 +769,7 @@ fn checked_transfer_bytes(total: u64, additional: u64) -> Result<u64, CacheError
 fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), CacheError> {
     #[cfg(unix)]
     {
-        use rustix::fs::{RenameFlags, renameat_with};
-
-        let source_parent = source.parent().ok_or(CacheError::UnsafeMetadata)?;
-        let source_name = source.file_name().ok_or(CacheError::UnsafeMetadata)?;
-        let destination_parent = destination.parent().ok_or(CacheError::UnsafeMetadata)?;
-        let destination_name = destination.file_name().ok_or(CacheError::UnsafeMetadata)?;
-        let source_directory = open_directory_nofollow(source_parent)?;
-        let destination_directory = open_directory_nofollow(destination_parent)?;
-        renameat_with(
-            &source_directory,
-            source_name,
-            &destination_directory,
-            destination_name,
-            RenameFlags::NOREPLACE,
-        )
-        .map_err(|error| {
-            if error == rustix::io::Errno::EXIST {
-                CacheError::DestinationExists
-            } else {
-                CacheError::Io(error.into())
-            }
-        })
+        rename_noreplace_impl(source, destination, || {})
     }
     #[cfg(not(unix))]
     {
@@ -805,6 +784,37 @@ fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), CacheError>
             Err(error) => Err(CacheError::Io(error)),
         }
     }
+}
+
+#[cfg(unix)]
+fn rename_noreplace_impl<F: FnOnce()>(
+    source: &Path,
+    destination: &Path,
+    after_open: F,
+) -> Result<(), CacheError> {
+    use rustix::fs::{RenameFlags, renameat_with};
+
+    let source_parent = source.parent().ok_or(CacheError::UnsafeMetadata)?;
+    let source_name = source.file_name().ok_or(CacheError::UnsafeMetadata)?;
+    let destination_parent = destination.parent().ok_or(CacheError::UnsafeMetadata)?;
+    let destination_name = destination.file_name().ok_or(CacheError::UnsafeMetadata)?;
+    let source_directory = open_directory_nofollow(source_parent)?;
+    let destination_directory = open_directory_nofollow(destination_parent)?;
+    after_open();
+    renameat_with(
+        &source_directory,
+        source_name,
+        &destination_directory,
+        destination_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| {
+        if error == rustix::io::Errno::EXIST {
+            CacheError::DestinationExists
+        } else {
+            CacheError::Io(error.into())
+        }
+    })
 }
 
 fn read_directory_if_present(path: &Path) -> Result<Option<std::fs::ReadDir>, CacheError> {
@@ -1458,6 +1468,44 @@ mod tests {
         ));
         assert_eq!(std::fs::read(destination.join("old"))?, b"old");
         assert_eq!(std::fs::read(source.join("new"))?, b"new");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_replace_publication_survives_parent_symlink_substitution() -> Result<(), CacheError> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let staging = temporary.path().join("staging");
+        let publish = temporary.path().join("publish");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&staging)?;
+        std::fs::create_dir(&publish)?;
+        std::fs::create_dir(&outside)?;
+        std::fs::write(outside.join("sentinel"), b"must remain unchanged")?;
+
+        let source = staging.join("entry");
+        let destination = publish.join("entry");
+        std::fs::create_dir(&source)?;
+        std::fs::write(source.join("new"), b"new")?;
+        let publish_real = temporary.path().join("publish-real");
+
+        let result = rename_noreplace_impl(&source, &destination, || {
+            // This is the attacker-controlled substitution race: both
+            // directory descriptors have already been opened, so the
+            // descriptor-relative rename must still target the original
+            // directory rather than following this replacement symlink.
+            std::fs::rename(&publish, &publish_real).expect("rename publish parent");
+            symlink(&outside, &publish).expect("replace publish parent with symlink");
+        });
+        assert!(result.is_ok());
+        assert_eq!(
+            std::fs::read(outside.join("sentinel"))?,
+            b"must remain unchanged"
+        );
+        assert!(!outside.join("entry").exists());
+        assert_eq!(std::fs::read(publish_real.join("entry/new"))?, b"new");
         Ok(())
     }
 

@@ -37,10 +37,13 @@ creation, rejecting a symlink at the configured root while resolving normal
 platform aliases such as macOS `/var`; export destinations apply the same rule
 to their parent and publish with an atomic no-replace rename. Artifact bundle
 publication uses the same primitive, so a destination substituted after the
-initial existence check cannot be overwritten. This prevents a symlinked
-spelling from silently redirecting cache state while preserving portable cache
-locations. Inventory validates each content hash, artifact bundle name, exact
-bundle member set, byte bound, and private metadata before reporting aggregate
+initial existence check cannot be overwritten. A regression test swaps the
+destination parent for a symlink after both directory descriptors are open and
+verifies that the descriptor-relative rename still writes only to the original
+directory. This prevents a symlinked spelling from silently redirecting cache
+state while preserving portable cache locations. Inventory validates each
+content hash, artifact bundle name, exact bundle member set, byte bound, and
+private metadata before reporting aggregate
 counts. This deliberately makes `cache status` fail on unexpected cache
 mutations instead of presenting a misleading count. Cache lifecycle operations
 build on this verified inventory.
