@@ -1054,7 +1054,10 @@ body\n\
         let temporary = tempfile::tempdir()?;
         let identity_path = temporary.path().join("identity.txt");
         let (identity, recipient) = generate_x25519();
-        std::fs::write(&identity_path, identity.expose_secret())?;
+        let mut identity_file = identity.expose_secret().as_bytes().to_vec();
+        identity_file.push(b'\n');
+        std::fs::write(&identity_path, &identity_file)?;
+        identity_file.fill(0);
         let private_permissions = std::fs::Permissions::from_mode(0o600);
         std::fs::set_permissions(&identity_path, private_permissions)?;
         let plaintext = b"nix-seal-age-interop-canary";
@@ -1072,13 +1075,17 @@ body\n\
                     &["-d", "-i"],
                     &[identity_path.as_os_str()],
                     &ciphertext
-                )?,
+                )
+                .map_err(|error| format!("external {binary} decrypt failed: {error}"))?,
                 plaintext
             );
 
-            let externally_encrypted = invoke(binary, &["-r"], &[recipient.as_ref()], plaintext)?;
+            let externally_encrypted = invoke(binary, &["-r"], &[recipient.as_ref()], plaintext)
+                .map_err(|error| format!("external {binary} encrypt failed: {error}"))?;
             let mut decrypted = Vec::new();
-            decrypt(externally_encrypted.as_slice(), &mut decrypted, &identity)?;
+            decrypt(externally_encrypted.as_slice(), &mut decrypted, &identity).map_err(
+                |error| format!("native decrypt of external {binary} ciphertext failed: {error}"),
+            )?;
             assert_eq!(decrypted, plaintext);
         }
         Ok(())
@@ -1114,7 +1121,7 @@ body\n\
             .args(trailing_arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()?;
         child
             .stdin
@@ -1123,7 +1130,17 @@ body\n\
             .write_all(input)?;
         let output = child.wait_with_output()?;
         if !output.status.success() {
-            return Err(format!("interoperability command failed: {binary}").into());
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "interoperability command failed: {binary} ({}){}",
+                output.status,
+                if diagnostic.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {diagnostic}")
+                }
+            )
+            .into());
         }
         Ok(output.stdout)
     }

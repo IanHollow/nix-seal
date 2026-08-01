@@ -1,15 +1,18 @@
 # ADR 0005: Plugins and generators
 
-Status: accepted; standard age plugin worker and hardened generator prompts
-implemented
+Status: accepted; standard age plugin worker, hardened generator prompts, and
+Linux generator network-isolation worker implemented
 
 Age identities use the standard plugin protocol. Generators are built-in Rust or
 direct declared executables from Nix packages; no shell evaluation. Processes
 receive a sanitized environment, explicit descriptors and secret dependencies,
 private workspace, time/output bounds, and network isolation when enforceable.
-The current release cannot enforce generator network isolation and emits a
-diagnostic warning for every external-generator invocation; generators and
-declared runtime inputs must therefore be treated as trusted code. On Unix,
+On Linux, nix-seal attempts generator network isolation in a dedicated Rust
+worker by creating a fresh network namespace before launching the executable. If
+the kernel or container denies that operation, it falls back once to the direct
+process-group path and emits a diagnostic warning. macOS and other platforms
+emit the capability warning because network isolation is unavailable. Generators
+and declared runtime inputs must therefore be treated as trusted code. On Unix,
 nix-seal places generators and migration helpers in a dedicated process group so
 timeout and failure cleanup terminates descendants that could otherwise retain
 access to staged plaintext; other platforms retain direct child termination as

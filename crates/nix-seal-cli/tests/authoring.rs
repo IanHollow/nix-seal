@@ -190,6 +190,51 @@ fn plan_directed_delete_is_explicit_and_recoverable() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn production_generator_worker_emits_a_bounded_isolation_status()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let workspace = temporary.path().join("workspace");
+    let outputs = workspace.join("outputs");
+    let public_outputs = workspace.join("public-outputs");
+    let prompts = workspace.join("prompts");
+    let secrets = workspace.join("secrets");
+    for directory in [&workspace, &outputs, &public_outputs, &prompts, &secrets] {
+        std::fs::create_dir(directory)?;
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_nix-seal"))
+        .arg("__generator-worker")
+        .arg("--executable")
+        .arg(env!("CARGO_BIN_EXE_nix-seal"))
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--output-directory")
+        .arg(&outputs)
+        .arg("--public-output-directory")
+        .arg(&public_outputs)
+        .arg("--prompt-directory")
+        .arg(&prompts)
+        .arg("--prompt-count")
+        .arg("0")
+        .arg("--secret-directory")
+        .arg(&secrets)
+        .arg("--secret-count")
+        .arg("0")
+        .arg("--output-count")
+        .arg("0")
+        .arg("--public-output-count")
+        .arg("0")
+        .env_clear()
+        .env("NIX_SEAL_GENERATOR_WORKER", "1")
+        .output()?;
+    let magic = b"nix-seal-generator-worker-v1\n";
+    assert!(output.stdout.starts_with(magic));
+    assert_eq!(output.stdout.len(), magic.len() + 1);
+    assert!(matches!(output.stdout.last(), Some(0 | 1)));
+    Ok(())
+}
+
 struct Fixture {
     _temporary: tempfile::TempDir,
     root: PathBuf,

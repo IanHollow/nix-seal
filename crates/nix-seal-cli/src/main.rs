@@ -15,6 +15,7 @@ use fs2::FileExt;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -27,6 +28,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 const EXTERNAL_MIGRATION_MAX_PLAINTEXT_BYTES: u64 = 64 * 1024 * 1024;
 const EXTERNAL_MIGRATION_TIMEOUT: Duration = Duration::from_mins(2);
+#[cfg_attr(any(not(target_os = "linux"), test), allow(dead_code))]
+const GENERATOR_WORKER_MAGIC: &[u8] = b"nix-seal-generator-worker-v1\n";
+#[cfg_attr(any(not(target_os = "linux"), test), allow(dead_code))]
+const GENERATOR_WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const PASSPHRASE_WORDS: [&str; 64] = [
     "amber", "anchor", "april", "arch", "aspen", "atlas", "aurora", "bamboo", "beacon", "birch",
     "blue", "brisk", "canyon", "cedar", "cinder", "cobalt", "comet", "coral", "crystal", "dawn",
@@ -192,6 +197,9 @@ enum Command {
     /// Internal isolated age-plugin worker. This is not a stable user command.
     #[command(name = "__plugin-worker", hide = true)]
     PluginWorker,
+    /// Internal Linux network-isolation worker. This is not a stable user command.
+    #[command(name = "__generator-worker", hide = true)]
+    GeneratorWorker(GeneratorWorkerArgs),
     /// Secret authoring operations.
     #[command(subcommand)]
     Secret(SecretCommand),
@@ -499,6 +507,46 @@ struct GenerateArgs {
     /// explicit because interactive input is never appropriate for automation.
     #[arg(long)]
     interactive: bool,
+}
+
+#[derive(Args)]
+struct GeneratorWorkerArgs {
+    /// Absolute declared generator executable.
+    #[arg(long)]
+    executable: PathBuf,
+    /// One public argument passed directly to the declared executable.
+    #[arg(long = "generator-arg", allow_hyphen_values = true)]
+    generator_args: Vec<OsString>,
+    /// Sanitized runtime-input PATH assembled by the parent.
+    #[arg(long)]
+    runtime_path: Option<OsString>,
+    /// Private generator workspace.
+    #[arg(long)]
+    workspace: PathBuf,
+    /// Private secret output directory.
+    #[arg(long)]
+    output_directory: PathBuf,
+    /// Private public output directory.
+    #[arg(long)]
+    public_output_directory: PathBuf,
+    /// Private prompt directory.
+    #[arg(long)]
+    prompt_directory: PathBuf,
+    /// Number of declared prompt files.
+    #[arg(long)]
+    prompt_count: usize,
+    /// Private canonical-secret dependency directory.
+    #[arg(long)]
+    secret_directory: PathBuf,
+    /// Number of declared secret dependencies.
+    #[arg(long)]
+    secret_count: usize,
+    /// Number of secret outputs.
+    #[arg(long)]
+    output_count: usize,
+    /// Number of public outputs.
+    #[arg(long)]
+    public_output_count: usize,
 }
 
 #[derive(Args)]
@@ -879,6 +927,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Generate(arguments) => run_generate(&arguments, cli.json)?,
         Command::Activate(arguments) => run_activate(&arguments, cli.json)?,
         Command::PluginWorker => run_plugin_worker()?,
+        Command::GeneratorWorker(arguments) => run_generator_worker_main(&arguments)?,
         Command::Secret(command) => run_secret(command, cli.json)?,
         Command::Rotate(arguments) => run_secret_write(
             &arguments,
@@ -4775,9 +4824,6 @@ fn generate_external_values(
     prompts: &[SecretBox<Vec<u8>>],
     secret_inputs: GeneratorSecretInputs<'_>,
 ) -> Result<GeneratedValues> {
-    eprintln!(
-        "warning: network isolation is not enforced for this external generator; trust the declared executable and runtime inputs"
-    );
     let workspace = tempfile::Builder::new()
         .prefix("nix-seal-generator-")
         .tempdir()
@@ -4813,35 +4859,19 @@ fn generate_external_values(
             .map(|input| Path::new(input).join("bin")),
     )
     .context("generator runtime inputs cannot form a safe PATH")?;
-    let mut command = ProcessCommand::new(&generator.executable);
-    command
-        .args(&generator.arguments)
-        .env_clear()
-        .env("PATH", runtime_path)
-        .env("HOME", workspace.path())
-        .env("TMPDIR", workspace.path())
-        .env("NIX_SEAL_OUTPUT_DIR", &output_directory)
-        .env("NIX_SEAL_OUTPUT_COUNT", generator.outputs.len().to_string())
-        .env("NIX_SEAL_PUBLIC_OUTPUT_DIR", &public_output_directory)
-        .env(
-            "NIX_SEAL_PUBLIC_OUTPUT_COUNT",
-            generator.public_outputs.len().to_string(),
-        )
-        .env("NIX_SEAL_PROMPT_DIR", &prompt_directory)
-        .env("NIX_SEAL_PROMPT_COUNT", prompts.len().to_string())
-        .env("NIX_SEAL_SECRET_DIR", &secret_directory)
-        .env(
-            "NIX_SEAL_SECRET_COUNT",
-            generator.secret_dependencies.len().to_string(),
-        )
-        .current_dir(workspace.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    isolate_child_process_group(&mut command);
-    let mut child = command
-        .spawn()
-        .context("could not start constrained generator")?;
+    let layout = GeneratorExecutionLayout {
+        runtime_path: &runtime_path,
+        workspace: workspace.path(),
+        output_directory: &output_directory,
+        public_output_directory: &public_output_directory,
+        prompt_directory: &prompt_directory,
+        prompt_count: prompts.len(),
+        secret_directory: &secret_directory,
+        secret_count: generator.secret_dependencies.len(),
+        output_count: generator.outputs.len(),
+        public_output_count: generator.public_outputs.len(),
+    };
+    let mut child = spawn_external_generator(generator, &layout)?;
     let deadline = Instant::now() + Duration::from_secs(u64::from(generator.timeout_seconds));
     loop {
         match child
@@ -4918,6 +4948,181 @@ fn generate_external_values(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(GeneratedValues { secrets, public })
+}
+
+struct GeneratorExecutionLayout<'a> {
+    runtime_path: &'a OsStr,
+    workspace: &'a Path,
+    output_directory: &'a Path,
+    public_output_directory: &'a Path,
+    prompt_directory: &'a Path,
+    prompt_count: usize,
+    secret_directory: &'a Path,
+    secret_count: usize,
+    output_count: usize,
+    public_output_count: usize,
+}
+
+fn build_external_generator_command(
+    executable: &Path,
+    generator_args: &[OsString],
+    layout: &GeneratorExecutionLayout<'_>,
+) -> ProcessCommand {
+    let mut command = ProcessCommand::new(executable);
+    command
+        .args(generator_args)
+        .env_clear()
+        .env("PATH", layout.runtime_path)
+        .env("HOME", layout.workspace)
+        .env("TMPDIR", layout.workspace)
+        .env("NIX_SEAL_OUTPUT_DIR", layout.output_directory)
+        .env("NIX_SEAL_OUTPUT_COUNT", layout.output_count.to_string())
+        .env("NIX_SEAL_PUBLIC_OUTPUT_DIR", layout.public_output_directory)
+        .env(
+            "NIX_SEAL_PUBLIC_OUTPUT_COUNT",
+            layout.public_output_count.to_string(),
+        )
+        .env("NIX_SEAL_PROMPT_DIR", layout.prompt_directory)
+        .env("NIX_SEAL_PROMPT_COUNT", layout.prompt_count.to_string())
+        .env("NIX_SEAL_SECRET_DIR", layout.secret_directory)
+        .env("NIX_SEAL_SECRET_COUNT", layout.secret_count.to_string())
+        .current_dir(layout.workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+#[allow(clippy::too_many_lines)]
+fn spawn_external_generator(
+    generator: &nix_seal_core::Generator,
+    layout: &GeneratorExecutionLayout<'_>,
+) -> Result<Child> {
+    let generator_args = generator
+        .arguments
+        .iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    #[cfg(all(target_os = "linux", not(test)))]
+    {
+        let worker_executable = std::env::current_exe()
+            .context("could not locate nix-seal generator worker")?
+            .canonicalize()
+            .context("could not canonicalize nix-seal generator worker")?;
+        let mut worker = ProcessCommand::new(worker_executable);
+        worker
+            .arg("__generator-worker")
+            .arg("--executable")
+            .arg(&generator.executable)
+            .arg("--workspace")
+            .arg(layout.workspace)
+            .arg("--output-directory")
+            .arg(layout.output_directory)
+            .arg("--public-output-directory")
+            .arg(layout.public_output_directory)
+            .arg("--prompt-directory")
+            .arg(layout.prompt_directory)
+            .arg("--prompt-count")
+            .arg(layout.prompt_count.to_string())
+            .arg("--secret-directory")
+            .arg(layout.secret_directory)
+            .arg("--secret-count")
+            .arg(generator.secret_dependencies.len().to_string())
+            .arg("--output-count")
+            .arg(generator.outputs.len().to_string())
+            .arg("--public-output-count")
+            .arg(generator.public_outputs.len().to_string());
+        if !layout.runtime_path.is_empty() {
+            worker.arg("--runtime-path").arg(layout.runtime_path);
+        }
+        for argument in &generator_args {
+            worker.arg("--generator-arg").arg(argument);
+        }
+        worker
+            .env_clear()
+            .env("NIX_SEAL_GENERATOR_WORKER", "1")
+            .current_dir(layout.workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        isolate_child_process_group(&mut worker);
+        let mut child = worker
+            .spawn()
+            .context("could not start constrained generator isolation worker")?;
+        let Some(mut status) = child.stdout.take() else {
+            terminate_child_process_tree(&mut child);
+            bail!("generator isolation worker did not provide a status pipe");
+        };
+        let (status_tx, status_rx) = mpsc::sync_channel(1);
+        let status_reader = thread::spawn(move || {
+            let mut marker = vec![0_u8; GENERATOR_WORKER_MAGIC.len() + 1];
+            let result = status
+                .read_exact(&mut marker)
+                .map(|()| marker)
+                .map_err(|_| ());
+            let _ = status_tx.send(result);
+        });
+        let marker = match status_rx.recv_timeout(GENERATOR_WORKER_STARTUP_TIMEOUT) {
+            Ok(Ok(marker))
+                if marker[..GENERATOR_WORKER_MAGIC.len()] == GENERATOR_WORKER_MAGIC[..] =>
+            {
+                let _ = status_reader.join();
+                marker
+            }
+            Ok(Ok(_)) | Ok(Err(())) => {
+                terminate_child_process_tree(&mut child);
+                let _ = status_reader.join();
+                bail!("generator isolation worker returned an invalid status");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                terminate_child_process_tree(&mut child);
+                let _ = status_reader.join();
+                bail!("generator isolation worker startup timed out");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                terminate_child_process_tree(&mut child);
+                let _ = status_reader.join();
+                bail!("generator isolation worker returned no status");
+            }
+        };
+        match marker[GENERATOR_WORKER_MAGIC.len()] {
+            1 => Ok(child),
+            0 => {
+                terminate_child_process_tree(&mut child);
+                eprintln!(
+                    "warning: Linux network isolation was unavailable for this external generator; trust the declared executable and runtime inputs"
+                );
+                let mut direct = build_external_generator_command(
+                    Path::new(&generator.executable),
+                    &generator_args,
+                    layout,
+                );
+                isolate_child_process_group(&mut direct);
+                direct
+                    .spawn()
+                    .context("could not start constrained generator")
+            }
+            _ => {
+                terminate_child_process_tree(&mut child);
+                bail!("generator isolation worker returned an invalid status");
+            }
+        }
+    }
+    #[cfg(any(not(target_os = "linux"), test))]
+    {
+        eprintln!(
+            "warning: network isolation is unavailable on this platform for this external generator; trust the declared executable and runtime inputs"
+        );
+        let mut direct = build_external_generator_command(
+            Path::new(&generator.executable),
+            &generator_args,
+            layout,
+        );
+        isolate_child_process_group(&mut direct);
+        direct
+            .spawn()
+            .context("could not start constrained generator")
+    }
 }
 
 fn materialize_generator_secret_dependencies(
@@ -5588,6 +5793,64 @@ fn run_plugin_worker() -> Result<()> {
     }
     nix_seal_crypto::run_plugin_worker_protocol(std::io::stdin().lock(), std::io::stdout().lock())
         .map_err(anyhow::Error::from)
+}
+
+fn run_generator_worker_main(arguments: &GeneratorWorkerArgs) -> Result<()> {
+    if std::env::var_os("NIX_SEAL_GENERATOR_WORKER").as_deref() != Some(OsStr::new("1")) {
+        bail!("internal generator worker may only be launched by nix-seal");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let isolated = {
+            #[allow(deprecated)]
+            {
+                rustix::thread::unshare(rustix::thread::UnshareFlags::NEWNET).is_ok()
+            }
+        };
+        let mut status = std::io::stdout().lock();
+        status.write_all(GENERATOR_WORKER_MAGIC)?;
+        status.write_all(&[u8::from(isolated)])?;
+        status.flush()?;
+        drop(status);
+        if !isolated {
+            return Ok(());
+        }
+        let executable = resolve_external_executable(&arguments.executable)?;
+        let runtime_path = arguments
+            .runtime_path
+            .as_deref()
+            .unwrap_or_else(|| OsStr::new(""));
+        let layout = GeneratorExecutionLayout {
+            runtime_path,
+            workspace: &arguments.workspace,
+            output_directory: &arguments.output_directory,
+            public_output_directory: &arguments.public_output_directory,
+            prompt_directory: &arguments.prompt_directory,
+            prompt_count: arguments.prompt_count,
+            secret_directory: &arguments.secret_directory,
+            secret_count: arguments.secret_count,
+            output_count: arguments.output_count,
+            public_output_count: arguments.public_output_count,
+        };
+        let mut command =
+            build_external_generator_command(&executable, &arguments.generator_args, &layout);
+        let mut child = command
+            .spawn()
+            .context("could not start constrained generator")?;
+        let status = child
+            .wait()
+            .context("could not observe constrained generator")?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("constrained generator failed")
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = arguments;
+        bail!("generator network isolation is unavailable on this platform")
+    }
 }
 
 fn ensure_identity_matches_recipient(

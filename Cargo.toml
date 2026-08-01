@@ -42,7 +42,7 @@ nix-seal-manifest = { path = "crates/nix-seal-manifest", version = "=0.1.0-alpha
 nix-seal-policy = { path = "crates/nix-seal-policy", version = "=0.1.0-alpha.1" }
 nix-seal-rekey = { path = "crates/nix-seal-rekey", version = "=0.1.0-alpha.1" }
 nix-seal-runtime = { path = "crates/nix-seal-runtime", version = "=0.1.0-alpha.1" }
-rustix = { version = "=1.1.4", features = ["fs", "process", "termios"] }
+rustix = { version = "=1.1.4", features = ["fs", "process", "termios", "thread"] }
 schemars = "1.0.4"
 secrecy = "0.10.3"
 serde = { version = "1.0.219", features = ["derive"] }

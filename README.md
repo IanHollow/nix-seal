@@ -187,7 +187,8 @@ slice provides strict plan parsing and validation, canonical plan hashing,
 native age X25519 encryption/decryption, signed target artifacts, transactional
 ciphertext cache writes, authenticated atomic activation, ownership-aware
 generation changes, activation-time secret templates, post-switch service
-coordination, isolated standard age-plugin operations, JSON Schema output, and
+coordination, isolated standard age-plugin operations, Linux generator network
+namespace isolation with capability fallback, JSON Schema output, and
 NixOS/nix-darwin/Home Manager modules. See [SPEC.md](SPEC.md) and
 [ROADMAP.md](ROADMAP.md) before relying on it.
 
@@ -453,9 +454,13 @@ cannot receive secret dependencies. No undeclared canonical secret is decrypted
 for the generator, and the private workspace is removed whether generation
 succeeds or fails. If an input is itself produced by another generator, that
 producer must be a direct entry in `dependencies`, making generation order
-explicit and checkable. This release does not enforce network isolation for
-external generators; each invocation emits a diagnostic warning, so generators
-and their declared runtime inputs must be treated as trusted code.
+explicit and checkable. On Linux, nix-seal launches the generator through a Rust
+worker that attempts a fresh network namespace before execution. If the kernel
+or container denies that operation, nix-seal falls back once to the direct
+process-group path and emits a diagnostic warning. macOS and other platforms
+emit the same capability warning because network isolation is not available
+there; generators and their declared runtime inputs must always be treated as
+trusted code.
 
 Set a secret's `repositoryOnly` policy bit for an intermediary output that must
 remain administrator/recovery-encrypted in the repository and cache but must

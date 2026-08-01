@@ -37,10 +37,12 @@ logs, and CI. External processes receive a minimal environment, explicit file
 descriptors, deadlines, output bounds, and the least required secret set.
 Generator prompt input is non-interactive by default. Explicit interactive input
 uses only a verified controlling terminal, masks hidden values with guaranteed
-terminal-mode restoration, bounds bytes, and zeroizes transient read buffers.
-The current release does not enforce network isolation for external generators;
-it warns at invocation and treats their executables and declared runtime inputs
-as trusted code.
+terminal-mode restoration, bounds bytes, and zeroizes transient read buffers. On
+Linux, a Rust worker attempts a fresh network namespace before launching an
+external generator. If the kernel or container denies that operation, execution
+falls back once with a diagnostic warning. macOS and other platforms warn
+because network isolation is unavailable. Generator executables and declared
+runtime inputs remain trusted-code boundaries on every platform.
 
 Security tests cover traversal, symlink/hardlink/TOCTOU races, malformed crypto
 and signatures, replay and target substitution, disk exhaustion, crashes,
