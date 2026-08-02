@@ -19,23 +19,34 @@ let
     phase: spec:
     let
       runtimeSuffix = if phase == "activation" then "" else "/${phase}";
+      runtimeRoot =
+        if pkgs.stdenv.hostPlatform.isLinux then
+          ''"$XDG_RUNTIME_DIR/nix-seal${runtimeSuffix}"''
+        else
+          lib.escapeShellArg "${config.home.homeDirectory}/Library/Caches/nix-seal${runtimeSuffix}";
     in
     ''
-      if [ -z "''${XDG_RUNTIME_DIR:-}" ]; then
-        echo "nix-seal: XDG_RUNTIME_DIR is required for Home Manager activation" >&2
-        exit 1
-      fi
+      ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+        if [ -z "''${XDG_RUNTIME_DIR:-}" ]; then
+          echo "nix-seal: XDG_RUNTIME_DIR is required for Linux Home Manager activation" >&2
+          exit 1
+        fi
+      ''}
       ${lib.getExe cfg.package} activate \
         --spec ${spec} \
         --identity ${lib.escapeShellArg cfg.identityFile} \
-        --runtime-root "$XDG_RUNTIME_DIR/nix-seal${runtimeSuffix}"
+        --runtime-root ${runtimeRoot}
     '';
 in
 {
   imports = [
     ((import ./shared.nix) {
       inherit self;
-      runtimeDirectory = "%t/nix-seal";
+      runtimeDirectory =
+        if pkgs.stdenv.hostPlatform.isLinux then
+          "%t/nix-seal"
+        else
+          "${config.home.homeDirectory}/Library/Caches/nix-seal";
       serviceManager = if pkgs.stdenv.hostPlatform.isLinux then "systemd-user" else "launchd-user";
       serviceExecutable =
         if pkgs.stdenv.hostPlatform.isLinux then "${pkgs.systemd}/bin/systemctl" else "/bin/launchctl";
@@ -95,7 +106,12 @@ in
       })
     ];
     warnings = [
-      "Home Manager stores runtime plaintext under XDG_RUNTIME_DIR; macOS may not provide memory-backed storage"
+      (
+        if pkgs.stdenv.hostPlatform.isLinux then
+          "Home Manager stores runtime plaintext under XDG_RUNTIME_DIR"
+        else
+          "Home Manager stores runtime plaintext under ~/Library/Caches/nix-seal on macOS; this location is not guaranteed memory-backed"
+      )
     ];
   };
 }

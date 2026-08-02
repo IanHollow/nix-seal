@@ -263,6 +263,13 @@ let
       }
     ];
   };
+  homeRuntimeDirectory =
+    if pkgs.stdenv.hostPlatform.isLinux then "%t/nix-seal" else "/home/test/Library/Caches/nix-seal";
+  homeActivationRuntimeDirectory =
+    if pkgs.stdenv.hostPlatform.isLinux then
+      ''"$XDG_RUNTIME_DIR/nix-seal"''
+    else
+      "/home/test/Library/Caches/nix-seal";
   checkDocument =
     name: manager: owner: group: spec: activationText: credentialSpec:
     pkgs.runCommand name { nativeBuildInputs = [ pkgs.jq ]; } ''
@@ -478,27 +485,27 @@ in
   module-home-phase-scheduling =
     assert
       homePhased.config.nixSeal.secrets."bootstrap/token".path
-      == "%t/nix-seal/users/current/bootstrap/token";
+      == "${homeRuntimeDirectory}/users/current/bootstrap/token";
     assert
       homePhased.config.nixSeal.secrets."service/token".path
-      == "%t/nix-seal/services/current/service/token";
+      == "${homeRuntimeDirectory}/services/current/service/token";
     assert lib.elem "nixSealUsers" homePhased.config.home.activation.nixSeal.after;
     assert lib.elem "nixSeal" homePhased.config.home.activation.nixSealServices.after;
     pkgs.runCommand "nix-seal-module-home-phase-scheduling" { nativeBuildInputs = [ pkgs.jq ]; } ''
       jq -e '
         .phase == "users" and
-        .runtimeRoot == "%t/nix-seal/users" and
+        .runtimeRoot == $runtimeRoot and
         (.artifacts | length) == 1 and
         .artifacts[0].secretId == "bootstrap/token"
-      ' ${homePhased.config.nixSeal.activationSpecs.users} >/dev/null
+      ' --arg runtimeRoot "${homeRuntimeDirectory}/users" ${homePhased.config.nixSeal.activationSpecs.users} >/dev/null
       jq -e '
         .phase == "services" and
-        .runtimeRoot == "%t/nix-seal/services" and
+        .runtimeRoot == $runtimeRoot and
         (.artifacts | length) == 1 and
         .artifacts[0].secretId == "service/token"
-      ' ${homePhased.config.nixSeal.activationSpecs.services} >/dev/null
-      grep -F -- '"$XDG_RUNTIME_DIR/nix-seal/users"' ${homeUsersActivation} >/dev/null
-      grep -F -- '"$XDG_RUNTIME_DIR/nix-seal/services"' ${homeServicesActivation} >/dev/null
+      ' --arg runtimeRoot "${homeRuntimeDirectory}/services" ${homePhased.config.nixSeal.activationSpecs.services} >/dev/null
+      grep -F -- ${lib.escapeShellArg "${homeActivationRuntimeDirectory}/users"} ${homeUsersActivation} >/dev/null
+      grep -F -- ${lib.escapeShellArg "${homeActivationRuntimeDirectory}/services"} ${homeServicesActivation} >/dev/null
       touch "$out"
     '';
 }
