@@ -240,6 +240,18 @@ checks and verifies the signed manifest, target binding, and hashes before it
 decrypts anything. Keep the cache scoped: import host artifacts only into the
 host cache and user artifacts only into the owning user's cache.
 
+### Reboot and repository lifecycle
+
+An activated NixOS, nix-darwin, or Home Manager generation does not need the
+source repository at runtime. Its `nix-seal` executable, public plan, and
+activation specification are retained in the Nix store; the target identity and
+its local ciphertext-only artifact cache remain outside it. NixOS installs a
+boot-time activation unit, nix-darwin installs a launch daemon, and Home Manager
+installs a user service or launch agent. They recreate runtime plaintext after
+reboot or login from the target-local artifacts, without consulting Git.
+Removing the local artifact cache or target identity prevents future activation
+and fails closed; it does not expose plaintext.
+
 ### Nix/store artifact bridge (compatibility only)
 
 `nixSeal.lib.artifactBundle` remains available when a deployment deliberately

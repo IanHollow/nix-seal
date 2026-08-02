@@ -9,9 +9,7 @@ let
   ];
   bootActivationCommands = lib.concatMap (
     phase:
-    lib.optional (builtins.hasAttr phase cfg.activationSpecs) (
-      "${lib.getExe cfg.package} activate --spec ${cfg.activationSpecs.${phase}} --identity ${lib.escapeShellArg cfg.identityFile}"
-    )
+    lib.optional (builtins.hasAttr phase cfg.activationSpecs) "${lib.getExe cfg.package} activate --spec ${cfg.activationSpecs.${phase}} --identity ${lib.escapeShellArg cfg.identityFile}"
   ) bootPhases;
   credentialId = value: builtins.head (lib.splitString ":" (toString value));
   groupCredentials = lib.foldl' (

@@ -454,6 +454,17 @@ in
       home.config.nixSeal.activationSpec
       homeActivation
       (if pkgs.stdenv.hostPlatform.isLinux then homeCredentialSpec else null);
+  module-persistent-activation =
+    assert lib.elem "multi-user.target" nixos.config.systemd.services.nix-seal-activate.wantedBy;
+    assert nixos.config.systemd.services.nix-seal-activate.serviceConfig.RemainAfterExit;
+    assert
+      if pkgs.stdenv.hostPlatform.isLinux then
+        home.config.systemd.user.services.nix-seal-activation.Install.WantedBy == [ "default.target" ]
+      else
+        home.config.launchd.agents.nix-seal-activation.config.RunAtLoad;
+    pkgs.runCommand "nix-seal-module-persistent-activation" { } ''
+      touch "$out"
+    '';
   module-credential-policy =
     assert hasFailedAssertion
       "a systemd service credential name may be mapped by only one nixSeal secret"
@@ -640,6 +651,13 @@ in
         darwin.config.nixSeal.activationSpec
         darwinActivation
         null;
+    module-darwin-persistent-activation =
+      assert darwin.config.launchd.daemons.nix-seal-activation.serviceConfig.RunAtLoad;
+      assert lib.elem "activate"
+        darwin.config.launchd.daemons.nix-seal-activation.serviceConfig.ProgramArguments;
+      pkgs.runCommand "nix-seal-module-darwin-persistent-activation" { } ''
+        touch "$out"
+      '';
     module-darwin-credential-policy =
       assert hasFailedAssertion "nixSeal serviceCredentials require a systemd platform" darwinUnsupported;
       assert !(builtins.tryEval homeUnsupported.activationPackage).success;
