@@ -604,18 +604,10 @@ an empty consumer list as a security signal.
 
 ## Migration inspection
 
-Migration begins with a deliberately non-destructive public inventory. Export
-the existing index and inspect the stable mapping before touching ciphertext:
+Migration begins with a deliberately non-destructive public inventory. Inspect
+the stable mapping before touching ciphertext:
 
 ```console
-nix eval --json .#secretIndex > /tmp/secretctl-index.json
-nix-seal migrate secretctl --index /tmp/secretctl-index.json --json
-# after review, rekey legacy files into a side-by-side native age tree
-nix-seal migrate secretctl --index /tmp/secretctl-index.json \
-  --repository-root . --destination secrets/nix-seal \
-  --identity /absolute/private/legacy.agekey \
-  --verification-identity /absolute/private/nix-seal-admin.agekey \
-  --recipient age1admin... --recipient age1recovery... --execute
 nix-seal migrate agenix --directory ./secrets --json
 # ragenix uses the same standard age ciphertext inventory format
 nix-seal migrate ragenix --directory ./secrets --json
@@ -656,10 +648,7 @@ nix-seal migrate ciphertext --source legacy/token.age --destination secrets/toke
   --identity /absolute/path/to/administrator.age --recipient age1... --json
 ```
 
-It validates legacy paths, scopes, consumers, IDs, groups, and SSH recipient
-metadata. For `secretctl`, it additionally cross-checks every target recipient
-set against its declared group membership and every secret recipient set against
-its consumer targets before reporting normalized nix-seal IDs. An explicit
+It validates legacy paths, IDs, and SSH recipient metadata. An explicit
 repository-relative destination, private identity, and replacement recipients
 enable a side-by-side bulk rekey; `--execute` is required before ciphertext is
 opened, and the source tree remains untouched. Without those import flags it
@@ -669,7 +658,7 @@ only as a migration compatibility path; encrypted SSH private keys are
 deliberately rejected in non-interactive workflows, so convert them to a
 reviewed native-age or hardware-backed identity before automated import.
 
-For age-tree, agenix-rekey, secretctl, and single-file ciphertext migration,
+For age-tree, agenix-rekey, and single-file ciphertext migration,
 `--identity` is the legacy source/decryption identity. `--verification-identity`
 is optional and defaults to `--identity`; when supplied it must be authorized by
 every replacement recipient and is used to authenticate the newly written
@@ -713,7 +702,7 @@ standard age-compatible.
 Public migration compatibility goldens are checked into
 `crates/nix-seal-cli/tests/fixtures/migrations` and exercised through the
 released binary. They cover agenix, ragenix, agenix-rekey, SOPS JSON metadata,
-Clan Vars, Clan Facts, and the current `secretctl` index format. The fixtures
+Clan Vars, and Clan Facts. The fixtures
 contain only public metadata, empty/public leaves, or ciphertext without its
 private identity; mutation adapters remain dry-run-first and require separate
 round-trip tests before a 1.0 migration claim.
@@ -747,36 +736,12 @@ nixSeal.lib.agenixRekeyMigrationExport {
 }
 ```
 
-To produce a separate, reviewable `plan.v1.json` bridge from a `secretctl`
-index, provide every legacy target's Nix system, at least one independent
-approval signer, and one administrator or recovery recipient. The candidate uses
-administrator-backed `rekeyed` delivery by default; it does not modify the old
-manager or any ciphertext. Because legacy ciphertext is normally addressed to
-target SSH keys rather than the new administrator, also provide the
-repository-relative prefix where the side-by-side rekey will publish canonical
-sources. The candidate plan points at that post-migration prefix and must be
-deep-checked only after the new ciphertext exists.
-
-```console
-nix-seal migrate secretctl --index /tmp/secretctl-index.json \
-  --plan-output /tmp/nix-seal-plan.v1.json \
-  --canonical-source-prefix migrated-secretctl \
-  --target-system 'home:ianmh@desktop=x86_64-linux' \
-  --target-system 'host:nixos:desktop=x86_64-linux' \
-  --administrator 'migration-admin=age1admin…' \
-  --signer 'release=nix-seal-ed25519-v1:…'
-# First run the reviewed side-by-side migration into migrated-secretctl, then:
-nix-seal check --nix-plan /tmp/nix-seal-plan.v1.json --deep --repository-root .
-```
-
-Candidate plans use root-only runtime permissions because those private runtime
-choices are absent from `secretIndex`; review ownership, phases, lifecycle, and
-templates before activation. To intentionally preserve the legacy masterless
-model, pass `--delivery direct` and omit `--administrator`. This is an advanced
-mode: a stolen target key can decrypt current and historical Git ciphertext
-addressed to that target. When a candidate plan and a side-by-side import are
-requested together, every administrator recipient must also be present in the
-replacement `--recipient` set.
+Build a separate, reviewable `plan.v1.json` with the Nix or TOML frontend before
+performing a migration. The plan must name target systems, approval signers,
+administrator or recovery recipients, runtime ownership, phases, lifecycle, and
+templates explicitly. The default delivery is administrator-backed `rekeyed`;
+advanced `direct` delivery is intentionally explicit because a stolen target
+key can decrypt historical ciphertext addressed to that target.
 
 `migrate sops-json` is intentionally a metadata-only adapter for SOPS JSON
 files. It accepts only bounded regular files, validates the top-level `sops`

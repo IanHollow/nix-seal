@@ -6,28 +6,18 @@ side-by-side age-tree and agenix-rekey migration implemented
 Migration is dry-run-first, preserves the source manager, streams plaintext into
 native age encryption, verifies every result by round trip, and supports
 side-by-side runtime directories. The initial implementation inventories
-`secretctl` public indexes and agenix/ragenix age trees, then provides explicit
-single-file and bulk age-tree paths that stream reviewed source ciphertexts
-through replacement recipients without materializing plaintext. The bulk path
-requires an explicit repository-relative destination, identity, and recipient
-set; it reports the complete mapping before execution and opens the identity
-only for `--execute`. Every source is staged and round-trip verified before any
-destination is changed, then destinations are committed with private backups and
-rollback on failure. Legacy files remain untouched for side-by-side activation
-and rollback verification. The `secretctl` adapter validates group membership,
-target recipient expansion, and every secret's direct recipient set against its
-declared consumers before it emits a mapping report. With explicit
-target-system, approval-signer, administrator-recipient, and
-`--canonical-source-prefix` mappings it writes a separate administrator-backed
-rekeyed candidate plan by default. Candidate source paths point at the
-post-migration tree, so deep validation happens only after the side-by-side
-rekey has produced those files. The legacy direct delivery model is available
-only through an explicit `--delivery direct` opt-in. It never mutates the legacy
-configuration or ciphertext. With an explicit repository-relative destination,
-private identity, and replacement recipient set, `--execute` additionally
-performs a side-by-side bulk rekey of the validated `secrets/*.age` sources. It
-streams and round-trip verifies every file in one transaction and leaves the
-legacy tree untouched.
+agenix/ragenix age trees, then provides explicit single-file and bulk age-tree
+paths that stream reviewed source ciphertexts through replacement recipients
+without materializing plaintext. The bulk path requires an explicit
+repository-relative destination, identity, and recipient set; it reports the
+complete mapping before execution and opens the identity only for `--execute`.
+Every source is staged and round-trip verified before any destination is changed,
+then destinations are committed with private backups and rollback on failure.
+Legacy files remain untouched for side-by-side activation and rollback
+verification. With an explicit repository-relative destination, private identity,
+and replacement recipient set, `--execute` performs a side-by-side bulk rekey of
+validated `secrets/*.age` sources. It streams and round-trip verifies every file
+in one transaction and leaves the legacy tree untouched.
 
 Age-ciphertext migrations distinguish the legacy source identity from the
 destination verification identity. `--identity` decrypts the source; the

@@ -9,6 +9,16 @@ concurrency:
   group: "${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}"
   cancel-in-progress: true
 jobs:
+  legacy-symbols:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Reject removed manager symbols and runtime references
+        run: |
+          if git grep -nEi 'secret[c]tl|secret[I]ndex|config[.]age[.]secrets|inputs[.]agenix'; then
+            echo 'removed secret-manager symbols or agenix runtime references found' >&2
+            exit 1
+          fi
   rust:
     strategy:
       fail-fast: false

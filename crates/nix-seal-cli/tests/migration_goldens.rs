@@ -78,16 +78,6 @@ fn public_migration_reports_match_versioned_goldens() -> Result<(), Box<dyn std:
             ],
             "../migration-goldens/clan-facts.json",
         ),
-        (
-            vec![
-                "migrate".to_owned(),
-                "secretctl".to_owned(),
-                "--index".to_owned(),
-                path("secretctl/index.json")?,
-                "--json".to_owned(),
-            ],
-            "../migration-goldens/secretctl.json",
-        ),
     ];
     for (arguments, expected_path) in cases {
         assert_eq!(

@@ -55,16 +55,6 @@ fn structured_mutation_fixtures_fail_closed_without_a_report()
         "--json".into(),
     ])?;
 
-    let _ = run_failure(&[
-        "migrate".into(),
-        "secretctl".into(),
-        "--index".into(),
-        Path::new(FIXTURE_ROOT)
-            .join("secretctl/inconsistent-target.json")
-            .into_os_string(),
-        "--json".into(),
-    ])?;
-
     assert!(!temporary.path().join("migrated").exists());
     Ok(())
 }

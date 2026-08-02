@@ -131,9 +131,9 @@ Templates use strict placeholders; missing/unused placeholders fail. Templates
 remain public in the store and render at activation. Binary interpolation needs
 an explicit encoding transform.
 
-Dry-run-first, non-destructive migration adapters cover this repository's
-`secretIndex`/`secretctl`, agenix/ragenix, agenix-rekey, sops-nix/SOPS, and Clan
-Vars/Facts. They report mappings first, stream plaintext directly into age,
+Dry-run-first, non-destructive migration adapters cover agenix/ragenix,
+agenix-rekey, sops-nix/SOPS, and Clan Vars/Facts. They report mappings first,
+stream plaintext directly into age,
 round-trip every ciphertext, preserve IDs/scopes where possible, and support
 side-by-side runtime directories. Source managers are never rewritten or removed
 automatically.
