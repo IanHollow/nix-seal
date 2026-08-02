@@ -719,24 +719,29 @@ nixSeal.lib.agenixRekeyMigrationExport {
 ```
 
 To produce a separate, reviewable `plan.v1.json` bridge from a `secretctl`
-index, provide every legacy target's Nix system and at least one independent
-approval signer. The candidate preserves the current direct-recipient model; it
-does not modify the old manager or any ciphertext.
+index, provide every legacy target's Nix system, at least one independent
+approval signer, and one administrator or recovery recipient. The candidate
+uses administrator-backed `rekeyed` delivery by default; it does not modify the
+old manager or any ciphertext.
 
 ```console
 nix-seal migrate secretctl --index /tmp/secretctl-index.json \
   --plan-output /tmp/nix-seal-plan.v1.json \
   --target-system 'home:ianmh@desktop=x86_64-linux' \
   --target-system 'host:nixos:desktop=x86_64-linux' \
+  --administrator 'migration-admin=age1admin…' \
   --signer 'release=nix-seal-ed25519-v1:…'
 nix-seal check --nix-plan /tmp/nix-seal-plan.v1.json --deep --repository-root .
 ```
 
-Candidate plans default each migrated secret to advanced `direct` delivery and
-root-only runtime permissions because those private runtime choices are absent
-from `secretIndex`. Review and replace those defaults, add lifecycle/template
-metadata, and migrate to administrator/recovery-backed `rekeyed` delivery before
-activation.
+Candidate plans use root-only runtime permissions because those private runtime
+choices are absent from `secretIndex`; review ownership, phases, lifecycle, and
+templates before activation. To intentionally preserve the legacy masterless
+model, pass `--delivery direct` and omit `--administrator`. This is an advanced
+mode: a stolen target key can decrypt current and historical Git ciphertext
+addressed to that target. When a candidate plan and a side-by-side import are
+requested together, every administrator recipient must also be present in the
+replacement `--recipient` set.
 
 `migrate sops-json` is intentionally a metadata-only adapter for SOPS JSON
 files. It accepts only bounded regular files, validates the top-level `sops`

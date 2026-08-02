@@ -906,6 +906,14 @@ struct SecretctlMigrationArgs {
     /// Trusted approval signer for a candidate plan as `ID=PUBLIC_KEY`; repeat as needed.
     #[arg(long = "signer", value_name = "ID=PUBLIC_KEY")]
     signers: Vec<String>,
+    /// Administrator or recovery recipient for a rekeyed candidate plan as `ID=RECIPIENT`;
+    /// repeat as needed. At least one is required unless `--delivery direct` is selected.
+    #[arg(long = "administrator", value_name = "ID=RECIPIENT")]
+    administrators: Vec<String>,
+    /// Candidate delivery mode. Rekeyed is the secure default; direct is an explicit
+    /// advanced compatibility mode for legacy masterless deployments.
+    #[arg(long, value_enum, default_value_t = CandidateDelivery::Rekeyed)]
+    delivery: CandidateDelivery,
     /// Repository root containing the legacy secretctl ciphertexts and destination tree.
     #[arg(long, default_value = ".")]
     repository_root: PathBuf,
@@ -928,6 +936,15 @@ struct SecretctlMigrationArgs {
     /// Commit the complete preflighted import. Without this flag no ciphertext is opened.
     #[arg(long)]
     execute: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum CandidateDelivery {
+    /// Canonical ciphertext is encrypted to administrator/recovery recipients.
+    #[default]
+    Rekeyed,
+    /// Canonical ciphertext is encrypted directly to target recipients.
+    Direct,
 }
 
 #[derive(Subcommand)]
@@ -3495,14 +3512,22 @@ fn migrate_secretctl(arguments: &SecretctlMigrationArgs, json: bool) -> Result<(
         read_json_bounded(&arguments.index).context("invalid strict secretctl secretIndex JSON")?;
     let report = build_secretctl_migration_report(&index)?;
     let candidate_plan = if let Some(output) = arguments.plan_output.as_deref() {
-        let plan =
-            build_secretctl_candidate_plan(&index, &arguments.target_systems, &arguments.signers)?;
+        let plan = build_secretctl_candidate_plan(
+            &index,
+            &arguments.target_systems,
+            &arguments.signers,
+            &arguments.administrators,
+            arguments.delivery,
+        )?;
         let canonical = nix_seal_policy::canonical_json(&plan)?;
         emit_canonical_public_json(Some(output), &canonical)?;
-        Some(output)
+        Some((output, plan))
     } else {
-        if !arguments.target_systems.is_empty() || !arguments.signers.is_empty() {
-            bail!("--target-system and --signer require --plan-output");
+        if !arguments.target_systems.is_empty()
+            || !arguments.signers.is_empty()
+            || !arguments.administrators.is_empty()
+        {
+            bail!("candidate plan mappings require --plan-output");
         }
         None
     };
@@ -3548,6 +3573,30 @@ fn migrate_secretctl(arguments: &SecretctlMigrationArgs, json: bool) -> Result<(
     } else {
         (PathBuf::new(), Vec::new(), Vec::new())
     };
+    if let Some((_, plan)) = &candidate_plan
+        && import_requested
+        && !arguments.recipients.is_empty()
+    {
+        let replacement_recipients = normalize_migration_recipients(&arguments.recipients)?;
+        let candidate_recipients = plan
+            .identities
+            .values()
+            .filter(|identity| {
+                matches!(
+                    identity.kind,
+                    nix_seal_core::IdentityKind::Administrator
+                        | nix_seal_core::IdentityKind::Recovery
+                )
+            })
+            .map(|identity| nix_seal_crypto::normalize_recipient(&identity.public))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .context("candidate administrator recipient is invalid")?;
+        if !candidate_recipients.is_subset(&replacement_recipients.iter().cloned().collect()) {
+            bail!(
+                "candidate administrator recipients must be included in the replacement recipient set"
+            );
+        }
+    }
     let mut mappings = report.secrets;
     if import_requested {
         for (mapping, (_, destination)) in mappings.iter_mut().zip(&entries) {
@@ -3602,9 +3651,22 @@ fn migrate_secretctl(arguments: &SecretctlMigrationArgs, json: bool) -> Result<(
         "secretctl uses SSH recipients; native age is preferred, while unencrypted OpenSSH identities are available only for reviewed migration compatibility".to_owned(),
         "the reported legacy group memberships and direct-recipient sets were cross-checked; review normalized IDs and scope selectors before generating a nix-seal plan".to_owned(),
     ];
-    if candidate_plan.is_some() {
+    if let Some((_, plan)) = &candidate_plan {
+        if plan
+            .secrets
+            .values()
+            .any(|secret| matches!(secret.delivery, nix_seal_core::DeliveryMode::Direct))
+        {
+            warnings.push(
+                "candidate plan uses explicit advanced direct delivery; stolen target keys can decrypt current and historical ciphertext addressed to them".to_owned(),
+            );
+        } else {
+            warnings.push(
+                "candidate plan uses administrator-backed rekeyed delivery; review administrator/recovery custody, runtime ownership, phases, templates, and lifecycle metadata before activation".to_owned(),
+            );
+        }
         warnings.push(
-            "candidate plans retain legacy direct delivery and use default root-only runtime settings; review runtime ownership, phases, templates, lifecycle metadata, and a rekeyed administrator/recovery policy before activation".to_owned(),
+            "candidate plans use default root-only runtime settings because those private runtime choices are absent from secretIndex".to_owned(),
         );
     }
     if import_requested {
@@ -3624,7 +3686,7 @@ fn migrate_secretctl(arguments: &SecretctlMigrationArgs, json: bool) -> Result<(
                 "targets":report.targets,
                 "sshRecipientCount":report.ssh_recipient_count,
                 "recipientPolicy":if import_requested { serde_json::json!({"recipients":&replacement_recipients}) } else { serde_json::Value::Null },
-                "candidatePlan":candidate_plan,
+                "candidatePlan":candidate_plan.as_ref().map(|(path, _)| path),
                 "warnings":warnings
             })
         );
@@ -3644,7 +3706,7 @@ fn migrate_secretctl(arguments: &SecretctlMigrationArgs, json: bool) -> Result<(
         for warning in warnings {
             eprintln!("warning: {warning}");
         }
-        if let Some(path) = candidate_plan {
+        if let Some((path, _)) = candidate_plan {
             eprintln!(
                 "candidate plan written to {}; review before activation",
                 path.display()
@@ -3694,16 +3756,30 @@ fn build_secretctl_migration_report(index: &SecretctlIndexV1) -> Result<Secretct
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_secretctl_candidate_plan(
     index: &SecretctlIndexV1,
     target_system_specs: &[String],
     signer_specs: &[String],
+    administrator_specs: &[String],
+    delivery: CandidateDelivery,
 ) -> Result<nix_seal_core::PlanV1> {
     let _ = build_secretctl_migration_report(index)?;
     let systems = parse_target_systems(target_system_specs, &index.targets)?;
     let signers = parse_candidate_signers(signer_specs)?;
+    let administrators = parse_candidate_administrators(administrator_specs, delivery)?;
     let mut plan = nix_seal_core::PlanV1::default();
     plan.identities.extend(signers);
+    plan.identities
+        .extend(administrators.iter().map(|(id, public)| {
+            (
+                id.clone(),
+                nix_seal_core::Identity {
+                    kind: nix_seal_core::IdentityKind::Administrator,
+                    public: public.clone(),
+                },
+            )
+        }));
 
     let mut target_ids = BTreeMap::new();
     let mut seen_target_recipients = BTreeSet::new();
@@ -3780,8 +3856,11 @@ fn build_secretctl_candidate_plan(
             migrated_id(legacy_id)?,
             nix_seal_core::Secret {
                 source: secret.file.clone(),
-                delivery: nix_seal_core::DeliveryMode::Direct,
-                administrators: Vec::new(),
+                delivery: match delivery {
+                    CandidateDelivery::Rekeyed => nix_seal_core::DeliveryMode::Rekeyed,
+                    CandidateDelivery::Direct => nix_seal_core::DeliveryMode::Direct,
+                },
+                administrators: administrators.keys().cloned().collect(),
                 consumers,
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
@@ -3794,6 +3873,40 @@ fn build_secretctl_candidate_plan(
     }
     nix_seal_policy::validate(&plan)?;
     Ok(plan)
+}
+
+fn parse_candidate_administrators(
+    specs: &[String],
+    delivery: CandidateDelivery,
+) -> Result<BTreeMap<nix_seal_core::Id, String>> {
+    if matches!(delivery, CandidateDelivery::Rekeyed) && (specs.is_empty() || specs.len() > 256) {
+        bail!(
+            "rekeyed candidate plans require one or more distinct --administrator ID=RECIPIENT mappings"
+        );
+    }
+    if specs.len() > 256 {
+        bail!("candidate plans support at most 256 administrator mappings");
+    }
+    if matches!(delivery, CandidateDelivery::Direct) && !specs.is_empty() {
+        bail!("--administrator cannot be used with --delivery direct");
+    }
+    let mut administrators = BTreeMap::new();
+    let mut recipients = BTreeSet::new();
+    for spec in specs {
+        let (id, public) = spec
+            .split_once('=')
+            .context("administrator must use ID=RECIPIENT")?;
+        let id = nix_seal_core::Id::parse(id).context("candidate administrator ID is invalid")?;
+        let public = nix_seal_crypto::normalize_recipient(public)
+            .context("candidate administrator recipient is invalid")?;
+        if !recipients.insert(public.clone()) {
+            bail!("candidate administrator recipients must be distinct");
+        }
+        if administrators.insert(id, public).is_some() {
+            bail!("candidate administrator IDs must be distinct");
+        }
+    }
+    Ok(administrators)
 }
 
 fn parse_target_systems(
@@ -10372,6 +10485,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn secretctl_migration_cross_checks_groups_targets_and_recipients()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -10432,12 +10546,14 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 "host:nixos:desktop=x86_64-linux".to_owned(),
             ],
             &[format!("release={}", signer.encode_public()?)],
+            &[format!("admin={first}")],
+            CandidateDelivery::Rekeyed,
         )?;
         assert_eq!(plan.targets.len(), 2);
         assert_eq!(plan.groups.len(), 1);
         assert!(matches!(
             plan.secrets[&nix_seal_core::Id::parse("operators.home.ianmh.token")?].delivery,
-            nix_seal_core::DeliveryMode::Direct
+            nix_seal_core::DeliveryMode::Rekeyed
         ));
         assert_eq!(
             nix_seal_policy::secret_recipients(
@@ -10447,6 +10563,34 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             .recipients
             .len(),
             1
+        );
+
+        let direct = build_secretctl_candidate_plan(
+            &index,
+            &[
+                "home:ianmh@desktop=x86_64-linux".to_owned(),
+                "host:nixos:desktop=x86_64-linux".to_owned(),
+            ],
+            &[format!("release={}", signer.encode_public()?)],
+            &[],
+            CandidateDelivery::Direct,
+        )?;
+        assert!(matches!(
+            direct.secrets[&nix_seal_core::Id::parse("operators.home.ianmh.token")?].delivery,
+            nix_seal_core::DeliveryMode::Direct
+        ));
+        assert!(
+            build_secretctl_candidate_plan(
+                &index,
+                &[
+                    "home:ianmh@desktop=x86_64-linux".to_owned(),
+                    "host:nixos:desktop=x86_64-linux".to_owned(),
+                ],
+                &[format!("release={}", signer.encode_public()?)],
+                &[],
+                CandidateDelivery::Rekeyed,
+            )
+            .is_err()
         );
 
         index
@@ -10520,6 +10664,8 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             plan_output: None,
             target_systems: Vec::new(),
             signers: Vec::new(),
+            administrators: Vec::new(),
+            delivery: CandidateDelivery::Rekeyed,
             repository_root: repository.clone(),
             destination: Some(PathBuf::from("migrated")),
             identity: Some(identity_path.clone()),

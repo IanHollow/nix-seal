@@ -16,9 +16,11 @@ destination is changed, then destinations are committed with private backups and
 rollback on failure. Legacy files remain untouched for side-by-side activation
 and rollback verification. The `secretctl` adapter validates group membership,
 target recipient expansion, and every secret's direct recipient set against its
-declared consumers before it emits a mapping report. With explicit target-system
-and approval-signer mappings it may also write a separate valid direct-delivery
-candidate plan; it never mutates the legacy configuration or ciphertext. With an
+declared consumers before it emits a mapping report. With explicit target-system,
+approval-signer, and administrator-recipient mappings it writes a separate valid
+administrator-backed rekeyed candidate plan by default; the legacy direct-
+delivery model is available only through an explicit `--delivery direct` opt-in.
+It never mutates the legacy configuration or ciphertext. With an
 explicit repository-relative destination, private identity, and replacement
 recipient set, `--execute` additionally performs a side-by-side bulk rekey of
 the validated `secrets/*.age` sources. It streams and round-trip verifies every

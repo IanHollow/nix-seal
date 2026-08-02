@@ -53,8 +53,9 @@
   malformed age recipients, inconsistent recipient sets, and symlinked legacy
   trees. The dogfood migration also exercises a legacy OpenSSH source identity
   re-encrypted to a distinct native-age administrator identity, proving the
-  explicit source/verification-key split. Migration of actual nix-conf secrets
-  remains required.
+  explicit source/verification-key split. Secretctl candidate plans now default
+  to administrator-backed rekeyed delivery and require an explicit opt-in for
+  legacy direct delivery. Migration of actual nix-conf secrets remains required.
 - Phase 5: attack-path review, sustained fuzz/mutation/platform/performance work
   (the reproducible scale benchmark protocol and scheduled Miri, sanitizer, and
   mutation jobs are now published), release build/SBOM/attestation scaffolding,
