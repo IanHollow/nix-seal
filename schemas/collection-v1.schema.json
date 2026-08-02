@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/IanHollow/nix-seal/schema/collection-v1.json",
+  "title": "nix-seal logical collection mapping v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "entries"],
+  "properties": {
+    "schema": {
+      "const": "nix-seal.collection.v1"
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["secret", "path"],
+        "properties": {
+          "secret": {
+            "type": "string",
+            "pattern": "^[a-z0-9._-]+(/[a-z0-9._-]+)*$"
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "pattern": "^[^\\u0000-\\u001f]+$"
+          },
+          "encoding": {
+            "enum": ["utf8", "base64", "hex"],
+            "default": "utf8"
+          }
+        }
+      }
+    }
+  }
+}

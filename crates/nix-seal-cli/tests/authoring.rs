@@ -190,6 +190,110 @@ fn plan_directed_delete_is_explicit_and_recoverable() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+#[test]
+fn logical_collection_batch_authors_independent_ciphertexts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture()?;
+    let mut plan: PlanV1 = serde_json::from_slice(&std::fs::read(&fixture.plan_path)?)?;
+    plan.secrets.insert(
+        Id::parse("db/token")?,
+        Secret {
+            source: "secrets/token.age".to_owned(),
+            delivery: DeliveryMode::Rekeyed,
+            administrators: Vec::new(),
+            consumers: Vec::new(),
+            selectors: TargetSelectors::default(),
+            phase: ActivationPhase::Activation,
+            runtime: RuntimeSettings::default(),
+            lifecycle: Lifecycle::default(),
+            approval_policy: None,
+            repository_only: false,
+        },
+    );
+    nix_seal_policy::validate(&plan)?;
+    std::fs::write(&fixture.plan_path, nix_seal_policy::canonical_json(&plan)?)?;
+    let mapping = fixture.root.join("collection-map.json");
+    std::fs::write(
+        &mapping,
+        br#"{
+          "schema": "nix-seal.collection.v1",
+          "entries": [
+            {"secret": "db/password", "path": "database.password"},
+            {"secret": "db/token", "path": "database.token"}
+          ]
+        }"#,
+    )?;
+    let authored = run_with_stdin(
+        &fixture.root,
+        &[
+            "--json",
+            "secret",
+            "batch",
+            "--plan",
+            path_text(&fixture.plan_path)?,
+            "--repository-root",
+            path_text(&fixture.root)?,
+            "--identity",
+            path_text(&fixture.identity_path)?,
+            "--mapping",
+            path_text(&mapping)?,
+            "--format",
+            "json",
+        ],
+        br#"{"database":{"password":"batch-password","token":"batch-token"}}"#,
+    )?;
+    assert!(
+        authored.status.success(),
+        "batch authoring failed: {}",
+        String::from_utf8_lossy(&authored.stderr)
+    );
+    assert!(
+        !authored
+            .stdout
+            .windows(14)
+            .any(|window| window == b"batch-password")
+    );
+    assert!(
+        !authored
+            .stdout
+            .windows(10)
+            .any(|window| window == b"batch-token")
+    );
+    let password = run(
+        &fixture.root,
+        &[
+            "secret",
+            "reveal",
+            "--plan",
+            path_text(&fixture.plan_path)?,
+            "--repository-root",
+            path_text(&fixture.root)?,
+            "--secret",
+            "db/password",
+            "--identity",
+            path_text(&fixture.identity_path)?,
+        ],
+    )?;
+    assert_eq!(password.stdout, b"batch-password");
+    let token = run(
+        &fixture.root,
+        &[
+            "secret",
+            "reveal",
+            "--plan",
+            path_text(&fixture.plan_path)?,
+            "--repository-root",
+            path_text(&fixture.root)?,
+            "--secret",
+            "db/token",
+            "--identity",
+            path_text(&fixture.identity_path)?,
+        ],
+    )?;
+    assert_eq!(token.stdout, b"batch-token");
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn production_generator_worker_emits_a_bounded_isolation_status()

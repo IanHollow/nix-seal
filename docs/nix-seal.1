@@ -26,6 +26,11 @@ The \fBsecret create\fR, \fBsecret import\fR, \fBsecret edit\fR, and
 \fBdotenv\fR to validate a bounded logical collection before it is encrypted.
 The original bytes are retained. dotenv validation accepts only unique
 shell-compatible \fBKEY=VALUE\fR entries and does not evaluate shell syntax.
+The \fBsecret batch\fR command accepts a public
+\fBnix-seal.collection.v1\fR mapping, optionally stages the collection in a
+mode-0600 editor workspace, and commits each mapped field as an independent
+ciphertext through one recoverable transaction. Binary fields require an
+explicit \fBbase64\fR or \fBhex\fR encoding.
 .PP
 Generator prompts are non-interactive by default and must be supplied through
 owner-only \fB--prompt-file ID=PATH\fR inputs. The explicit
@@ -49,8 +54,8 @@ scrypt-encrypted human recovery identity after protected terminal prompts;
 passphrases are never read from argv, stdin, or the environment.
 .TP
 .B secret, rotate
-Create, import, edit, reveal, inspect, delete, recipient-rekey, and rotate
-canonical secrets. Recipient rekey is dry-run by default and requires an
+Create, import, edit, batch, reveal, inspect, delete, recipient-rekey, and
+rotate canonical secrets. Recipient rekey is dry-run by default and requires an
 explicit \fB--yes\fR for atomic replacement; it does not rotate the value.
 .TP
 .B rekey, artifact, provision, cache

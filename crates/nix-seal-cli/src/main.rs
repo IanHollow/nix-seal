@@ -590,9 +590,13 @@ enum SecretCommand {
     },
     /// Show public policy metadata for one secret.
     Show(SecretPlanArgs),
+    /// Import or edit a logical JSON/TOML/YAML/dotenv collection and atomically
+    /// split its mapped fields into independent canonical ciphertext files.
+    Batch(CollectionBatchArgs),
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 enum SecretFormat {
     /// Validate stdin as a strict JSON document before encrypting its original bytes.
     Json,
@@ -602,6 +606,70 @@ enum SecretFormat {
     Yaml,
     /// Validate stdin as a bounded dotenv collection before encrypting its original bytes.
     Dotenv,
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize, serde::Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum CollectionEncoding {
+    /// Require a UTF-8 value and store its bytes unchanged.
+    #[default]
+    Utf8,
+    /// Decode a standard padded or unpadded base64 value before encryption.
+    Base64,
+    /// Decode a hexadecimal value before encryption.
+    Hex,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CollectionMapping {
+    /// Versioned public mapping schema.
+    schema: String,
+    /// Logical field mappings. The collection format is selected on the CLI.
+    entries: Vec<CollectionEntry>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CollectionEntry {
+    /// Plan secret receiving this field's decoded bytes.
+    secret: nix_seal_core::Id,
+    /// Dot-separated object path, or an exact dotenv key.
+    path: String,
+    /// Explicit text/binary conversion for the logical view.
+    #[serde(default)]
+    encoding: CollectionEncoding,
+}
+
+#[derive(Clone, Args)]
+struct CollectionBatchArgs {
+    /// Canonical compiled plan.v1 JSON.
+    #[arg(long, default_value = "plan.v1.json")]
+    plan: PathBuf,
+    /// Repository root used to resolve canonical ciphertext destinations.
+    #[arg(long, default_value = ".")]
+    repository_root: PathBuf,
+    /// Administrator/recovery identity authorized for every mapped secret.
+    #[arg(long)]
+    identity: PathBuf,
+    /// Public JSON mapping with schema `nix-seal.collection.v1`.
+    #[arg(long)]
+    mapping: PathBuf,
+    /// Logical input format.
+    #[arg(long, value_enum)]
+    format: SecretFormat,
+    /// Optional explicit editor. The input collection is staged privately first.
+    #[arg(long)]
+    editor: Option<PathBuf>,
+    /// Explicit editor argument placed before the private collection filename.
+    #[arg(long = "editor-arg")]
+    editor_arguments: Vec<String>,
+    /// Existing private/runtime directory used as the temporary workspace parent.
+    #[arg(long)]
+    workspace_root: Option<PathBuf>,
+    /// Replace existing canonical ciphertexts; omission is create-only.
+    #[arg(long)]
+    replace: bool,
 }
 
 #[derive(Clone, Args)]
@@ -988,6 +1056,7 @@ enum SchemaKind {
     TargetPolicy,
     SecretRecipients,
     Activation,
+    Collection,
 }
 
 fn main() {
@@ -1377,6 +1446,8 @@ fn run_schema(kind: SchemaKind) -> Result<()> {
             SchemaKind::TargetPolicy => nix_seal_policy::target_policy_json_schema()?,
             SchemaKind::SecretRecipients => nix_seal_policy::secret_recipients_json_schema()?,
             SchemaKind::Activation => nix_seal_runtime::activation_json_schema()?,
+            SchemaKind::Collection =>
+                include_str!("../../../schemas/collection-v1.schema.json").to_owned(),
         }
     );
     Ok(())
@@ -7008,6 +7079,7 @@ fn run_secret(command: SecretCommand, json: bool) -> Result<()> {
         SecretCommand::Edit(arguments) => run_secret_edit(arguments, json)?,
         SecretCommand::Rekey(arguments) => run_secret_rekey(&arguments, json)?,
         SecretCommand::Delete(arguments) => run_secret_delete(&arguments, json)?,
+        SecretCommand::Batch(arguments) => run_secret_batch(&arguments, json)?,
         SecretCommand::Reveal(arguments) => {
             if json {
                 bail!("secret reveal refuses --json because plaintext JSON output is forbidden");
@@ -7199,6 +7271,349 @@ fn run_secret_write(
         }
     }
     Ok(())
+}
+
+fn run_secret_batch(arguments: &CollectionBatchArgs, json: bool) -> Result<()> {
+    let mapping = read_collection_mapping(&arguments.mapping)?;
+    let input = read_structured_secret_input(Some(arguments.format))?;
+    let input = if let Some(editor) = arguments.editor.as_deref() {
+        edit_collection_input(
+            input.expose_secret(),
+            editor,
+            &arguments.editor_arguments,
+            arguments.workspace_root.as_deref(),
+        )?
+    } else {
+        input
+    };
+    let values =
+        extract_collection_values(input.expose_secret(), arguments.format, &mapping.entries)?;
+    let plan = read_plan_bounded(&arguments.plan)?;
+    let identity = read_identity(&arguments.identity)?;
+    let root = arguments
+        .repository_root
+        .canonicalize()
+        .context("repository root must exist")?;
+
+    let mut payloads = Vec::with_capacity(mapping.entries.len());
+    let mut destinations = Vec::with_capacity(mapping.entries.len());
+    let mut recipient_sets = Vec::with_capacity(mapping.entries.len());
+    for (entry, value) in mapping.entries.iter().zip(values) {
+        let secret = plan.secrets.get(&entry.secret).with_context(|| {
+            format!(
+                "collection mapping references unknown secret {}",
+                entry.secret
+            )
+        })?;
+        ensure_canonical_authoring_identity_authorized(&plan, &entry.secret, &identity)?;
+        let recipients = nix_seal_policy::secret_recipients(&plan, &entry.secret)?
+            .recipients
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if matches!(secret.delivery, nix_seal_core::DeliveryMode::Direct) {
+            eprintln!(
+                "warning: direct mode allows matching target keys to decrypt current and historical Git ciphertext"
+            );
+        }
+        payloads.push(value);
+        destinations.push(PathBuf::from(&secret.source));
+        recipient_sets.push(recipients);
+    }
+
+    let writes = mapping
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, _)| nix_seal_authoring::BatchSecretWrite {
+            relative_destination: &destinations[index],
+            plaintext: payloads[index].expose_secret(),
+            recipients: &recipient_sets[index],
+        })
+        .collect::<Vec<_>>();
+    let results = nix_seal_authoring::write_secret_batch(
+        &root,
+        &writes,
+        &identity,
+        if arguments.replace {
+            nix_seal_authoring::WriteMode::Replace
+        } else {
+            nix_seal_authoring::WriteMode::Create
+        },
+    )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"nix-seal.output.v1",
+                "operation":"batch-authored",
+                "format":arguments.format,
+                "count":results.len(),
+                "secrets":results.iter().zip(&mapping.entries).map(|(result, entry)| serde_json::json!({
+                    "secretId":entry.secret,
+                    "ciphertextPath":result.path,
+                    "ciphertextHash":result.ciphertext_hash,
+                    "plaintextBytes":result.plaintext_bytes
+                })).collect::<Vec<_>>()
+            })
+        );
+    } else {
+        for (result, entry) in results.iter().zip(&mapping.entries) {
+            println!("{}\t{}", entry.secret, result.path.display());
+        }
+        eprintln!("atomically authored {} mapped secret(s)", results.len());
+    }
+    Ok(())
+}
+
+fn read_collection_mapping(path: &Path) -> Result<CollectionMapping> {
+    let file = open_public_ciphertext(path)
+        .context("collection mapping must be a regular non-symlink file")?;
+    let mut bytes = Vec::new();
+    file.take(2 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .context("could not read collection mapping")?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        bail!("collection mapping exceeds the 2 MiB safety limit");
+    }
+    let mapping: CollectionMapping =
+        serde_json::from_slice(&bytes).context("collection mapping is not valid strict JSON")?;
+    if mapping.schema != "nix-seal.collection.v1"
+        || mapping.entries.is_empty()
+        || mapping.entries.len() > 10_000
+    {
+        bail!(
+            "collection mapping must use schema nix-seal.collection.v1 and contain 1..10000 entries"
+        );
+    }
+    let mut secrets = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    for entry in &mapping.entries {
+        if !secrets.insert(entry.secret.clone()) {
+            bail!("collection mapping contains a duplicate secret ID");
+        }
+        if !paths.insert(entry.path.clone()) {
+            bail!("collection mapping contains a duplicate logical path");
+        }
+        validate_collection_path(&entry.path, SecretFormat::Json)?;
+    }
+    Ok(mapping)
+}
+
+fn validate_collection_path(path: &str, format: SecretFormat) -> Result<Vec<String>> {
+    if path.is_empty() || path.len() > 1024 || path.bytes().any(|byte| byte.is_ascii_control()) {
+        bail!("collection logical path is empty, oversized, or contains control characters");
+    }
+    if format == SecretFormat::Dotenv {
+        if !path.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_uppercase()
+                || byte.is_ascii_lowercase()
+                || byte == b'_'
+                || index > 0 && byte.is_ascii_digit()
+        }) {
+            bail!("dotenv collection paths must be shell-compatible keys");
+        }
+        return Ok(vec![path.to_owned()]);
+    }
+    let segments = path.split('.').map(str::to_owned).collect::<Vec<_>>();
+    if segments.len() > 64
+        || segments.iter().any(|segment| {
+            segment.is_empty()
+                || segment == "."
+                || segment == ".."
+                || segment.bytes().any(|byte| byte.is_ascii_control())
+        })
+    {
+        bail!("collection logical paths must contain normal non-empty dot-separated segments");
+    }
+    Ok(segments)
+}
+
+fn edit_collection_input(
+    input: &[u8],
+    editor: &Path,
+    editor_arguments: &[String],
+    workspace_root: Option<&Path>,
+) -> Result<SecretBox<Vec<u8>>> {
+    if !editor.is_absolute() {
+        bail!("collection editor must be an absolute executable path");
+    }
+    let canonical = editor
+        .canonicalize()
+        .context("collection editor must exist")?;
+    let metadata = fs::symlink_metadata(&canonical)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("collection editor must be a regular executable");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            bail!("collection editor is not executable");
+        }
+    }
+    let workspace_root = match workspace_root {
+        Some(path) => path.to_owned(),
+        None => match std::env::var_os("XDG_RUNTIME_DIR") {
+            Some(path) if Path::new(&path).is_absolute() => PathBuf::from(path),
+            _ => {
+                eprintln!(
+                    "warning: collection editor workspace uses the OS temporary directory, which may not be memory-backed"
+                );
+                std::env::temp_dir()
+            }
+        },
+    };
+    let workspace_root = workspace_root
+        .canonicalize()
+        .context("collection editor workspace root must exist")?;
+    let workspace = tempfile::Builder::new()
+        .prefix("nix-seal-collection-")
+        .tempdir_in(workspace_root)
+        .context("could not create private collection workspace")?;
+    set_private_directory(workspace.path())?;
+    let path = workspace.path().join("collection");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .context("could not create private collection input")?;
+    set_private_file_handle(&file)?;
+    file.write_all(input)
+        .and_then(|()| file.sync_all())
+        .context("could not stage private collection input")?;
+    drop(file);
+    let status = ProcessCommand::new(editor)
+        .args(editor_arguments)
+        .arg(&path)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(workspace.path())
+        .status()
+        .context("could not start collection editor")?;
+    if !status.success() {
+        bail!("collection editor failed; canonical ciphertext was not changed");
+    }
+    let mut edited = SecretBox::new(Box::new(Vec::new()));
+    let mut edited_file = open_private_collection_file(&path)?;
+    BoundedReader::new(&mut edited_file, EXTERNAL_MIGRATION_MAX_PLAINTEXT_BYTES)
+        .read_to_end(edited.expose_secret_mut())
+        .context("edited collection exceeds the 64 MiB safety limit")?;
+    Ok(edited)
+}
+
+fn open_private_collection_file(path: &Path) -> Result<fs::File> {
+    let file = open_public_ciphertext(path)?;
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o077 != 0
+        {
+            bail!("edited collection file has unsafe ownership, mode, or link metadata");
+        }
+    }
+    Ok(file)
+}
+
+fn extract_collection_values(
+    input: &[u8],
+    format: SecretFormat,
+    entries: &[CollectionEntry],
+) -> Result<Vec<SecretBox<Vec<u8>>>> {
+    let text = std::str::from_utf8(input).context("logical collection must be valid UTF-8")?;
+    if format == SecretFormat::Dotenv {
+        let mut values = BTreeMap::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let (key, value) = line
+                .split_once('=')
+                .context("dotenv entries must use KEY=VALUE syntax")?;
+            if values.insert(key.to_owned(), value.to_owned()).is_some() {
+                bail!("dotenv collection contains duplicate keys");
+            }
+        }
+        return entries
+            .iter()
+            .map(|entry| {
+                validate_collection_path(&entry.path, format)?;
+                let value = values
+                    .get(&entry.path)
+                    .with_context(|| format!("logical collection is missing {}", entry.path))?;
+                decode_collection_value(value, entry.encoding)
+            })
+            .collect();
+    }
+    let document: serde_json::Value = match format {
+        SecretFormat::Json => serde_json::from_str(text).context("logical JSON is malformed")?,
+        SecretFormat::Toml => toml::from_str(text).context("logical TOML is malformed")?,
+        SecretFormat::Yaml => yaml_serde::from_str(text).context("logical YAML is malformed")?,
+        SecretFormat::Dotenv => unreachable!(),
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            let segments = validate_collection_path(&entry.path, format)?;
+            let value = segments.iter().try_fold(&document, |current, segment| {
+                current
+                    .get(segment)
+                    .with_context(|| format!("logical collection is missing {}", entry.path))
+            })?;
+            let text = match value {
+                serde_json::Value::String(value) => value.clone(),
+                serde_json::Value::Bool(_) | serde_json::Value::Number(_) => value.to_string(),
+                serde_json::Value::Null
+                | serde_json::Value::Array(_)
+                | serde_json::Value::Object(_) => {
+                    bail!("logical collection field {} must be a scalar", entry.path)
+                }
+            };
+            decode_collection_value(&text, entry.encoding)
+        })
+        .collect()
+}
+
+fn decode_collection_value(
+    value: &str,
+    encoding: CollectionEncoding,
+) -> Result<SecretBox<Vec<u8>>> {
+    let bytes = match encoding {
+        CollectionEncoding::Utf8 => value.as_bytes().to_vec(),
+        CollectionEncoding::Base64 => BASE64_STANDARD
+            .decode(value)
+            .or_else(|_| BASE64_STANDARD_NO_PAD.decode(value))
+            .context("logical collection base64 value is malformed")?,
+        CollectionEncoding::Hex => {
+            if !value.len().is_multiple_of(2) {
+                bail!("logical collection hexadecimal value has odd length");
+            }
+            value
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    let high = (pair[0] as char)
+                        .to_digit(16)
+                        .context("logical collection hexadecimal value is malformed")?;
+                    let low = (pair[1] as char)
+                        .to_digit(16)
+                        .context("logical collection hexadecimal value is malformed")?;
+                    u8::try_from((high << 4) | low).context("invalid hexadecimal byte")
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    if bytes.len() as u64 > EXTERNAL_MIGRATION_MAX_PLAINTEXT_BYTES {
+        bail!("logical collection field exceeds the 64 MiB safety limit");
+    }
+    Ok(SecretBox::new(Box::new(bytes)))
 }
 
 fn run_secret_rekey(arguments: &SecretRekeyArgs, json: bool) -> Result<()> {
@@ -8305,6 +8720,83 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             validate_structured_secret_bytes(b"token: value\n", Some(SecretFormat::Yaml)).is_ok()
         );
         assert!(validate_structured_secret_bytes(b"token: [", Some(SecretFormat::Yaml)).is_err());
+    }
+
+    #[test]
+    fn logical_collection_extraction_supports_nested_and_binary_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let entries = vec![
+            CollectionEntry {
+                secret: nix_seal_core::Id::parse("application/password")?,
+                path: "application.password".to_owned(),
+                encoding: CollectionEncoding::Utf8,
+            },
+            CollectionEntry {
+                secret: nix_seal_core::Id::parse("application/key")?,
+                path: "application.key".to_owned(),
+                encoding: CollectionEncoding::Hex,
+            },
+        ];
+        let values = extract_collection_values(
+            br#"{"application":{"password":"s3cret","key":"000102ff"}}"#,
+            SecretFormat::Json,
+            &entries,
+        )?;
+        assert_eq!(values[0].expose_secret(), b"s3cret");
+        assert_eq!(values[1].expose_secret(), &[0, 1, 2, 255]);
+
+        let toml_values = extract_collection_values(
+            b"[application]\npassword = \"toml-secret\"\nkey = \"0001\"\n",
+            SecretFormat::Toml,
+            &entries,
+        )?;
+        assert_eq!(toml_values[0].expose_secret(), b"toml-secret");
+        assert_eq!(toml_values[1].expose_secret(), &[0, 1]);
+        let yaml_values = extract_collection_values(
+            b"application:\n  password: yaml-secret\n  key: 0001\n",
+            SecretFormat::Yaml,
+            &entries,
+        )?;
+        assert_eq!(yaml_values[0].expose_secret(), b"yaml-secret");
+        assert_eq!(yaml_values[1].expose_secret(), &[0, 1]);
+
+        let dotenv_entries = vec![CollectionEntry {
+            secret: nix_seal_core::Id::parse("application/token")?,
+            path: "TOKEN".to_owned(),
+            encoding: CollectionEncoding::Base64,
+        }];
+        let values = extract_collection_values(
+            b"export TOKEN=c2VjcmV0\n",
+            SecretFormat::Dotenv,
+            &dotenv_entries,
+        )?;
+        assert_eq!(values[0].expose_secret(), b"secret");
+        Ok(())
+    }
+
+    #[test]
+    fn logical_collection_rejects_missing_fields_and_unsafe_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let entry = CollectionEntry {
+            secret: nix_seal_core::Id::parse("application/token")?,
+            path: "application.token".to_owned(),
+            encoding: CollectionEncoding::Utf8,
+        };
+        assert!(
+            extract_collection_values(b"{}", SecretFormat::Json, std::slice::from_ref(&entry))
+                .is_err()
+        );
+        assert!(validate_collection_path("application..token", SecretFormat::Json).is_err());
+        assert!(validate_collection_path("1TOKEN", SecretFormat::Dotenv).is_err());
+        assert!(
+            extract_collection_values(
+                br#"{"application":{"token":[]}}"#,
+                SecretFormat::Json,
+                &[entry],
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

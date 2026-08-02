@@ -123,10 +123,36 @@ formatting and ordering are not rewritten. Structured input is limited to 64 MiB
 and must be valid UTF-8. dotenv validation accepts only unique shell-compatible
 `KEY=VALUE` entries (with an optional `export ` prefix); it does not evaluate
 shell syntax. An edit that fails its declared format check never replaces the
-existing ciphertext. This validation is an authoring guardrail, not field-level
-secret splitting: each canonical source remains one independent standard age
+existing ciphertext. Each canonical source remains one independent standard age
 file. Keep any plaintext input file private and remove it according to your
 local storage policy.
+
+For field-level authoring, `secret batch` accepts a bounded JSON/TOML/YAML or
+dotenv collection on stdin and a public `nix-seal.collection.v1` mapping. Each
+mapped scalar is decoded according to its explicit `utf8`, `base64`, or `hex`
+encoding and committed as an independent age ciphertext through one all-or-
+recover transaction. `--editor /absolute/path/to/editor` stages the collection
+in a mode-0600 ephemeral workspace before extraction; the editor receives no
+ambient environment or shell. Omit `--replace` for create-only behavior.
+
+```json
+{
+  "schema": "nix-seal.collection.v1",
+  "entries": [
+    {"secret": "service/password", "path": "service.password"},
+    {"secret": "service/key", "path": "service.key", "encoding": "hex"}
+  ]
+}
+```
+
+The mapping is public metadata only; values, editor responses, and private
+identities never enter the plan or Nix store. Unknown or missing mapped fields,
+duplicate keys, unsafe paths, malformed encodings, and any failed ciphertext
+write abort the complete batch.
+
+The machine-readable mapping schema is available with
+`nix-seal schema --kind collection` and is installed with the flake's generated
+schemas.
 
 Generate a native recovery identity with `nix-seal key generate`. For a
 human-held recovery copy, `nix-seal key generate --passphrase` writes a standard
