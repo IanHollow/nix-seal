@@ -720,9 +720,9 @@ nixSeal.lib.agenixRekeyMigrationExport {
 
 To produce a separate, reviewable `plan.v1.json` bridge from a `secretctl`
 index, provide every legacy target's Nix system, at least one independent
-approval signer, and one administrator or recovery recipient. The candidate
-uses administrator-backed `rekeyed` delivery by default; it does not modify the
-old manager or any ciphertext.
+approval signer, and one administrator or recovery recipient. The candidate uses
+administrator-backed `rekeyed` delivery by default; it does not modify the old
+manager or any ciphertext.
 
 ```console
 nix-seal migrate secretctl --index /tmp/secretctl-index.json \
