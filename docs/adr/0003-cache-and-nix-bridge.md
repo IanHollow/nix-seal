@@ -46,9 +46,9 @@ content hash, artifact bundle name, exact bundle member set, byte bound, and
 private metadata before reporting aggregate counts. This deliberately makes
 `cache status` fail on unexpected cache mutations instead of presenting a
 misleading count. Every bounded cache read also applies the limit to the
-stream itself rather than trusting a prior metadata length, so a concurrent
-file growth race cannot turn a malformed entry into an unbounded allocation.
-Cache lifecycle operations build on this verified inventory.
+stream itself rather than trusting a prior metadata length, so a concurrent file growth
+race cannot turn a malformed entry into an unbounded allocation. Cache lifecycle
+operations build on this verified inventory.
 
 `cache gc` is dry-run-first. It retains a target artifact only after compiling
 the current plan, deriving the target projection, hashing the current canonical
