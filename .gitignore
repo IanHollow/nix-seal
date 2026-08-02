@@ -4,3 +4,4 @@
 *.age.tmp
 *.identity
 /.nix-seal/
+/.nix-seal.lock
