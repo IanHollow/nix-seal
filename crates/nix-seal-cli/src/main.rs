@@ -8409,14 +8409,98 @@ fn open_private_identity(path: &Path) -> Result<std::fs::File> {
     Ok(std::fs::File::open(path)?)
 }
 
-fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
+#[cfg(unix)]
+fn canonical_private_output_parent(path: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let canonical = path.canonicalize().with_context(|| {
+        format!(
+            "could not resolve private identity parent {}",
+            path.display()
+        )
+    })?;
+    let mut current = if path.is_absolute() {
+        PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
+    } else {
+        std::env::current_dir()?
+    };
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => current.push(name),
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                bail!("private identity output parent is not normalized")
+            }
+        }
+        let metadata = std::fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() && metadata.uid() != 0 {
+            bail!("private identity output parent contains a user-owned symlink");
+        }
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn open_private_output_parent(path: &Path) -> Result<std::fs::File> {
+    use rustix::fs::{FileType, fstat};
+
+    let directory = open_directory_chain_nofollow(path)?;
+    let metadata = fstat(&directory).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+        || metadata.st_mode & 0o022 != 0
+    {
+        bail!("private identity output parent has unsafe ownership or write permissions");
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn create_new_private_file(path: &Path) -> Result<std::fs::File> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+
     let parent = path.parent().context("identity path has no parent")?;
     std::fs::create_dir_all(parent)?;
-    let mut file = std::fs::OpenOptions::new()
+    // Resolve only root-owned platform aliases (for example macOS `/tmp`),
+    // while rejecting user-owned symlinked ancestry. The resulting canonical
+    // path is still opened component-by-component with `O_NOFOLLOW`.
+    let parent = canonical_private_output_parent(parent)?;
+    let directory = open_private_output_parent(&parent)?;
+    let name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .context("identity path is not a normal file path")?;
+    let descriptor = openat(
+        &directory,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(std::io::Error::from)
+    .with_context(|| format!("refusing to overwrite {}", path.display()))?;
+    let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+        || metadata.st_nlink != 1
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+    {
+        bail!("private identity output has unsafe ownership or link metadata");
+    }
+    Ok(std::fs::File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn create_new_private_file(path: &Path) -> Result<std::fs::File> {
+    let parent = path.parent().context("identity path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .with_context(|| format!("refusing to overwrite {}", path.display()))?;
+        .with_context(|| format!("refusing to overwrite {}", path.display()))
+}
+
+fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = create_new_private_file(path)?;
     set_private_file_handle(&file)?;
     file.write_all(bytes)?;
     file.write_all(b"\n")?;
@@ -8858,6 +8942,47 @@ mod tests {
         symlink(&real, &linked)?;
 
         assert!(open_directory_chain_nofollow(&linked).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_identity_creation_rejects_symlinked_parent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let real = temporary.path().join("real");
+        std::fs::create_dir(&real)?;
+        let linked = temporary.path().join("linked");
+        symlink(&real, &linked)?;
+
+        let result = write_new_private(&linked.join("identity"), b"private identity");
+        assert!(result.is_err());
+        assert!(!real.join("identity").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_identity_creation_publishes_owner_only_regular_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary = tempfile::tempdir()?;
+        let path = temporary
+            .path()
+            .canonicalize()?
+            .join("nested")
+            .join("identity");
+        write_new_private(&path, b"private identity")?;
+
+        let metadata = std::fs::symlink_metadata(&path)?;
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&path)?, b"private identity\n");
         Ok(())
     }
 
