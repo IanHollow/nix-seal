@@ -501,21 +501,27 @@ in
           {
             assertion = lib.all (
               secret:
-              (secret.artifact == null || (
-                secret.ciphertext == "${secret.artifact}/ciphertext.age"
-                && secret.envelope == "${secret.artifact}/manifest.dsse.json"
-              ))
-              && (secret.artifactDirectory == null || (
-                secret.ciphertext == "${secret.artifactDirectory}/ciphertext.age"
-                && secret.envelope == "${secret.artifactDirectory}/manifest.dsse.json"
-              ))
+              (
+                secret.artifact == null
+                || (
+                  secret.ciphertext == "${secret.artifact}/ciphertext.age"
+                  && secret.envelope == "${secret.artifact}/manifest.dsse.json"
+                )
+              )
+              && (
+                secret.artifactDirectory == null
+                || (
+                  secret.ciphertext == "${secret.artifactDirectory}/ciphertext.age"
+                  && secret.envelope == "${secret.artifactDirectory}/manifest.dsse.json"
+                )
+              )
             ) (builtins.attrValues cfg.secrets);
             message = "nixSeal artifact bundles derive ciphertext and envelope paths; do not override either path";
           }
           {
-            assertion = lib.all (
-              secret: secret.artifact == null || secret.artifactDirectory == null
-            ) (builtins.attrValues cfg.secrets);
+            assertion = lib.all (secret: secret.artifact == null || secret.artifactDirectory == null) (
+              builtins.attrValues cfg.secrets
+            );
             message = "nixSeal secrets must use either artifact (Nix-store bridge) or artifactDirectory (target-local cache), not both";
           }
           {
