@@ -28,7 +28,10 @@
   generators, prompts, templates, and provisioning phases. Private identity,
   prompt-state, generator dependency, and generator-output permissions now use
   descriptor-relative hardening with regression coverage against pathname
-  substitution races.
+  substitution races. Canonical authoring staging, editor values, public-output
+  staging, and deletion tombstone metadata now apply permissions through
+  already-open descriptors; compatibility path helpers verify no-follow type,
+  ownership, and link count before changing modes.
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
   starting with a synthetic low-risk secret. Public migration compatibility
   goldens now cover agenix/ragenix, agenix-rekey, SOPS metadata, Clan

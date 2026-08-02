@@ -303,7 +303,7 @@ pub fn write_secret_checked<R: Read + Send, F: FnOnce() -> Result<(), AuthoringE
     let previous = validate_destination(&destination, mode)?;
     let parent = destination.parent().ok_or(AuthoringError::UnsafePath)?;
     let mut staged = NamedTempFile::new_in(parent).map_err(AuthoringError::Io)?;
-    set_private(staged.path()).map_err(AuthoringError::Io)?;
+    set_private_file(staged.as_file()).map_err(AuthoringError::Io)?;
 
     let mut hashing_input = HashingReader::new(input);
     nix_seal_crypto::encrypt(&mut hashing_input, staged.as_file_mut(), recipients)?;
@@ -367,7 +367,7 @@ pub fn rekey_secret(
     let previous = validate_destination(&destination, mode)?;
     let parent = destination.parent().ok_or(AuthoringError::UnsafePath)?;
     let mut staged = NamedTempFile::new_in(parent).map_err(AuthoringError::Io)?;
-    set_private(staged.path()).map_err(AuthoringError::Io)?;
+    set_private_file(staged.as_file()).map_err(AuthoringError::Io)?;
     nix_seal_crypto::rekey(
         source_file,
         staged.as_file_mut(),
@@ -450,7 +450,7 @@ pub fn rekey_secret_batch(
             .ok_or(AuthoringError::UnsafePath)?
             .to_owned();
         let mut staged = NamedTempFile::new_in(&parent).map_err(AuthoringError::Io)?;
-        set_private(staged.path()).map_err(AuthoringError::Io)?;
+        set_private_file(staged.as_file()).map_err(AuthoringError::Io)?;
         let (source_hash, _) = hash_bounded_file(&source, 64 * 1024 * 1024)?;
         nix_seal_crypto::rekey(
             open_nofollow_regular(&source)?,
@@ -574,7 +574,7 @@ pub fn write_secret_file_batch(
             .ok_or(AuthoringError::UnsafePath)?
             .to_owned();
         let mut staged = NamedTempFile::new_in(&parent).map_err(AuthoringError::Io)?;
-        set_private(staged.path()).map_err(AuthoringError::Io)?;
+        set_private_file(staged.as_file()).map_err(AuthoringError::Io)?;
         let mut hashing_input =
             HashingReader::new(open_nofollow_regular(&source)?.take(64 * 1024 * 1024 + 1));
         nix_seal_crypto::encrypt(&mut hashing_input, staged.as_file_mut(), write.recipients)?;
@@ -690,7 +690,7 @@ pub fn write_public_file_batch(
             .ok_or(AuthoringError::UnsafePath)?
             .to_owned();
         let mut staged = NamedTempFile::new_in(&parent).map_err(AuthoringError::Io)?;
-        set_private(staged.path()).map_err(AuthoringError::Io)?;
+        set_private_file(staged.as_file()).map_err(AuthoringError::Io)?;
         let mut source_file = open_nofollow_regular(&source)?;
         let mut hashing_source =
             HashingReader::new((&mut source_file).take(MAX_PUBLIC_FILE_BYTES.saturating_add(1)));
@@ -760,7 +760,7 @@ pub fn write_public_file_batch(
             }
             return Err(AuthoringError::BatchRecoveryUnknown);
         };
-        if let Err(error) = set_public(staged.path()) {
+        if let Err(error) = set_public_file(staged.as_file()) {
             if restore_combined(&prepared, &mut backups, &committed) {
                 return Err(AuthoringError::BatchRolledBack);
             }
@@ -929,7 +929,7 @@ pub fn write_secret_and_public_batch(
             return Err(AuthoringError::BatchRecoveryUnknown);
         };
         if matches!(item, PreparedCombinedWrite::Public(_))
-            && let Err(error) = set_public(staged.path())
+            && let Err(error) = set_public_file(staged.as_file())
         {
             if restore_combined(&prepared, &mut backups, &committed) {
                 return Err(AuthoringError::BatchRolledBack);
@@ -996,7 +996,7 @@ fn prepare_public_writes(
             .ok_or(AuthoringError::UnsafePath)?
             .to_owned();
         let mut staged = NamedTempFile::new_in(&parent).map_err(AuthoringError::Io)?;
-        set_private(staged.path()).map_err(AuthoringError::Io)?;
+        set_private_file(staged.as_file()).map_err(AuthoringError::Io)?;
         staged
             .write_all(write.plaintext)
             .and_then(|()| staged.as_file().sync_all())
@@ -1069,7 +1069,7 @@ fn prepare_batch_writes(
             .ok_or(AuthoringError::UnsafePath)?
             .to_owned();
         let mut staged = NamedTempFile::new_in(&parent).map_err(AuthoringError::Io)?;
-        set_private(staged.path()).map_err(AuthoringError::Io)?;
+        set_private_file(staged.as_file()).map_err(AuthoringError::Io)?;
         let mut input = HashingReader::new(std::io::Cursor::new(write.plaintext));
         nix_seal_crypto::encrypt(&mut input, staged.as_file_mut(), write.recipients)?;
         staged.as_file().sync_all().map_err(AuthoringError::Io)?;
@@ -1175,7 +1175,7 @@ where
         .create_new(true)
         .open(&plaintext_path)
         .map_err(AuthoringError::Io)?;
-    set_private(&plaintext_path).map_err(AuthoringError::Io)?;
+    set_private_file(&plaintext).map_err(AuthoringError::Io)?;
     nix_seal_crypto::decrypt(
         open_nofollow_regular(&destination)?,
         &mut plaintext,
@@ -1301,7 +1301,7 @@ pub fn delete_secret(request: &DeleteRequest<'_>) -> Result<DeletionResult, Auth
         .create_new(true)
         .open(&metadata_path)
         .map_err(AuthoringError::Io)?;
-    set_private(&metadata_path).map_err(AuthoringError::Io)?;
+    set_private_file(&metadata_file).map_err(AuthoringError::Io)?;
     metadata_file
         .write_all(&metadata_bytes)
         .and_then(|()| metadata_file.write_all(b"\n"))
@@ -1530,30 +1530,73 @@ fn same_file(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn set_private(path: &Path) -> Result<(), std::io::Error> {
+fn set_private_file(file: &File) -> Result<(), std::io::Error> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(unix)]
-fn set_public(path: &Path) -> Result<(), std::io::Error> {
+fn set_public_file(file: &File) -> Result<(), std::io::Error> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
-}
-
-#[cfg(unix)]
-fn set_private_directory(path: &Path) -> Result<(), std::io::Error> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))
 }
 
 #[cfg(not(unix))]
-fn set_private(_path: &Path) -> Result<(), std::io::Error> {
+fn set_private_file(_file: &File) -> Result<(), std::io::Error> {
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_public(_path: &Path) -> Result<(), std::io::Error> {
+fn set_public_file(_file: &File) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private(path: &Path) -> Result<(), std::io::Error> {
+    use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, open};
+    let descriptor = open(
+        path,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+        || metadata.st_nlink != 1
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private file is not a single-link file owned by the current user",
+        ));
+    }
+    fchmod(&descriptor, Mode::from_raw_mode(0o600)).map_err(std::io::Error::from)
+}
+
+#[cfg(unix)]
+fn set_private_directory(path: &Path) -> Result<(), std::io::Error> {
+    use rustix::fs::{FileType, Mode, OFlags, fchmod, fstat, open};
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
+        || metadata.st_nlink == 0
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private directory is not owned by the current user",
+        ));
+    }
+    fchmod(&descriptor, Mode::from_raw_mode(0o700)).map_err(std::io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn set_private(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
@@ -1670,6 +1713,14 @@ mod tests {
         assert_eq!(created.plaintext_bytes, 11);
         let before = std::fs::read(&created.path)?;
         assert!(!before.windows(11).any(|window| window == b"first-value"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&created.path)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
 
         let (wrong_identity, _) = nix_seal_crypto::generate_x25519();
         assert!(matches!(
