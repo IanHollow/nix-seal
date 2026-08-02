@@ -1,11 +1,14 @@
 # ADR 0003: Ciphertext cache and Nix bridge
 
-Status: accepted; rekey/cache transaction, interruption recovery, and Nix import
-bridge implemented
+Status: accepted; rekey/cache transaction, interruption recovery, target-local
+cache bridge, and optional Nix-store bridge implemented
 
-Target artifacts live in a content-addressed XDG cache and ciphertext-only Nix
-store imports, never Git by default. Rekey is an explicit impure preparation
-step; Nix evaluation fails safely when an expected object is absent.
+Target artifacts live in a content-addressed cache, never Git by default.
+System artifacts belong in a system-owned cache such as
+`/var/lib/nix-seal/cache/v1`; Home Manager artifacts belong in the owning
+user's cache. Rekey is an explicit impure preparation step. The normal Nix
+module interface carries only the absolute local cache path, so it neither
+imports artifacts into the store nor makes a cache export a flake input.
 Transactions use private same-filesystem temporary files, locks, fsync, content
 verification, and atomic rename. Temporary entries use an explicit private
 transaction prefix. Cache open takes the cache lock before removing only
@@ -71,12 +74,14 @@ address with different ciphertext or envelope fails closed. Artifact
 authorization remains a policy/activation operation, so importing an artifact
 never by itself grants it runtime use.
 
-The public Nix library's `artifactBundle` helper consumes one exported target
-artifact directory and requires the exact two-member set
-`ciphertext.age`/`manifest.dsse.json`. It copies ciphertext and signed public
-metadata through `builtins.path`, derives module paths from the bundle, and
-rejects malformed layouts before store import. The helper emits the complete
-operator-supplied `nix-seal rekey` command when the bundle is missing. It never
-reads an identity, invokes a process, or performs rekeying in a derivation;
+The module's `artifactDirectory` option is the normal bridge. It derives the
+two fixed paths from an absolute out-of-store bundle directory, refuses a Nix
+store path or traversal spelling, and leaves all existence, no-follow, and
+signature checks to Rust activation. `artifactBundle` remains a compatibility
+helper for deployments that deliberately need a fixed ciphertext-only store
+closure. It consumes one exported target artifact directory with the exact
+two-member set `ciphertext.age`/`manifest.dsse.json`, copies public ciphertext
+and metadata through `builtins.path`, and derives module paths from it. Neither
+bridge reads an identity, invokes a process, or rekeys in a derivation;
 artifact signatures and target bindings remain verified by the Rust activation
 runtime.

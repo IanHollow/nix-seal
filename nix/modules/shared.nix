@@ -496,7 +496,7 @@ in
               let
                 secret = builtins.head (builtins.attrNames missingSecretArtifacts);
               in
-              "nixSeal secret ${secret} is missing a target ciphertext artifact; run `nix-seal rekey --plan ${toString cfg.planFile} --target ${cfg.targetId} --secret ${secret} --identity /path/to/admin.agekey --signing-key /path/to/approval-signing-key` and import its cache export";
+              "nixSeal secret ${secret} is missing a target ciphertext artifact; run `nix-seal rekey --plan ${toString cfg.planFile} --target ${cfg.targetId} --secret ${secret} --identity /path/to/admin.agekey --signing-key /path/to/approval-signing-key`, then import the ciphertext-only bundle into this target's local nix-seal cache";
           }
           {
             assertion = lib.all (
