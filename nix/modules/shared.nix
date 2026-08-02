@@ -132,7 +132,7 @@ let
         inherit (secret) mode;
         inherit (secret) owner;
         inherit (secret) group;
-        compatibilitySymlink = secret.compatibilitySymlink;
+        inherit (secret) compatibilitySymlink;
       }) secrets;
       templates = lib.mapAttrsToList (name: template: {
         source = toString template.source;

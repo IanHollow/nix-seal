@@ -376,13 +376,13 @@ symlink on a secret's runtime policy:
 nixSeal.secrets."db/password".compatibilitySymlink = "/run/my-app/database-password";
 ```
 
-The link always targets the stable
-`<runtime-root>/current/db/password` path, never a generation directly, so a
-rollback changes the compatibility view together with `current`. Its parent
-must already exist, be owned by the activating user, and not be group- or
-world-writable. A mismatched existing file or symlink is an error; nix-seal
-never silently replaces it. The option is intentionally unavailable for
-templates and is rejected inside the private runtime root.
+The link always targets the stable `<runtime-root>/current/db/password` path,
+never a generation directly, so a rollback changes the compatibility view
+together with `current`. Its parent must already exist, be owned by the
+activating user, and not be group- or world-writable. A mismatched existing file
+or symlink is an error; nix-seal never silently replaces it. The option is
+intentionally unavailable for templates and is rejected inside the private
+runtime root.
 
 `nix-seal check` and `nix-seal doctor` validate every bounded public template
 source and its declared placeholders before a deployment attempt. For a
