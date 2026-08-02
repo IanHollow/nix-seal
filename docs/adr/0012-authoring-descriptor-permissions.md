@@ -4,10 +4,10 @@ Status: accepted; implemented
 
 Authoring creates encrypted staging files, public-output staging files, editor
 workspace values, and deletion tombstone metadata. Permission changes for those
-objects must be applied to the descriptor that created or opened the object,
-not by resolving its pathname again. A pathname chmod creates a substitution
-window in which a local process that can modify the containing directory could
-cause a different file to receive the intended mode.
+objects must be applied to the descriptor that created or opened the object, not
+by resolving its pathname again. A pathname chmod creates a substitution window
+in which a local process that can modify the containing directory could cause a
+different file to receive the intended mode.
 
 On Unix, the authoring crate therefore applies `0600`, `0644`, and `0700`
 through already-open descriptors. Path-based compatibility helpers also reopen
