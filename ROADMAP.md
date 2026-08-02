@@ -25,7 +25,10 @@
   and post-switch restart after activation; service actions now reject untrusted
   manager paths.
 - Phase 3: authoring and lifecycle commands, identity/value rotation,
-  generators, prompts, templates, and provisioning phases.
+  generators, prompts, templates, and provisioning phases. Private identity,
+  prompt-state, generator dependency, and generator-output permissions now use
+  descriptor-relative hardening with regression coverage against pathname
+  substitution races.
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
   starting with a synthetic low-risk secret. Public migration compatibility
   goldens now cover agenix/ragenix, agenix-rekey, SOPS metadata, Clan

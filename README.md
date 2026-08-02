@@ -481,6 +481,12 @@ without exposing process output. Public destinations are repository-relative,
 must not collide with ciphertext sources, and are recorded in the public plan;
 built-in generators currently emit encrypted secret outputs only.
 
+Private identities, prompt state, generator dependencies, and generator outputs
+are permissioned through their already-open descriptors. Generator output paths
+are opened with no-follow and single-link checks before mode `0600` is applied,
+so a pathname substitution cannot redirect a permission change or the bounded
+read to another file.
+
 Set a generator's public `validation` value when its generated credential must
 be replaced after a specific non-secret configuration change. nix-seal records
 only the generator ID, output IDs, and validation value in a private local

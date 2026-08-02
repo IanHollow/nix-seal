@@ -5390,7 +5390,7 @@ fn write_generator_state(
     })?;
     let mut staged = tempfile::NamedTempFile::new_in(parent)
         .context("could not stage generator validation state")?;
-    set_private_file(staged.path())?;
+    set_private_file_handle(staged.as_file())?;
     staged
         .write_all(&bytes)
         .and_then(|()| staged.as_file().sync_all())
@@ -5514,7 +5514,7 @@ fn write_private_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     let mut staged = tempfile::NamedTempFile::new_in(parent)
         .context("could not stage persistent prompt state")?;
-    set_private_file(staged.path())?;
+    set_private_file_handle(staged.as_file())?;
     staged
         .write_all(bytes)
         .and_then(|()| staged.as_file().sync_all())
@@ -5975,7 +5975,7 @@ fn materialize_generator_secret_dependencies(
             .create_new(true)
             .open(&output_path)
             .context("could not create private generator secret dependency")?;
-        set_private_file(&output_path)?;
+        set_private_file_handle(&output)?;
         nix_seal_crypto::decrypt(ciphertext, &mut output, identity).with_context(|| {
             format!("could not decrypt generator secret dependency {secret_id}")
         })?;
@@ -5986,16 +5986,50 @@ fn materialize_generator_secret_dependencies(
     Ok(())
 }
 
+/// Opens a generator-created output without following the path and then
+/// restricts that exact descriptor. The generator controls the directory, so
+/// checking metadata and chmod'ing the pathname separately is insufficient.
+#[cfg(unix)]
+fn open_generator_output(path: &Path) -> Result<fs::File> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+        || metadata.st_nlink != 1
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+    {
+        bail!("constrained generator output has unsafe filesystem metadata");
+    }
+    let file = fs::File::from(descriptor);
+    set_private_file_handle(&file)?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_generator_output(path: &Path) -> Result<fs::File> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        bail!("constrained generator output has unsafe filesystem metadata");
+    }
+    let file = fs::OpenOptions::new().read(true).open(path)?;
+    set_private_file_handle(&file)?;
+    Ok(file)
+}
+
 fn read_generator_output(path: &Path, maximum: u64) -> Result<SecretBox<Vec<u8>>> {
-    let metadata =
-        fs::symlink_metadata(path).context("could not inspect constrained generator output")?;
-    if !metadata.file_type().is_file() || metadata.len() > maximum {
+    let mut input = open_generator_output(path)
+        .context("constrained generator output has unsafe ownership or permissions")?;
+    let metadata = input
+        .metadata()
+        .context("could not inspect constrained generator output")?;
+    if metadata.len() > maximum {
         bail!("constrained generator output is invalid or exceeds its declared limit");
     }
-    set_private_file(path)
-        .context("could not restrict constrained generator output permissions")?;
-    let mut input = open_private_identity(path)
-        .context("constrained generator output has unsafe ownership or permissions")?;
     let capacity =
         usize::try_from(metadata.len()).context("generator output length cannot fit memory")?;
     let mut output = Vec::with_capacity(capacity);
@@ -7566,7 +7600,7 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(path)
         .with_context(|| format!("refusing to overwrite {}", path.display()))?;
-    set_private_file(path)?;
+    set_private_file_handle(&file)?;
     file.write_all(bytes)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
@@ -7579,7 +7613,7 @@ fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(path)
         .context("could not create private generator prompt file")?;
-    set_private_file(path)?;
+    set_private_file_handle(&file)?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .context("could not write private generator prompt file")?;
@@ -7587,9 +7621,18 @@ fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn set_private_file(path: &Path) -> Result<()> {
+/// Restricts an already-open private file descriptor. Permission changes must
+/// be descriptor-relative: changing a pathname after opening it would allow a
+/// concurrent actor (including a hostile generator) to redirect the chmod to a
+/// different file.
+fn set_private_file_handle(file: &fs::File) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_file_handle(_file: &fs::File) -> Result<()> {
     Ok(())
 }
 
@@ -7604,11 +7647,6 @@ fn set_private_directory(path: &Path) -> Result<()> {
 fn set_private_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
-#[cfg(not(unix))]
-fn set_private_file(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 fn cache_status(root: Option<PathBuf>, json: bool) -> Result<()> {
     let root = root.unwrap_or_else(default_cache_root);
     let cache = nix_seal_cache::Cache::open(&root)?;
@@ -9494,6 +9532,23 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         assert_eq!(values.secrets[1].expose_secret(), b"second");
         assert_eq!(values.public.len(), 1);
         assert_eq!(values.public[0].expose_secret(), b"public");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generator_output_permissions_are_restricted_on_the_open_descriptor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temporary = tempfile::tempdir()?;
+        let output = temporary.path().join("output");
+        std::fs::write(&output, b"descriptor-safe")?;
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o644))?;
+
+        let value = read_generator_output(&output, 1024)?;
+        assert_eq!(value.expose_secret(), b"descriptor-safe");
+        assert_eq!(std::fs::metadata(&output)?.mode() & 0o777, 0o600);
         Ok(())
     }
 
