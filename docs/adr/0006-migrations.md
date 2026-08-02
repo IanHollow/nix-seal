@@ -11,13 +11,13 @@ paths that stream reviewed source ciphertexts through replacement recipients
 without materializing plaintext. The bulk path requires an explicit
 repository-relative destination, identity, and recipient set; it reports the
 complete mapping before execution and opens the identity only for `--execute`.
-Every source is staged and round-trip verified before any destination is changed,
-then destinations are committed with private backups and rollback on failure.
-Legacy files remain untouched for side-by-side activation and rollback
-verification. With an explicit repository-relative destination, private identity,
-and replacement recipient set, `--execute` performs a side-by-side bulk rekey of
-validated `secrets/*.age` sources. It streams and round-trip verifies every file
-in one transaction and leaves the legacy tree untouched.
+Every source is staged and round-trip verified before any destination is
+changed, then destinations are committed with private backups and rollback on
+failure. Legacy files remain untouched for side-by-side activation and rollback
+verification. With an explicit repository-relative destination, private
+identity, and replacement recipient set, `--execute` performs a side-by-side
+bulk rekey of validated `secrets/*.age` sources. It streams and round-trip
+verifies every file in one transaction and leaves the legacy tree untouched.
 
 Age-ciphertext migrations distinguish the legacy source identity from the
 destination verification identity. `--identity` decrypts the source; the
