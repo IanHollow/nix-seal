@@ -115,6 +115,11 @@ pub struct ActivationArtifactSpecV2 {
     pub owner: String,
     /// Existing operating-system group that owns the runtime file.
     pub group: String,
+    /// Optional stable symlink outside the runtime root for legacy consumers.
+    /// The link resolves through `runtimeRoot/current/<secret_id>` so rollback
+    /// changes the compatibility view atomically with the active generation.
+    #[serde(default)]
+    pub compatibility_symlink: Option<PathBuf>,
 }
 
 /// One public runtime template declaration.
@@ -202,6 +207,7 @@ impl ActivationSpecV2 {
         }
         let mut destinations = BTreeSet::new();
         let mut secret_ids = BTreeSet::new();
+        let mut compatibility_paths = BTreeSet::new();
         for artifact in &self.artifacts {
             if !artifact.ciphertext.is_absolute()
                 || !artifact.envelope.is_absolute()
@@ -213,6 +219,10 @@ impl ActivationSpecV2 {
                 || parse_mode(&artifact.mode).is_err()
                 || !is_account_name(&artifact.owner)
                 || !is_account_name(&artifact.group)
+                || artifact.compatibility_symlink.as_ref().is_some_and(|path| {
+                    !valid_compatibility_path(path, &self.runtime_root)
+                        || !compatibility_paths.insert(path.clone())
+                })
             {
                 return Err(RuntimeError::InvalidSpec);
             }
@@ -293,6 +303,8 @@ pub struct ActivationArtifact<'a> {
     pub owner: &'a str,
     /// Existing operating-system group that owns the runtime file.
     pub group: &'a str,
+    /// Optional compatibility symlink bound to this secret's active path.
+    pub compatibility_symlink: Option<&'a Path>,
 }
 
 /// One public template and its exact runtime policy.
@@ -366,6 +378,9 @@ pub enum RuntimeError {
     /// Runtime root, destination, generation, or mode violated constraints.
     #[error("invalid runtime destination")]
     InvalidDestination,
+    /// A compatibility symlink could not be safely created or matched.
+    #[error("invalid compatibility symlink destination")]
+    CompatibilityPath,
     /// Artifact or envelope exceeded a v1 resource bound.
     #[error("activation input exceeds v1 safety limits")]
     Limit,
@@ -414,6 +429,7 @@ struct PreparedArtifact<'a> {
     mode: u32,
     uid: u32,
     gid: u32,
+    compatibility_symlink: Option<PathBuf>,
 }
 
 struct PreparedTemplate<'a> {
@@ -431,12 +447,19 @@ fn prepare_artifacts<'a>(
     output_ids: &mut BTreeSet<String>,
 ) -> Result<Vec<PreparedArtifact<'a>>, RuntimeError> {
     let mut prepared = Vec::with_capacity(request.artifacts.len());
+    let mut compatibility_paths = BTreeSet::new();
     for artifact in request.artifacts {
         validate_mode(artifact.mode)?;
         if !secret_ids.insert(artifact.secret_id.clone())
             || !output_ids.insert(artifact.secret_id.as_str().to_owned())
         {
             return Err(RuntimeError::InvalidSpec);
+        }
+        if let Some(path) = artifact.compatibility_symlink
+            && (!valid_compatibility_path(path, request.runtime_root)
+                || !compatibility_paths.insert(path.to_owned()))
+        {
+            return Err(RuntimeError::CompatibilityPath);
         }
         let uid = resolve_user(artifact.owner)?;
         let gid = resolve_group(artifact.group)?;
@@ -472,6 +495,7 @@ fn prepare_artifacts<'a>(
             mode: artifact.mode,
             uid,
             gid,
+            compatibility_symlink: artifact.compatibility_symlink.map(Path::to_path_buf),
         });
     }
     Ok(prepared)
@@ -529,7 +553,6 @@ pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, Run
     let mut output_ids = BTreeSet::new();
     let mut prepared = prepare_artifacts(request, &mut secret_ids, &mut output_ids)?;
     let prepared_templates = prepare_templates(request.templates, &secret_ids, &mut output_ids)?;
-
     let generation = Generation::begin(request.runtime_root)?;
     let mut activated_outputs = Vec::with_capacity(prepared.len() + prepared_templates.len());
     for artifact in &mut prepared {
@@ -551,19 +574,31 @@ pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, Run
         generation.render_template(template)?;
         activated_outputs.push(template.output_id.clone());
     }
+    let compatibility = prepared
+        .iter()
+        .filter_map(|artifact| {
+            artifact
+                .compatibility_symlink
+                .as_deref()
+                .map(|path| (path, artifact.secret_id))
+        })
+        .collect::<Vec<_>>();
     if let Some(generation_path) = generation.matching_current(&activated_outputs)? {
+        let compatibility_changed =
+            ensure_compatibility_symlinks(request.runtime_root, &compatibility)?;
         generation.finish_unchanged(&generation_path, request.plan_hash, request.post_switch)?;
         return Ok(ActivationResult {
             generation_path,
             secret_count: request.artifacts.len(),
             template_count: request.templates.len(),
-            changed: false,
+            changed: !compatibility_changed.is_empty(),
         });
     }
     let generation_path = generation.commit_and_switch_optional(
         request.runtime_generation,
         request.plan_hash,
         request.post_switch,
+        &compatibility,
     )?;
     Ok(ActivationResult {
         generation_path,
@@ -732,7 +767,7 @@ impl Generation {
     /// Atomically publishes and switches the `current` symlink to this complete
     /// generation. Existing generations are never overwritten.
     pub fn commit_and_switch(self, generation: u64) -> Result<PathBuf, RuntimeError> {
-        self.commit_and_switch_optional(Some(generation), "manual", None)
+        self.commit_and_switch_optional(Some(generation), "manual", None, &[])
     }
 
     fn commit_and_switch_optional(
@@ -740,6 +775,7 @@ impl Generation {
         generation: Option<u64>,
         plan_hash: &str,
         actions: Option<&PostSwitchSpecV1>,
+        compatibility: &[(&Path, &Id)],
     ) -> Result<PathBuf, RuntimeError> {
         // A failed post-switch action belongs to the currently active
         // generation. Never replace or clear that durable marker while
@@ -749,14 +785,28 @@ impl Generation {
             return Err(RuntimeError::PendingPostSwitch);
         }
         let generation = generation.map_or_else(|| next_generation(&self.root), Ok)?;
-        sync_tree(self.transaction.path())?;
+        let created_compatibility = ensure_compatibility_symlinks(&self.root, compatibility)?;
+        if let Err(error) = sync_tree(self.transaction.path()) {
+            let _ = remove_compatibility_symlinks(&created_compatibility);
+            return Err(error);
+        }
         let destination = self.root.join(format!("generation-{generation}"));
         if std::fs::symlink_metadata(&destination).is_ok() {
+            remove_compatibility_symlinks(&created_compatibility)?;
             return Err(RuntimeError::InvalidDestination);
         }
         let source = self.transaction.keep();
-        std::fs::rename(source, &destination)?;
-        open_directory_nofollow(&self.root)?.sync_all()?;
+        if let Err(error) = std::fs::rename(source, &destination) {
+            remove_compatibility_symlinks(&created_compatibility)?;
+            return Err(error.into());
+        }
+        if let Err(error) = open_directory_nofollow(&self.root)
+            .and_then(|directory| directory.sync_all().map_err(RuntimeError::Io))
+        {
+            let _ = std::fs::remove_dir_all(&destination);
+            let _ = remove_compatibility_symlinks(&created_compatibility);
+            return Err(error);
+        }
 
         let pending_result = if actions.is_some() {
             write_pending(&self.root, &destination, plan_hash)
@@ -765,12 +815,14 @@ impl Generation {
         };
         if let Err(error) = pending_result {
             let _ = std::fs::remove_dir_all(&destination);
+            let _ = remove_compatibility_symlinks(&created_compatibility);
             return Err(error);
         }
 
         if let Err(error) = switch_current(&self.root, generation) {
             let _ = std::fs::remove_dir_all(&destination);
             let _ = clear_pending(&self.root);
+            let _ = remove_compatibility_symlinks(&created_compatibility);
             return Err(error);
         }
         if let Some(actions) = actions {
@@ -779,6 +831,225 @@ impl Generation {
         }
         Ok(destination)
     }
+}
+
+fn valid_compatibility_path(path: &Path, runtime_root: &Path) -> bool {
+    let Some(value) = path.to_str() else {
+        return false;
+    };
+    nix_seal_core::valid_compatibility_symlink(value)
+        && !path.starts_with(runtime_root)
+        && path.parent().is_some_and(Path::is_absolute)
+}
+
+/// Ensures every declared compatibility destination is a link to the stable
+/// `runtime_root/current/<secret>` view. Existing mismatches are rejected; a
+/// link is never replaced implicitly. The returned paths were created by this
+/// call and may be removed by the caller when a first activation aborts.
+fn ensure_compatibility_symlinks(
+    runtime_root: &Path,
+    links: &[(&Path, &Id)],
+) -> Result<Vec<(PathBuf, PathBuf)>, RuntimeError> {
+    let mut created = Vec::with_capacity(links.len());
+    for (path, secret_id) in links {
+        let target = runtime_root.join("current").join(secret_id.as_str());
+        match install_compatibility_symlink(path, &target, runtime_root) {
+            Ok(true) => created.push(((*path).to_owned(), target)),
+            Ok(false) => {}
+            Err(error) => {
+                let _ = remove_compatibility_symlinks(&created);
+                return Err(error);
+            }
+        }
+    }
+    Ok(created)
+}
+
+fn remove_compatibility_symlinks(links: &[(PathBuf, PathBuf)]) -> Result<(), RuntimeError> {
+    for (path, target) in links.iter().rev() {
+        remove_compatibility_symlink_if_matches(path, target)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_compatibility_symlink(
+    path: &Path,
+    target: &Path,
+    runtime_root: &Path,
+) -> Result<bool, RuntimeError> {
+    use rustix::fs::{
+        AtFlags, FileType, RenameFlags, readlinkat, renameat_with, statat, symlinkat, unlinkat,
+    };
+
+    let parent_path = path
+        .parent()
+        .ok_or(RuntimeError::CompatibilityPath)?
+        .canonicalize()
+        .map_err(|_| RuntimeError::CompatibilityPath)?;
+    let canonical_root = runtime_root
+        .canonicalize()
+        .map_err(|_| RuntimeError::CompatibilityPath)?;
+    if parent_path.starts_with(&canonical_root) {
+        return Err(RuntimeError::CompatibilityPath);
+    }
+    let (parent, name) = open_compatibility_parent(path)?;
+    let metadata = match statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error == rustix::io::Errno::NOENT => None,
+        Err(error) => return Err(RuntimeError::Io(error.into())),
+    };
+    if let Some(metadata) = metadata {
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::Symlink {
+            return Err(RuntimeError::CompatibilityPath);
+        }
+        let existing = readlinkat(&parent, &name, Vec::new())
+            .map_err(|error| RuntimeError::Io(error.into()))?;
+        if existing.as_bytes() == target.as_os_str().as_encoded_bytes() {
+            return Ok(false);
+        }
+        return Err(RuntimeError::CompatibilityPath);
+    }
+
+    // A process-local name avoids sharing a temporary link with another
+    // activation. The final publication still uses RENAME_NOREPLACE, so a
+    // concurrent creator cannot be overwritten.
+    let mut temporary = format!(
+        ".nix-seal-compat-{}-{}",
+        rustix::process::getpid().as_raw_pid(),
+        name.to_string_lossy()
+    );
+    for attempt in 0_u16..1024 {
+        if attempt != 0 {
+            temporary = format!(
+                ".nix-seal-compat-{}-{}-{attempt}",
+                rustix::process::getpid().as_raw_pid(),
+                name.to_string_lossy()
+            );
+        }
+        match symlinkat(target, &parent, &temporary) {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::EXIST => continue,
+            Err(error) => return Err(RuntimeError::Io(error.into())),
+        }
+        match renameat_with(&parent, &temporary, &parent, &name, RenameFlags::NOREPLACE) {
+            Ok(()) => return Ok(true),
+            Err(error) if error == rustix::io::Errno::EXIST => {
+                let _ = unlinkat(&parent, &temporary, AtFlags::empty());
+                let existing = statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|value| RuntimeError::Io(value.into()))?;
+                if FileType::from_raw_mode(existing.st_mode) != FileType::Symlink {
+                    return Err(RuntimeError::CompatibilityPath);
+                }
+                let existing = readlinkat(&parent, &name, Vec::new())
+                    .map_err(|value| RuntimeError::Io(value.into()))?;
+                return if existing.as_bytes() == target.as_os_str().as_encoded_bytes() {
+                    Ok(false)
+                } else {
+                    Err(RuntimeError::CompatibilityPath)
+                };
+            }
+            Err(error) => {
+                let _ = unlinkat(&parent, &temporary, AtFlags::empty());
+                return Err(RuntimeError::Io(error.into()));
+            }
+        }
+    }
+    Err(RuntimeError::CompatibilityPath)
+}
+
+#[cfg(not(unix))]
+fn install_compatibility_symlink(
+    _path: &Path,
+    _target: &Path,
+    _runtime_root: &Path,
+) -> Result<bool, RuntimeError> {
+    Err(RuntimeError::CompatibilityPath)
+}
+
+#[cfg(unix)]
+fn remove_compatibility_symlink_if_matches(path: &Path, target: &Path) -> Result<(), RuntimeError> {
+    use rustix::fs::{AtFlags, FileType, readlinkat, statat, unlinkat};
+    let (parent, name) = open_compatibility_parent(path)?;
+    let metadata = match statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) => metadata,
+        Err(error) if error == rustix::io::Errno::NOENT => return Ok(()),
+        Err(error) => return Err(RuntimeError::Io(error.into())),
+    };
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Symlink {
+        return Err(RuntimeError::CompatibilityPath);
+    }
+    let existing =
+        readlinkat(&parent, &name, Vec::new()).map_err(|error| RuntimeError::Io(error.into()))?;
+    if existing.as_bytes() != target.as_os_str().as_encoded_bytes() {
+        return Err(RuntimeError::CompatibilityPath);
+    }
+    unlinkat(&parent, &name, AtFlags::empty()).map_err(|error| RuntimeError::Io(error.into()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn remove_compatibility_symlink_if_matches(
+    _path: &Path,
+    _target: &Path,
+) -> Result<(), RuntimeError> {
+    Err(RuntimeError::CompatibilityPath)
+}
+
+#[cfg(unix)]
+fn open_compatibility_parent(path: &Path) -> Result<(File, std::ffi::OsString), RuntimeError> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
+    let name = path
+        .file_name()
+        .filter(|value| !value.is_empty())
+        .ok_or(RuntimeError::CompatibilityPath)?
+        .to_owned();
+    // Resolve platform aliases such as macOS `/tmp` -> `/private/tmp` once,
+    // then walk the resulting ancestry descriptor-relatively with no-follow.
+    // The final descriptor walk is the race-resistant boundary; canonicalizing
+    // only an existing parent also means missing parents fail closed.
+    let parent_path = path
+        .parent()
+        .ok_or(RuntimeError::CompatibilityPath)?
+        .canonicalize()
+        .map_err(|_| RuntimeError::CompatibilityPath)?;
+    let mut components = parent_path.components();
+    if components.next() != Some(std::path::Component::RootDir) {
+        return Err(RuntimeError::CompatibilityPath);
+    }
+    let root = open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| RuntimeError::Io(error.into()))?;
+    let mut parent = File::from(root);
+    for component in components {
+        let std::path::Component::Normal(component) = component else {
+            return Err(RuntimeError::CompatibilityPath);
+        };
+        let descriptor = openat(
+            &parent,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| RuntimeError::Io(error.into()))?;
+        parent = File::from(descriptor);
+    }
+    let metadata = fstat(&parent).map_err(|error| RuntimeError::Io(error.into()))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
+        || metadata.st_uid != rustix::process::geteuid().as_raw()
+        || metadata.st_mode & 0o022 != 0
+    {
+        return Err(RuntimeError::CompatibilityPath);
+    }
+    Ok((parent, name))
+}
+
+#[cfg(not(unix))]
+fn open_compatibility_parent(_path: &Path) -> Result<(File, std::ffi::OsString), RuntimeError> {
+    Err(RuntimeError::CompatibilityPath)
 }
 
 fn next_generation(root: &Path) -> Result<u64, RuntimeError> {
@@ -1909,6 +2180,7 @@ mod tests {
             mode: 0o400,
             owner: &fixture.owner,
             group: &fixture.group,
+            compatibility_symlink: None,
         }
     }
 
@@ -2023,6 +2295,86 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn compatibility_symlink_tracks_current_and_rejects_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let fixture = fixture()?;
+        let compatibility_parent = fixture.temporary.path().join("compat");
+        std::fs::create_dir(&compatibility_parent)?;
+        let compatibility = compatibility_parent.join("db-password");
+        let artifact = owned_artifact(&fixture, &fixture.ciphertext, &fixture.secret_id);
+        let artifact = ActivationArtifact {
+            compatibility_symlink: Some(&compatibility),
+            ..artifact
+        };
+        let request = ActivationRequest {
+            runtime_root: &fixture.runtime,
+            runtime_generation: None,
+            plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
+            target_id: &fixture.target_id,
+            recipient_fingerprint: &fixture.fingerprint,
+            tool_version: "0.1.0-alpha.1",
+            now: 101,
+            allowed_clock_skew: 0,
+            target_identity: &fixture.target_identity,
+            artifacts: std::slice::from_ref(&artifact),
+            templates: &[],
+            post_switch: None,
+        };
+        activate(&request)?;
+        assert_eq!(
+            std::fs::read_link(&compatibility)?,
+            fixture.runtime.join("current").join("db/password")
+        );
+        assert_eq!(std::fs::read(&compatibility)?, b"plaintext-canary");
+
+        let second_id = fixture.secret_id.clone();
+        let (second_ciphertext, second_envelope) =
+            write_artifact(&fixture, "second", &second_id, b"new-plaintext")?;
+        let second_artifact = ActivationArtifact {
+            ciphertext: &second_ciphertext,
+            envelope: &second_envelope,
+            compatibility_symlink: Some(&compatibility),
+            ..owned_artifact(&fixture, &second_ciphertext, &second_id)
+        };
+        let second_request = ActivationRequest {
+            artifacts: std::slice::from_ref(&second_artifact),
+            ..request
+        };
+        activate(&second_request)?;
+        assert_eq!(std::fs::read(&compatibility)?, b"new-plaintext");
+        assert_eq!(
+            std::fs::read_link(fixture.runtime.join("current"))?,
+            Path::new("generation-2")
+        );
+
+        let mismatch = compatibility_parent.join("mismatch");
+        let outside = fixture.temporary.path().join("outside");
+        std::fs::write(&outside, b"outside")?;
+        symlink(&outside, &mismatch)?;
+        let mismatch_artifact = ActivationArtifact {
+            compatibility_symlink: Some(&mismatch),
+            ..owned_artifact(&fixture, &fixture.ciphertext, &fixture.secret_id)
+        };
+        let mismatch_request = ActivationRequest {
+            artifacts: std::slice::from_ref(&mismatch_artifact),
+            ..second_request
+        };
+        assert!(matches!(
+            activate(&mismatch_request),
+            Err(RuntimeError::CompatibilityPath)
+        ));
+        assert_eq!(
+            std::fs::read_link(fixture.runtime.join("current"))?,
+            Path::new("generation-2")
+        );
+        Ok(())
+    }
+
     #[test]
     fn renders_templates_and_detects_template_changes() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture()?;
@@ -2102,6 +2454,7 @@ mod tests {
             mode: 0o400,
             owner: &fixture.owner,
             group: &fixture.group,
+            compatibility_symlink: None,
         };
         let source = fixture.temporary.path().join("binary.tmpl");
         std::fs::write(
@@ -2235,6 +2588,7 @@ mod tests {
             mode: "0400".to_owned(),
             owner: fixture.owner.clone(),
             group: fixture.group.clone(),
+            compatibility_symlink: None,
         };
         let template = ActivationTemplateSpecV1 {
             source: fixture.temporary.path().join("public-template"),
@@ -2310,6 +2664,27 @@ mod tests {
             .insert("INVALID".to_owned(), declaration);
         assert!(matches!(
             invalid_placeholder.validate(),
+            Err(RuntimeError::InvalidSpec)
+        ));
+        let mut internal_compatibility = spec.clone();
+        internal_compatibility.artifacts[0].compatibility_symlink =
+            Some(internal_compatibility.runtime_root.join("legacy/password"));
+        assert!(matches!(
+            internal_compatibility.validate(),
+            Err(RuntimeError::InvalidSpec)
+        ));
+        let mut duplicate_compatibility = spec.clone();
+        duplicate_compatibility.artifacts[0].compatibility_symlink =
+            Some(PathBuf::from("/run/nix-seal-legacy/password"));
+        let mut duplicate_compatibility_artifact = duplicate_compatibility.artifacts[0].clone();
+        duplicate_compatibility_artifact.secret_id = Id::parse("db/other")?;
+        duplicate_compatibility_artifact.compatibility_symlink =
+            Some(PathBuf::from("/run/nix-seal-legacy/password"));
+        duplicate_compatibility
+            .artifacts
+            .push(duplicate_compatibility_artifact);
+        assert!(matches!(
+            duplicate_compatibility.validate(),
             Err(RuntimeError::InvalidSpec)
         ));
         let mut encoded = serde_json::to_value(&spec)?;

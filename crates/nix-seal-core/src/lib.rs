@@ -3,7 +3,12 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::{collections::BTreeMap, fmt, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::{Component, Path},
+    str::FromStr,
+};
 use thiserror::Error;
 
 /// Current intermediate-representation schema identifier.
@@ -303,6 +308,13 @@ pub struct RuntimeSettings {
     /// Units reloaded after a successful switch.
     #[serde(default)]
     pub reload_units: Vec<String>,
+    /// Optional stable compatibility symlink to the active runtime file.
+    ///
+    /// The symlink itself is public metadata; it never contains plaintext.
+    /// Activation creates it only when its parent is an existing protected
+    /// directory and refuses to replace a mismatched existing entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility_symlink: Option<String>,
 }
 impl Default for RuntimeSettings {
     fn default() -> Self {
@@ -312,8 +324,36 @@ impl Default for RuntimeSettings {
             mode: "0400".into(),
             restart_units: vec![],
             reload_units: vec![],
+            compatibility_symlink: None,
         }
     }
+}
+
+/// Returns whether a compatibility symlink declaration is a safe absolute
+/// destination spelling. Runtime activation applies additional checks against
+/// the selected runtime root and the actual filesystem ancestry.
+#[must_use]
+pub fn valid_compatibility_symlink(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 4096
+        || !value.starts_with('/')
+        || value.ends_with('/')
+        || value.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let path = Path::new(value);
+    if path == Path::new("/")
+        || path.file_name().is_none()
+        || !value
+            .split('/')
+            .skip(1)
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+    {
+        return false;
+    }
+    path.components()
+        .all(|component| !matches!(component, Component::CurDir | Component::ParentDir))
 }
 
 /// Public lifecycle metadata.
@@ -501,5 +541,24 @@ mod tests {
             assert!(Id::parse(bad).is_err());
         }
         assert!(Id::parse("prod/db-password_v2").is_ok());
+    }
+
+    #[test]
+    fn compatibility_symlink_paths_are_absolute_and_normalized() {
+        for valid in ["/run/app/token", "/var/lib/nix-seal/legacy/db"] {
+            assert!(valid_compatibility_symlink(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "/",
+            "relative/token",
+            "/run/../etc/token",
+            "/run/./token",
+            "/run/token/",
+            "/run/nix\u{7f}seal/token",
+            "/run/nix\u{0085}seal/token",
+        ] {
+            assert!(!valid_compatibility_symlink(invalid), "{invalid:?}");
+        }
     }
 }

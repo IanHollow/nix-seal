@@ -35,6 +35,7 @@ let
       secrets."db/password" = {
         inherit ciphertext envelope;
         sourceCiphertextHash = digest "2";
+        compatibilitySymlink = "/run/nix-seal-legacy/db-password";
       };
       templates."application/config" = {
         source = templateSource;
@@ -282,6 +283,7 @@ let
         (.artifacts | length) == 1 and
         (.templates | length) == 1 and
         .artifacts[0].secretId == "db/password" and
+        .artifacts[0].compatibilitySymlink == "/run/nix-seal-legacy/db-password" and
         .artifacts[0].owner == $owner and
         .artifacts[0].group == $group and
         .templates[0].templateId == "application/config" and

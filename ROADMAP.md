@@ -25,6 +25,10 @@
   and post-switch restart after activation; service actions now reject untrusted
   manager paths. Every authoring and migration transaction now serializes on a
   descriptor-safe, owner-only repository lock in addition to the cache lock.
+  Runtime secrets now support optional compatibility symlinks bound to the
+  stable `current/<secret>` path. Existing parents and links are validated by
+  no-follow descriptors, publication is atomic no-replace, mismatches fail
+  closed, and rollback follows the same `current` switch.
 - Phase 3: authoring and lifecycle commands, identity/value rotation,
   generators, prompts, templates, and provisioning phases. Private identity,
   prompt-state, generator dependency, and generator-output permissions now use

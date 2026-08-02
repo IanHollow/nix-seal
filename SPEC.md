@@ -37,7 +37,8 @@ The object model includes identities, groups, targets, secrets, generators,
 templates, approval policies, and versioned backends. Secrets support binary or
 text values; groups/selectors; rekeyed or advanced direct delivery;
 partitioning, users, activation, or services phases; owner/group/mode; systemd
-credential mapping; reload/restart lists; lifecycle and incident metadata;
+credential mapping; optional compatibility symlinks bound to the active
+generation; reload/restart lists; lifecycle and incident metadata;
 generators and dependencies; public/secret/intermediary outputs; and runtime
 templates. Structured JSON/TOML/YAML/dotenv editing is a logical authoring view.
 Storage is one interoperable age file per secret/output.
@@ -96,6 +97,12 @@ decrypts a complete restrictive generation; and switches only after every value
 is ready. It rejects traversal, links, non-regular files, unsafe parents,
 ownership, and modes. File operations must be directory-relative with no-follow,
 exclusive, close-on-exec, restrictive umask, fsync, and atomic switching.
+Compatibility symlinks are created only below an existing owner-only,
+non-group/world-writable directory, are published with no-replace semantics,
+and must already point to the exact stable `runtimeRoot/current/<secret>` path or
+activation fails. They never point at a generation directly, so rollback updates
+the compatibility view with the same `current` switch. Old or mismatched links
+are never silently overwritten.
 Failure keeps the old generation. Old generations retain old plaintext until
 removed or rebooted. NixOS prefers systemd credentials; compatibility files use
 `/run/nix-seal`. Home Manager uses its runtime directory and macOS reports when

@@ -325,6 +325,7 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
     validate_generator_graph(plan)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
     let mut sources = BTreeSet::new();
     for (id, secret) in &plan.secrets {
@@ -415,6 +416,13 @@ fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
         if !is_private_runtime_mode(&secret.runtime.mode) {
             return Err(PolicyError::Violation(format!(
                 "secret {id} runtime mode must be a nonzero owner-only four-digit octal mode"
+            )));
+        }
+        if let Some(path) = &secret.runtime.compatibility_symlink
+            && !nix_seal_core::valid_compatibility_symlink(path)
+        {
+            return Err(PolicyError::Violation(format!(
+                "secret {id} compatibility symlink must be a safe absolute path without '.' or '..' components"
             )));
         }
         validate_lifecycle(id, &secret.lifecycle)?;
@@ -735,6 +743,11 @@ fn validate_templates(plan: &PlanV1) -> Result<(), PolicyError> {
         if !is_private_runtime_mode(&template.runtime.mode) {
             return Err(PolicyError::Violation(format!(
                 "template {id} runtime mode must be a nonzero owner-only four-digit octal mode"
+            )));
+        }
+        if template.runtime.compatibility_symlink.is_some() {
+            return Err(PolicyError::Violation(format!(
+                "template {id} cannot declare a compatibility symlink"
             )));
         }
         let output_id = Id::parse(format!("templates/{id}"))

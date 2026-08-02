@@ -5127,6 +5127,7 @@ fn delivery_name(delivery: &nix_seal_core::DeliveryMode) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn verify_activation_projection(
     spec: &nix_seal_runtime::ActivationSpecV2,
     policy: &nix_seal_policy::TargetPolicyV1,
@@ -5159,6 +5160,12 @@ fn verify_activation_projection(
             || artifact.owner != secret.runtime.owner
             || artifact.group != secret.runtime.group
             || artifact.mode != secret.runtime.mode
+            || artifact.compatibility_symlink.as_deref()
+                != secret
+                    .runtime
+                    .compatibility_symlink
+                    .as_deref()
+                    .map(Path::new)
         {
             bail!(
                 "runtime policy for secret {} differs from the canonical plan",
@@ -6959,6 +6966,7 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
                 mode: artifact.parsed_mode()?,
                 owner: &artifact.owner,
                 group: &artifact.group,
+                compatibility_symlink: artifact.compatibility_symlink.as_deref(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -11180,6 +11188,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             mode: "0400".to_owned(),
             restart_units: Vec::new(),
             reload_units: Vec::new(),
+            compatibility_symlink: None,
         };
         let mut plan = nix_seal_core::PlanV1::default();
         plan.identities.insert(
@@ -11286,6 +11295,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 mode: "0400".to_owned(),
                 owner: owner.clone(),
                 group: group.clone(),
+                compatibility_symlink: None,
             }],
             templates: vec![nix_seal_runtime::ActivationTemplateSpecV1 {
                 source: template_path,

@@ -367,6 +367,23 @@ Rendered files use the same owner/group/mode controls, unchanged generation
 detection, atomic switch, rollback preservation, and post-switch action protocol
 as ordinary secret files.
 
+## Compatibility symlinks
+
+Legacy applications that require a fixed path can opt into a compatibility
+symlink on a secret's runtime policy:
+
+```nix
+nixSeal.secrets."db/password".compatibilitySymlink = "/run/my-app/database-password";
+```
+
+The link always targets the stable
+`<runtime-root>/current/db/password` path, never a generation directly, so a
+rollback changes the compatibility view together with `current`. Its parent
+must already exist, be owned by the activating user, and not be group- or
+world-writable. A mismatched existing file or symlink is an error; nix-seal
+never silently replaces it. The option is intentionally unavailable for
+templates and is rejected inside the private runtime root.
+
 `nix-seal check` and `nix-seal doctor` validate every bounded public template
 source and its declared placeholders before a deployment attempt. For a
 deliberate local render outside activation, use an absolute, existing private

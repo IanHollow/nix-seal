@@ -42,6 +42,22 @@ let
   credentialNameType = types.addCheck (types.strMatching "[A-Za-z0-9_.@-]{1,255}") (
     name: name != "." && name != ".."
   );
+  compatibilitySymlinkType = types.nullOr (
+    types.addCheck types.str (
+      path:
+      lib.hasPrefix "/" path
+      && path != "/"
+      && !lib.hasPrefix "/nix/store/" path
+      && !lib.hasSuffix "/" path
+      && !lib.hasInfix "/../" path
+      && !lib.hasInfix "/./" path
+      && !lib.hasSuffix "/.." path
+      && !lib.hasSuffix "/." path
+      && !(builtins.any (character: character < " " || character == "\u007f") (
+        lib.stringToCharacters path
+      ))
+    )
+  );
   configuredSecrets = lib.filterAttrs (_: secret: secret.ciphertext != null) cfg.secrets;
   missingSecretArtifacts = lib.filterAttrs (_: secret: secret.ciphertext == null) cfg.secrets;
   configuredTemplates = lib.filterAttrs (_: template: template.source != null) cfg.templates;
@@ -116,6 +132,7 @@ let
         inherit (secret) mode;
         inherit (secret) owner;
         inherit (secret) group;
+        compatibilitySymlink = secret.compatibilitySymlink;
       }) secrets;
       templates = lib.mapAttrsToList (name: template: {
         source = toString template.source;
@@ -232,6 +249,15 @@ in
               mode = mkOption {
                 type = privateModeType;
                 default = "0400";
+              };
+              compatibilitySymlink = mkOption {
+                type = compatibilitySymlinkType;
+                default = null;
+                description = ''
+                  Optional absolute compatibility symlink for legacy consumers.
+                  Activation binds it to the stable current-generation path and
+                  refuses to replace a mismatched existing filesystem entry.
+                '';
               };
               artifact = mkOption {
                 type = types.nullOr types.path;
