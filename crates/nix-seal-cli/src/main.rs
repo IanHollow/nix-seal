@@ -3770,6 +3770,12 @@ fn build_secretctl_candidate_plan(
     let administrators = parse_candidate_administrators(administrator_specs, delivery)?;
     let mut plan = nix_seal_core::PlanV1::default();
     plan.identities.extend(signers);
+    if administrators
+        .keys()
+        .any(|id| plan.identities.contains_key(id))
+    {
+        bail!("candidate signer and administrator IDs must be distinct");
+    }
     plan.identities
         .extend(administrators.iter().map(|(id, public)| {
             (
@@ -3795,13 +3801,19 @@ fn build_secretctl_candidate_plan(
         }
         let kind = candidate_target_kind(legacy_id, &target.target_type)?;
         let username = candidate_target_username(legacy_id, &target.target_type)?;
-        plan.identities.insert(
-            identity_id.clone(),
-            nix_seal_core::Identity {
-                kind: nix_seal_core::IdentityKind::Target,
-                public,
-            },
-        );
+        if plan
+            .identities
+            .insert(
+                identity_id.clone(),
+                nix_seal_core::Identity {
+                    kind: nix_seal_core::IdentityKind::Target,
+                    public,
+                },
+            )
+            .is_some()
+        {
+            bail!("secretctl candidate generated an identity ID collision");
+        }
         plan.targets.insert(
             target_id.clone(),
             nix_seal_core::Target {
@@ -10588,6 +10600,19 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 ],
                 &[format!("release={}", signer.encode_public()?)],
                 &[],
+                CandidateDelivery::Rekeyed,
+            )
+            .is_err()
+        );
+        assert!(
+            build_secretctl_candidate_plan(
+                &index,
+                &[
+                    "home:ianmh@desktop=x86_64-linux".to_owned(),
+                    "host:nixos:desktop=x86_64-linux".to_owned(),
+                ],
+                &[format!("same-id={}", signer.encode_public()?)],
+                &[format!("same-id={first}")],
                 CandidateDelivery::Rekeyed,
             )
             .is_err()
