@@ -36,11 +36,11 @@ Secrets may additionally declare one compatibility symlink outside the private
 runtime root. The runtime resolves its existing parent by no-follow directory
 descriptors, requires the activating user to own a non-group/world-writable
 parent, rejects user-owned symlink ancestry before resolving platform aliases,
-and publishes the link with atomic no-replace semantics. A pre-existing
-link is accepted only when it points exactly to `runtimeRoot/current/<secret>`;
-regular files, mismatched links, missing parents, and links inside the runtime
-root fail closed. Because the link targets `current` rather than a generation,
-rollback updates legacy consumers atomically with the generation switch.
+and publishes the link with atomic no-replace semantics. A pre-existing link is
+accepted only when it points exactly to `runtimeRoot/current/<secret>`; regular
+files, mismatched links, missing parents, and links inside the runtime root fail
+closed. Because the link targets `current` rather than a generation, rollback
+updates legacy consumers atomically with the generation switch.
 
 On NixOS, `users` runs after `specialfs` and is an explicit dependency of the
 standard user-creation activation script, so its output must be `root:root`. The
