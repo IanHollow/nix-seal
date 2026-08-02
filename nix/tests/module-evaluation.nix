@@ -186,6 +186,22 @@ let
       }
     ];
   };
+  partitioningInstaller = inputs.nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = [
+      self.nixosModules.default
+      common
+      {
+        system.stateVersion = "26.05";
+        nixSeal.installerMode = true;
+        nixSeal.secrets."disk/token" = {
+          inherit ciphertext envelope;
+          sourceCiphertextHash = digest "7";
+          phase = "partitioning";
+        };
+      }
+    ];
+  };
   phaseTemplateViolation = inputs.nixpkgs.lib.nixosSystem {
     inherit system;
     modules = [
@@ -432,8 +448,10 @@ in
       == "/run/nix-seal/users/current/bootstrap/token";
     assert lib.elem "nixSealUsers" nixosPhased.config.system.activationScripts.users.deps;
     assert hasFailedAssertion
-      "nixSeal partitioning-phase secrets are not scheduled by generic NixOS activation; provision config.nixSeal.activationSpecs.partitioning over a protected installation channel"
+      "nixSeal partitioning-phase secrets require explicit nixSeal.installerMode=true; the module never schedules partitioning activation automatically"
       partitioningPhase;
+    assert partitioningInstaller.config.nixSeal.activationSpecs ? partitioning;
+    assert !(partitioningInstaller.config.system.activationScripts ? nixSealPartitioning);
     assert hasFailedAssertion
       "every nixSeal template may reference secrets from exactly its own activation phase"
       phaseTemplateViolation;
@@ -446,6 +464,12 @@ in
         .artifacts[0].phase == "users" and
         (.templates | length) == 0
       ' ${nixosPhased.config.nixSeal.activationSpecs.users} >/dev/null
+      jq -e '
+        .phase == "partitioning" and
+        .runtimeRoot == "/run/nix-seal/partitioning" and
+        (.artifacts | length) == 1 and
+        .artifacts[0].secretId == "disk/token"
+      ' ${partitioningInstaller.config.nixSeal.activationSpecs.partitioning} >/dev/null
       grep -F -- "--identity /run/keys/nix-seal-target" ${nixosUsersActivation} >/dev/null
       touch "$out"
     '';

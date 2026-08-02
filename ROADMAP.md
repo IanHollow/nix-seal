@@ -31,7 +31,9 @@
   substitution races. Canonical authoring staging, editor values, public-output
   staging, and deletion tombstone metadata now apply permissions through
   already-open descriptors; compatibility path helpers verify no-follow type,
-  ownership, and link count before changing modes.
+  ownership, and link count before changing modes. NixOS exposes an explicit
+  installer-mode opt-in for partitioning activation specs while keeping that
+  phase out of the normal activation graph.
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
   starting with a synthetic low-risk secret. Public migration compatibility
   goldens now cover agenix/ragenix, agenix-rekey, SOPS metadata, Clan

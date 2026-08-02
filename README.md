@@ -43,10 +43,14 @@ phases use isolated roots such as `/run/nix-seal/users/current`.
 NixOS schedules `users` after `specialfs` and before account creation,
 `activation` after account creation, and `services` after the normal nix-seal
 activation step. `users` outputs must remain `root:root` because user accounts
-may not exist yet. The generic module does not schedule `partitioning`: its
-public spec must be carried over a protected installer channel before the target
-filesystem is mounted. nix-darwin currently rejects non-`activation` phases
-rather than silently running them at an unsafe point. Home Manager orders
+may not exist yet. The generic module rejects `partitioning` unless
+`nixSeal.installerMode = true` is explicitly set. Installer mode emits the
+public `activationSpecs.partitioning` document but schedules no normal
+activation script: reviewed installer orchestration must carry that document
+and its ciphertext-only artifacts over a protected channel, then invoke the
+internal `nix-seal activate` entrypoint with an out-of-store target identity.
+nix-darwin currently rejects non-`activation` phases rather than silently
+running them at an unsafe point. Home Manager orders
 `users`, `activation`, and `services` in its activation DAG with separate
 `$XDG_RUNTIME_DIR/nix-seal` roots; it rejects installer-only `partitioning`.
 

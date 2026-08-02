@@ -51,11 +51,26 @@ in
         };
     })
   ];
+  options.nixSeal.installerMode = lib.mkOption {
+    type = lib.types.bool;
+    default = false;
+    description = ''
+      Explicitly enable installer-only partitioning activation-spec
+      generation. This does not schedule an activation script; reviewed
+      installer orchestration must transport the public spec and ciphertext
+      artifacts over its protected channel and invoke `nix-seal activate`
+      with an out-of-store target identity.
+    '';
+  };
   config = lib.mkIf cfg.enable {
+    warnings = lib.optional cfg.installerMode ''
+      nixSeal installer mode is active: partitioning is not scheduled by the
+      normal NixOS activation graph. Invoke the generated activation spec only
+      from reviewed installer orchestration over a protected channel.'';
     assertions = [
       {
-        assertion = !(cfg.activationSpecs ? partitioning);
-        message = "nixSeal partitioning-phase secrets are not scheduled by generic NixOS activation; provision config.nixSeal.activationSpecs.partitioning over a protected installation channel";
+        assertion = !(cfg.activationSpecs ? partitioning) || cfg.installerMode;
+        message = "nixSeal partitioning-phase secrets require explicit nixSeal.installerMode=true; the module never schedules partitioning activation automatically";
       }
       {
         assertion =
