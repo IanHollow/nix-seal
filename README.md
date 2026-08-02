@@ -209,45 +209,43 @@ nix-seal provision --plan plan.v1.json --target host.example --generation 4 \
 Provisioning never transmits plaintext. Use the explicit ciphertext-only cache
 export/import flow or `nix copy` for a remote build or deployment transport.
 
-### Nix/store artifact bridge
+### Target-local artifact cache (recommended)
 
-After provisioning, export the ciphertext-only cache on the administrator
-machine and import that directory into the deployment checkout or build host:
+After provisioning, transfer the ciphertext-only artifact to the target and
+import it into that target's local cache. This keeps artifacts out of Git,
+flake inputs, and the Nix store. A host cache is normally
+`/var/lib/nix-seal/cache/v1`; a Home Manager cache is normally
+`$XDG_CACHE_HOME/nix-seal/v1`.
 
 ```console
 nix-seal cache export --destination /tmp/nix-seal-cache-export
-nix-seal cache import --source /tmp/nix-seal-cache-export
+nix-seal cache import --source /tmp/nix-seal-cache-export --root /var/lib/nix-seal/cache/v1
 ```
 
 Each target artifact is a directory containing exactly `ciphertext.age` and
-`manifest.dsse.json`. The public flake library can import one such directory
-without running a command or reading an identity:
+`manifest.dsse.json`. Point the module at the target-local directory; Nix does
+not read it while evaluating or building the configuration:
 
 ```nix
-let
-  artifact = nixSeal.lib.artifactBundle {
-    path = ./artifacts/host-example/db-password;
-    target = "host.example";
-    secret = "db/password";
-  };
-in
 {
   nixSeal.secrets."db/password" = {
-    artifact = artifact;
+    artifactDirectory = "/var/lib/nix-seal/cache/v1/artifacts/<cache-key>";
     sourceCiphertextHash = "…64 lowercase hexadecimal characters…";
   };
 }
 ```
 
-For integrations that need the two public paths directly, use
-`nixSeal.lib.artifactPaths artifact` instead of reconstructing the layout.
+The Rust activation runtime opens this directory with its normal no-follow
+checks and verifies the signed manifest, target binding, and hashes before it
+decrypts anything. Keep the cache scoped: import host artifacts only into the
+host cache and user artifacts only into the owning user's cache.
 
-The module derives the ciphertext and signed-envelope paths from `artifact` and
-rejects overrides. The helper rejects missing paths, symlinks, extra files, and
-wrong artifact layouts before they enter the store. If an artifact is absent,
-evaluation fails with the exact `nix-seal rekey` command to run; rekeying is
-never implicit in a Nix derivation. Artifact contents are ciphertext and public
-metadata only, so importing them into the store does not place plaintext there.
+### Nix/store artifact bridge (compatibility only)
+
+`nixSeal.lib.artifactBundle` remains available when a deployment deliberately
+needs a fixed, ciphertext-only store closure. It imports a two-file artifact
+directory and derives its public paths. New configurations should use
+`artifactDirectory` instead; rekeying is never implicit in either workflow.
 
 Deletion never unlinks canonical ciphertext directly. It requires `--yes` and
 atomically moves the ciphertext into a private, collision-safe

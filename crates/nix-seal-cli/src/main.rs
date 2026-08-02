@@ -5985,6 +5985,24 @@ fn canonical_ciphertext_hash(repository_root: &Path, relative: &str) -> Result<S
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+#[cfg(target_os = "macos")]
+fn default_cache_root() -> PathBuf {
+    // Keep authoring/provisioning artifacts in the platform's user cache. The
+    // Home Manager module uses the same location on macOS, so a user secret is
+    // never accidentally delivered through a system-scoped cache.
+    std::env::var_os("XDG_CACHE_HOME")
+        .map_or_else(
+            || {
+                std::env::var_os("HOME")
+                    .map_or_else(|| PathBuf::from("."), PathBuf::from)
+                    .join("Library/Caches")
+            },
+            PathBuf::from,
+        )
+        .join("nix-seal/v1")
+}
+
+#[cfg(not(target_os = "macos"))]
 fn default_cache_root() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map_or_else(
@@ -6362,6 +6380,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
+                runtime_overrides: Default::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,
@@ -6472,6 +6491,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
+                runtime_overrides: Default::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: Some(nix_seal_core::Id::parse("release")?),
                 repository_only: false,
@@ -6565,6 +6585,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
+                runtime_overrides: Default::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,
@@ -6688,6 +6709,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
+                runtime_overrides: Default::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,
@@ -6925,6 +6947,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
+                runtime_overrides: Default::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,
@@ -7464,6 +7487,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
+                runtime_overrides: Default::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,
@@ -7828,6 +7852,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
+                runtime_overrides: Default::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,
@@ -8121,6 +8146,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
+                runtime_overrides: Default::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,
@@ -8136,6 +8162,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
+                runtime_overrides: Default::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,
@@ -8307,6 +8334,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: runtime.clone(),
+                runtime_overrides: Default::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,
@@ -8513,6 +8541,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: nix_seal_core::ActivationPhase::Activation,
                 runtime: nix_seal_core::RuntimeSettings::default(),
+                runtime_overrides: Default::default(),
                 lifecycle: nix_seal_core::Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,

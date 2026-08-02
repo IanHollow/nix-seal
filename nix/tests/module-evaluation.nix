@@ -97,6 +97,25 @@ let
       }
     ];
   };
+  nixosArtifactDirectory = inputs.nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = [
+      self.nixosModules.default
+      {
+        system.stateVersion = "26.05";
+        nixSeal = {
+          enable = true;
+          targetId = "host.test";
+          identityFile = "/run/keys/nix-seal-target";
+          inherit planFile;
+          secrets."db/password" = {
+            artifactDirectory = "/var/lib/nix-seal/cache/v1/artifacts/test-cache-key";
+            sourceCiphertextHash = digest "2";
+          };
+        };
+      }
+    ];
+  };
   credentialCollision = inputs.nixpkgs.lib.nixosSystem {
     inherit system;
     modules = [
@@ -408,6 +427,18 @@ in
     pkgs.runCommand "nix-seal-module-artifact-bundle" { nativeBuildInputs = [ pkgs.jq ]; } ''
       jq -e '.artifacts[0].ciphertext == "${importedArtifact}/ciphertext.age" and .artifacts[0].envelope == "${importedArtifact}/manifest.dsse.json"' \
         ${nixosArtifactBundle.config.nixSeal.activationSpec} >/dev/null
+      touch "$out"
+    '';
+  module-artifact-directory =
+    assert
+      nixosArtifactDirectory.config.nixSeal.secrets."db/password".ciphertext
+      == "/var/lib/nix-seal/cache/v1/artifacts/test-cache-key/ciphertext.age";
+    assert
+      nixosArtifactDirectory.config.nixSeal.secrets."db/password".envelope
+      == "/var/lib/nix-seal/cache/v1/artifacts/test-cache-key/manifest.dsse.json";
+    pkgs.runCommand "nix-seal-module-artifact-directory" { nativeBuildInputs = [ pkgs.jq ]; } ''
+      jq -e '.artifacts[0].ciphertext == "/var/lib/nix-seal/cache/v1/artifacts/test-cache-key/ciphertext.age" and .artifacts[0].envelope == "/var/lib/nix-seal/cache/v1/artifacts/test-cache-key/manifest.dsse.json"' \
+        ${nixosArtifactDirectory.config.nixSeal.activationSpec} >/dev/null
       touch "$out"
     '';
   module-nixos =

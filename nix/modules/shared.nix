@@ -37,6 +37,20 @@ let
     "services"
   ];
   privateIdentityPathIsSafe = value: lib.hasPrefix "/" value && !(lib.hasPrefix "/nix/store/" value);
+  artifactDirectoryIsSafe =
+    value:
+    lib.hasPrefix "/" value
+    && value != "/"
+    && !(lib.hasPrefix "/nix/store/" value)
+    && !lib.hasSuffix "/" value
+    && !lib.hasInfix "/../" value
+    && !lib.hasInfix "/./" value
+    && !lib.hasSuffix "/.." value
+    && !lib.hasSuffix "/." value
+    && !(builtins.any (character: character < " " || character == "\u007f") (
+      lib.stringToCharacters value
+    ));
+  runtimeArtifactPathType = types.coercedTo types.path toString types.str;
   unitType = types.strMatching "[A-Za-z0-9_.@:-]{1,256}";
   serviceUnitType = types.strMatching "[A-Za-z0-9_.@:-]{1,247}\\.service";
   credentialNameType = types.addCheck (types.strMatching "[A-Za-z0-9_.@-]{1,255}") (
@@ -269,22 +283,38 @@ in
                   derived automatically and may enter the Nix store.
                 '';
               };
+              artifactDirectory = mkOption {
+                type = types.nullOr (types.addCheck types.str artifactDirectoryIsSafe);
+                default = null;
+                description = ''
+                  Absolute, out-of-store directory containing this target's
+                  ciphertext-only artifact bundle. This is the recommended
+                  delivery mechanism: provision or import the bundle into the
+                  target-local nix-seal cache, then configure this directory.
+                  The module does not read or copy it during evaluation; the
+                  Rust activation runtime verifies it before decryption.
+                '';
+              };
               ciphertext = mkOption {
-                type = types.nullOr types.path;
+                type = types.nullOr runtimeArtifactPathType;
                 default =
-                  if config.nixSeal.secrets.${name}.artifact == null then
-                    null
+                  if config.nixSeal.secrets.${name}.artifact != null then
+                    "${config.nixSeal.secrets.${name}.artifact}/ciphertext.age"
+                  else if config.nixSeal.secrets.${name}.artifactDirectory != null then
+                    "${config.nixSeal.secrets.${name}.artifactDirectory}/ciphertext.age"
                   else
-                    "${config.nixSeal.secrets.${name}.artifact}/ciphertext.age";
-                description = "Target-encrypted artifact path. Ciphertext may enter the Nix store.";
+                    null;
+                description = "Target-encrypted artifact path. A target-local artifact directory is preferred over a Nix store path.";
               };
               envelope = mkOption {
-                type = types.nullOr types.path;
+                type = types.nullOr runtimeArtifactPathType;
                 default =
-                  if config.nixSeal.secrets.${name}.artifact == null then
-                    null
+                  if config.nixSeal.secrets.${name}.artifact != null then
+                    "${config.nixSeal.secrets.${name}.artifact}/manifest.dsse.json"
+                  else if config.nixSeal.secrets.${name}.artifactDirectory != null then
+                    "${config.nixSeal.secrets.${name}.artifactDirectory}/manifest.dsse.json"
                   else
-                    "${config.nixSeal.secrets.${name}.artifact}/manifest.dsse.json";
+                    null;
                 description = "Signed public artifact manifest path.";
               };
               sourceCiphertextHash = mkOption {
@@ -471,13 +501,22 @@ in
           {
             assertion = lib.all (
               secret:
-              secret.artifact == null
-              || (
+              (secret.artifact == null || (
                 secret.ciphertext == "${secret.artifact}/ciphertext.age"
                 && secret.envelope == "${secret.artifact}/manifest.dsse.json"
-              )
+              ))
+              && (secret.artifactDirectory == null || (
+                secret.ciphertext == "${secret.artifactDirectory}/ciphertext.age"
+                && secret.envelope == "${secret.artifactDirectory}/manifest.dsse.json"
+              ))
             ) (builtins.attrValues cfg.secrets);
             message = "nixSeal artifact bundles derive ciphertext and envelope paths; do not override either path";
+          }
+          {
+            assertion = lib.all (
+              secret: secret.artifact == null || secret.artifactDirectory == null
+            ) (builtins.attrValues cfg.secrets);
+            message = "nixSeal secrets must use either artifact (Nix-store bridge) or artifactDirectory (target-local cache), not both";
           }
           {
             assertion = lib.all (
