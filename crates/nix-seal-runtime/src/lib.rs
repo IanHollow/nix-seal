@@ -896,6 +896,9 @@ fn install_compatibility_symlink(
     let parent_path = path
         .parent()
         .ok_or(RuntimeError::CompatibilityPath)?
+        .to_owned();
+    reject_user_owned_source_symlinks(&parent_path).map_err(|_| RuntimeError::CompatibilityPath)?;
+    let parent_path = parent_path
         .canonicalize()
         .map_err(|_| RuntimeError::CompatibilityPath)?;
     let canonical_root = runtime_root
@@ -1009,45 +1012,30 @@ fn remove_compatibility_symlink_if_matches(
 
 #[cfg(unix)]
 fn open_compatibility_parent(path: &Path) -> Result<(File, std::ffi::OsString), RuntimeError> {
-    use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
+    use rustix::fs::{FileType, fstat};
     let name = path
         .file_name()
         .filter(|value| !value.is_empty())
         .ok_or(RuntimeError::CompatibilityPath)?
         .to_owned();
-    // Resolve platform aliases such as macOS `/tmp` -> `/private/tmp` once,
-    // then walk the resulting ancestry descriptor-relatively with no-follow.
-    // The final descriptor walk is the race-resistant boundary; canonicalizing
-    // only an existing parent also means missing parents fail closed.
-    let parent_path = path
-        .parent()
-        .ok_or(RuntimeError::CompatibilityPath)?
-        .canonicalize()
-        .map_err(|_| RuntimeError::CompatibilityPath)?;
-    let mut components = parent_path.components();
-    if components.next() != Some(std::path::Component::RootDir) {
-        return Err(RuntimeError::CompatibilityPath);
-    }
-    let root = open(
-        "/",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| RuntimeError::Io(error.into()))?;
-    let mut parent = File::from(root);
-    for component in components {
-        let std::path::Component::Normal(component) = component else {
-            return Err(RuntimeError::CompatibilityPath);
-        };
-        let descriptor = openat(
-            &parent,
-            component,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| RuntimeError::Io(error.into()))?;
-        parent = File::from(descriptor);
-    }
+    // Open the declared ancestry directly first. This avoids a path
+    // canonicalization race for ordinary paths. Resolve platform aliases such
+    // as macOS `/tmp` -> `/private/tmp` only after a no-follow walk has shown a
+    // root-owned symlink and user-owned symlink ancestry has been rejected.
+    let parent_path = path.parent().ok_or(RuntimeError::CompatibilityPath)?;
+    let parent = match open_directory_chain_nofollow(parent_path) {
+        Ok(parent) => parent,
+        Err(RuntimeError::UnsafeSource) => {
+            reject_user_owned_source_symlinks(parent_path)
+                .map_err(|_| RuntimeError::CompatibilityPath)?;
+            let canonical_parent = parent_path
+                .canonicalize()
+                .map_err(|_| RuntimeError::CompatibilityPath)?;
+            open_directory_chain_nofollow(&canonical_parent)
+                .map_err(|_| RuntimeError::CompatibilityPath)?
+        }
+        Err(_) => return Err(RuntimeError::CompatibilityPath),
+    };
     let metadata = fstat(&parent).map_err(|error| RuntimeError::Io(error.into()))?;
     if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
         || metadata.st_uid != rustix::process::geteuid().as_raw()
@@ -2009,9 +1997,16 @@ fn open_source_parent(path: &Path) -> Result<(File, std::ffi::OsString), Runtime
         .ok_or(RuntimeError::UnsafeSource)?
         .to_owned();
     let parent_path = path.parent().ok_or(RuntimeError::UnsafeSource)?;
-    reject_user_owned_source_symlinks(parent_path)?;
-    let canonical_parent = parent_path.canonicalize().map_err(RuntimeError::Io)?;
-    Ok((open_directory_chain_nofollow(&canonical_parent)?, name))
+    let parent = match open_directory_chain_nofollow(parent_path) {
+        Ok(parent) => parent,
+        Err(RuntimeError::UnsafeSource) => {
+            reject_user_owned_source_symlinks(parent_path)?;
+            let canonical_parent = parent_path.canonicalize().map_err(RuntimeError::Io)?;
+            open_directory_chain_nofollow(&canonical_parent)?
+        }
+        Err(error) => return Err(error),
+    };
+    Ok((parent, name))
 }
 
 #[cfg(unix)]
@@ -2537,6 +2532,23 @@ mod tests {
             std::fs::read_link(fixture.runtime.join("current"))?,
             Path::new("generation-2")
         );
+
+        let linked_parent = fixture.temporary.path().join("linked-compat");
+        symlink(&compatibility_parent, &linked_parent)?;
+        let linked_compatibility = linked_parent.join("redirected-password");
+        let linked_artifact = ActivationArtifact {
+            compatibility_symlink: Some(&linked_compatibility),
+            ..owned_artifact(&fixture, &fixture.ciphertext, &fixture.secret_id)
+        };
+        let linked_request = ActivationRequest {
+            artifacts: std::slice::from_ref(&linked_artifact),
+            ..second_request
+        };
+        assert!(matches!(
+            activate(&linked_request),
+            Err(RuntimeError::CompatibilityPath)
+        ));
+        assert!(!linked_compatibility.exists());
         Ok(())
     }
 

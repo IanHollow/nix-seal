@@ -35,7 +35,8 @@ generation while preventing a later phase from implicitly consuming it.
 Secrets may additionally declare one compatibility symlink outside the private
 runtime root. The runtime resolves its existing parent by no-follow directory
 descriptors, requires the activating user to own a non-group/world-writable
-parent, and publishes the link with atomic no-replace semantics. A pre-existing
+parent, rejects user-owned symlink ancestry before resolving platform aliases,
+and publishes the link with atomic no-replace semantics. A pre-existing
 link is accepted only when it points exactly to `runtimeRoot/current/<secret>`;
 regular files, mismatched links, missing parents, and links inside the runtime
 root fail closed. Because the link targets `current` rather than a generation,

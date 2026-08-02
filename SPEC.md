@@ -101,9 +101,12 @@ is ready. It rejects traversal, links, non-regular files, unsafe parents,
 ownership, and modes. File operations must be directory-relative with no-follow,
 exclusive, close-on-exec, restrictive umask, fsync, and atomic switching.
 Compatibility symlinks are created only below an existing owner-only,
-non-group/world-writable directory, are published with no-replace semantics, and
-must already point to the exact stable `runtimeRoot/current/<secret>` path or
-activation fails. They never point at a generation directly, so rollback updates
+non-group/world-writable directory. User-owned symlink components in the parent
+ancestry are rejected before platform aliases are canonicalized; the resulting
+directory is opened descriptor-relatively with no-follow operations. Links are
+published with no-replace semantics and must already point to the exact stable
+`runtimeRoot/current/<secret>` path or activation fails. They never point at a
+generation directly, so rollback updates
 the compatibility view with the same `current` switch. Old or mismatched links
 are never silently overwritten. Failure keeps the old generation. Old
 generations retain old plaintext until removed or rebooted. NixOS prefers
