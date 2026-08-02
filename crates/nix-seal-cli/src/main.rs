@@ -8800,6 +8800,20 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
     }
 
     #[test]
+    fn collection_schema_matches_the_mapping_parser_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/collection-v1.schema.json"))?;
+        assert_eq!(
+            schema["properties"]["schema"]["const"],
+            "nix-seal.collection.v1"
+        );
+        assert_eq!(schema["properties"]["entries"]["maxItems"], 10_000);
+        assert_eq!(schema["additionalProperties"], false);
+        Ok(())
+    }
+
+    #[test]
     fn canonical_secret_rekey_is_dry_run_first_and_replaces_recipients_atomically()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
