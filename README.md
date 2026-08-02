@@ -471,10 +471,15 @@ public-key format or a standard `ssh-ed25519` public key. The corresponding
 `--signing-key` file may be a native key or an unencrypted OpenSSH Ed25519
 private key. SSH approvals use a standard PEM `sshsig`, bound to a dedicated
 nix-seal namespace and the same DSSE payload as native approvals; public-key
-comments do not affect authorization. The client does not call `ssh-keygen` or
-`ssh-agent`, and deliberately rejects SSH RSA, ECDSA, FIDO/U2F, agent-backed,
-and encrypted OpenSSH signing keys until those paths have their own hardened
-protocol design.
+comments do not affect authorization. For private keys held by a compatible
+local agent, the file may instead contain
+`NIX-SEAL-SSH-AGENT-ED25519-v1:ssh-ed25519 ...`; nix-seal then requires
+`SSH_AUTH_SOCK`, selects the exact public key in the agent sign request, uses
+the standard bounded Unix-agent protocol with a ten-second I/O timeout, and
+never reads or persists the private key. Agent use is explicit rather than
+inferred from the environment. SSH RSA, ECDSA, FIDO/U2F security-key algorithms,
+encrypted OpenSSH files, and interactive agent prompts remain rejected until
+their own reviewed protocol paths are implemented.
 
 For TOML-managed plans, `nix-seal identity add|remove|rotate` updates only the
 public TOML source in a same-directory atomic transaction. It validates the

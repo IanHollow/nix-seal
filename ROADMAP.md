@@ -3,9 +3,10 @@
 - Phase 0: repository foundation, specification, governance, Rust workspace,
   flake/modules, schema, CI, and release scaffolding. No secret migration.
 - Phase 1: complete Nix/TOML frontends and selectors; age/plugin adapter;
-  Ed25519/SSH DSSE approvals; signed manifests; official/differential vectors;
-  deterministic property suites for IDs, canonical plans, merge semantics, and
-  selector monotonicity; and fuzz foundations.
+  Ed25519/SSH DSSE approvals, including explicit bounded local SSH-agent Ed25519
+  signing; signed manifests; official/differential vectors; deterministic
+  property suites for IDs, canonical plans, merge semantics, and selector
+  monotonicity; and fuzz foundations.
 - Phase 2: administrator-to-target rekey, deterministic Nix bridge,
   transactional cache, verified activation/switch/rollback, systemd credentials,
   and full platform modules. Deterministic cache state-machine coverage now

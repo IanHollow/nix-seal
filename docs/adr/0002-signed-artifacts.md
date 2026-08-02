@@ -1,6 +1,7 @@
 # ADR 0002: Signed target artifacts
 
-Status: accepted; native Ed25519 and OpenSSH Ed25519 signing implemented
+Status: accepted; native Ed25519, OpenSSH Ed25519, and explicit SSH-agent
+Ed25519 signing implemented
 
 Use a DSSE/in-toto-style canonical envelope and Ed25519/SSH signing. Bind plan
 and source hashes, target/secret/recipient, generation, and versions. Signing
@@ -26,10 +27,18 @@ comments do not affect the approval key ID or authorization comparison. Plan
 validation rejects comment-only duplicates before approval thresholds are
 calculated, so one OpenSSH key cannot inflate an N-of-M policy.
 
-This is deliberately software-key compatibility only. The client does not invoke
-`ssh-keygen`, `ssh-agent`, FIDO/U2F, PKCS#11, or an arbitrary helper; it accepts
-neither SSH RSA nor ECDSA signing keys. Encrypted OpenSSH private keys are
-rejected because background signing never prompts. Hardware and agent signing
-require a separate protocol, descriptor, timeout, and user-presence ADR before
-they can be enabled. `ssh-key 0.6.7` is pinned with only its `alloc` and
-`ed25519` features, and is covered by the committed cargo-vet policy.
+The client does not invoke `ssh-keygen` or an arbitrary helper. A signer may
+explicitly delegate an Ed25519 operation to the local agent by placing
+`NIX-SEAL-SSH-AGENT-ED25519-v1:<openssh-public-key>` in the selected signing-key
+file. `SSH_AUTH_SOCK` is read only for that explicit format; the socket path
+must be absolute, the request is the standard SSH-agent sign request with zero
+flags, and reads/writes are bounded and capped at ten seconds. The response is
+accepted only when it is an Ed25519 signature for the exact requested key and is
+wrapped in the same `sshsig` namespace as file-backed SSH signing. The agent key
+file contains public metadata only, and an agent failure never falls back to
+another key or an interactive prompt. This supports compatible agents, including
+agents fronting ordinary Ed25519 hardware keys, while FIDO/U2F security-key
+algorithms, PKCS#11, SSH RSA/ECDSA, encrypted OpenSSH private keys, and agent
+prompt flows remain rejected pending separate reviewed protocols.
+`ssh-key 0.6.7` is pinned with only its `alloc` and `ed25519` features, and is
+covered by the committed cargo-vet policy.

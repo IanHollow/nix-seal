@@ -7,9 +7,12 @@ use nix_seal_core::Id;
 use serde::{Deserialize, Serialize};
 use ssh_key::{
     Algorithm as SshAlgorithm, HashAlg, LineEnding, PrivateKey as SshPrivateKey,
-    PublicKey as SshPublicKey, SshSig,
+    PublicKey as SshPublicKey, Signature as SshSignature, SshSig,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -21,9 +24,15 @@ pub const PAYLOAD_TYPE: &str = "application/vnd.nix-seal.target-manifest.v2+json
 pub const PRIVATE_KEY_PREFIX: &str = "NIX-SEAL-ED25519-PRIVATE-v1:";
 /// Public verification-key prefix used in plans and files.
 pub const PUBLIC_KEY_PREFIX: &str = "nix-seal-ed25519-v1:";
+/// Explicit signing-key file prefix for a local SSH-agent-backed Ed25519 key.
+pub const SSH_AGENT_KEY_PREFIX: &str = "NIX-SEAL-SSH-AGENT-ED25519-v1:";
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_SIGNATURES: usize = 256;
 const MAX_SIGNATURE_BYTES: usize = 32 * 1024;
+const MAX_AGENT_MESSAGE_BYTES: usize = 1024 * 1024;
+const AGENT_REQUEST_SIGN: u8 = 13;
+const AGENT_FAILURE: u8 = 5;
+const AGENT_SIGN_RESPONSE: u8 = 14;
 const SSH_SIGNATURE_NAMESPACE: &str = "nix-seal-artifact-v2";
 
 /// Public metadata cryptographically bound to one target ciphertext.
@@ -101,14 +110,23 @@ pub struct SignedEnvelopeV1 {
 /// Private approval key whose secret material is zeroized on drop.
 ///
 /// Native keys are encoded with [`PRIVATE_KEY_PREFIX`]. OpenSSH input is
-/// restricted to an unencrypted `ssh-ed25519` private key; agent, FIDO and
-/// other SSH algorithms are deliberately rejected until their protocols have
-/// a dedicated security review.
+/// restricted to an unencrypted `ssh-ed25519` private key or an explicitly
+/// selected local SSH-agent `ssh-ed25519` public key. FIDO and other SSH
+/// algorithms remain rejected until their protocols have a dedicated security
+/// review.
 pub enum ApprovalSigningKey {
     /// Project-native Ed25519 signing key.
     Ed25519(SigningKey),
     /// Interoperable OpenSSH Ed25519 signing key.
     SshEd25519(SshPrivateKey),
+    /// Ed25519 key whose private operation is delegated to a local SSH agent.
+    #[cfg(unix)]
+    SshAgentEd25519 {
+        /// Public key used to select the agent identity and verify its output.
+        public_key: SshPublicKey,
+        /// Absolute Unix-domain socket path supplied by `SSH_AUTH_SOCK`.
+        socket: PathBuf,
+    },
 }
 
 impl ApprovalSigningKey {
@@ -146,6 +164,31 @@ impl ApprovalSigningKey {
         Ok(Self::SshEd25519(key))
     }
 
+    /// Parses a file-backed key or the explicit SSH-agent key format.
+    ///
+    /// Agent use is never inferred from `SSH_AUTH_SOCK`: callers must place
+    /// [`SSH_AGENT_KEY_PREFIX`] in the selected key file. This prevents a
+    /// silently changed environment from redirecting an approval operation to
+    /// a different private key. The socket path is validated but not opened
+    /// until the signature operation.
+    pub fn parse_with_agent(encoded: &str, socket: &Path) -> Result<Self, ManifestError> {
+        let value = encoded.trim();
+        if let Some(body) = value.strip_prefix(SSH_AGENT_KEY_PREFIX) {
+            #[cfg(unix)]
+            {
+                let socket = validate_agent_socket(socket)?;
+                let public_key = parse_ssh_public_key(body)?;
+                return Ok(Self::SshAgentEd25519 { public_key, socket });
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (body, socket);
+                return Err(ManifestError::AgentUnavailable);
+            }
+        }
+        Self::parse(value)
+    }
+
     /// Returns a versioned native private-key encoding for initial persistence.
     ///
     /// Imported SSH private keys are never re-encoded or written by nix-seal.
@@ -159,6 +202,8 @@ impl ApprovalSigningKey {
                 )))
             }
             Self::SshEd25519(_) => Err(ManifestError::PrivateKeyFormat),
+            #[cfg(unix)]
+            Self::SshAgentEd25519 { .. } => Err(ManifestError::PrivateKeyFormat),
         }
     }
 
@@ -167,6 +212,8 @@ impl ApprovalSigningKey {
         match self {
             Self::Ed25519(key) => Ok(encode_public_key(&key.verifying_key())),
             Self::SshEd25519(key) => normalize_ssh_public_key(key.public_key()),
+            #[cfg(unix)]
+            Self::SshAgentEd25519 { public_key, .. } => normalize_ssh_public_key(public_key),
         }
     }
 
@@ -175,6 +222,8 @@ impl ApprovalSigningKey {
         match self {
             Self::Ed25519(key) => Ok(native_key_id(&key.verifying_key())),
             Self::SshEd25519(key) => ssh_key_id(key.public_key()),
+            #[cfg(unix)]
+            Self::SshAgentEd25519 { public_key, .. } => ssh_key_id(public_key),
         }
     }
 
@@ -211,6 +260,37 @@ impl ApprovalSigningKey {
                     key_id: ssh_key_id(key.public_key())?,
                     algorithm: ApprovalSignatureAlgorithm::SshEd25519SshsigV1,
                     signature,
+                })
+            }
+            #[cfg(unix)]
+            Self::SshAgentEd25519 { public_key, socket } => {
+                let signed_data =
+                    SshSig::signed_data(SSH_SIGNATURE_NAMESPACE, HashAlg::Sha512, message)
+                        .map_err(|_| ManifestError::InvalidSignature)?;
+                let key_blob = public_key
+                    .to_bytes()
+                    .map_err(|_| ManifestError::InvalidSignature)?;
+                let signature = ssh_agent_sign(socket, &key_blob, &signed_data)?;
+                if signature.algorithm() != SshAlgorithm::Ed25519 {
+                    return Err(ManifestError::AgentProtocol);
+                }
+                let sshsig = SshSig::new(
+                    public_key.key_data().clone(),
+                    SSH_SIGNATURE_NAMESPACE,
+                    HashAlg::Sha512,
+                    signature,
+                )
+                .map_err(|_| ManifestError::InvalidSignature)?;
+                let encoded = sshsig
+                    .to_pem(LineEnding::LF)
+                    .map_err(|_| ManifestError::InvalidSignature)?;
+                if encoded.len() > MAX_SIGNATURE_BYTES {
+                    return Err(ManifestError::Limit);
+                }
+                Ok(EnvelopeSignature {
+                    key_id: ssh_key_id(public_key)?,
+                    algorithm: ApprovalSignatureAlgorithm::SshEd25519SshsigV1,
+                    signature: encoded,
                 })
             }
         }
@@ -345,6 +425,130 @@ pub enum ManifestError {
     /// A signature is malformed or invalid.
     #[error("artifact contains an invalid signature")]
     InvalidSignature,
+    /// The configured SSH-agent socket is unavailable or cannot be used.
+    #[error("SSH agent is unavailable")]
+    AgentUnavailable,
+    /// The SSH-agent rejected the signing request.
+    #[error("SSH agent rejected the signing request")]
+    AgentRejected,
+    /// The SSH-agent response was malformed or used an unsupported algorithm.
+    #[error("SSH agent protocol response is invalid")]
+    AgentProtocol,
+}
+
+fn parse_ssh_public_key(encoded: &str) -> Result<SshPublicKey, ManifestError> {
+    let key =
+        SshPublicKey::from_openssh(encoded.trim()).map_err(|_| ManifestError::PublicKeyFormat)?;
+    if key.algorithm() != SshAlgorithm::Ed25519 {
+        return Err(ManifestError::PublicKeyFormat);
+    }
+    Ok(key)
+}
+
+#[cfg(unix)]
+fn validate_agent_socket(socket: &Path) -> Result<PathBuf, ManifestError> {
+    if !socket.is_absolute()
+        || socket.as_os_str().len() > 4096
+        || socket
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .any(u8::is_ascii_control)
+    {
+        return Err(ManifestError::AgentUnavailable);
+    }
+    Ok(socket.to_owned())
+}
+
+#[cfg(unix)]
+fn ssh_agent_sign(
+    socket: &Path,
+    key_blob: &[u8],
+    data: &[u8],
+) -> Result<SshSignature, ManifestError> {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+
+    let body_len = 1_usize
+        .checked_add(4)
+        .and_then(|length| length.checked_add(key_blob.len()))
+        .and_then(|length| length.checked_add(4))
+        .and_then(|length| length.checked_add(data.len()))
+        .and_then(|length| length.checked_add(4))
+        .ok_or(ManifestError::AgentProtocol)?;
+    if body_len > MAX_AGENT_MESSAGE_BYTES {
+        return Err(ManifestError::Limit);
+    }
+    let body_len = u32::try_from(body_len).map_err(|_| ManifestError::Limit)?;
+    let key_len = u32::try_from(key_blob.len()).map_err(|_| ManifestError::Limit)?;
+    let data_len = u32::try_from(data.len()).map_err(|_| ManifestError::Limit)?;
+    let mut request = Vec::with_capacity(4 + body_len as usize);
+    request.extend_from_slice(&body_len.to_be_bytes());
+    request.push(AGENT_REQUEST_SIGN);
+    request.extend_from_slice(&key_len.to_be_bytes());
+    request.extend_from_slice(key_blob);
+    request.extend_from_slice(&data_len.to_be_bytes());
+    request.extend_from_slice(data);
+    request.extend_from_slice(&0_u32.to_be_bytes());
+
+    let mut stream = UnixStream::connect(socket).map_err(|_| ManifestError::AgentUnavailable)?;
+    let timeout = Duration::from_secs(10);
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|_| ManifestError::AgentUnavailable)?;
+    stream
+        .write_all(&request)
+        .and_then(|()| stream.flush())
+        .map_err(|_| ManifestError::AgentUnavailable)?;
+
+    let mut length = [0_u8; 4];
+    stream
+        .read_exact(&mut length)
+        .map_err(|_| ManifestError::AgentUnavailable)?;
+    let response_len =
+        usize::try_from(u32::from_be_bytes(length)).map_err(|_| ManifestError::AgentProtocol)?;
+    if response_len == 0 || response_len > MAX_AGENT_MESSAGE_BYTES {
+        return Err(ManifestError::AgentProtocol);
+    }
+    let mut response = vec![0_u8; response_len];
+    stream
+        .read_exact(&mut response)
+        .map_err(|_| ManifestError::AgentUnavailable)?;
+    if response[0] == AGENT_FAILURE {
+        return Err(ManifestError::AgentRejected);
+    }
+    if response[0] != AGENT_SIGN_RESPONSE {
+        return Err(ManifestError::AgentProtocol);
+    }
+    let (signature_bytes, rest) = read_agent_string(&response[1..])?;
+    if !rest.is_empty() {
+        return Err(ManifestError::AgentProtocol);
+    }
+    SshSignature::try_from(signature_bytes).map_err(|_| ManifestError::AgentProtocol)
+}
+
+#[cfg(unix)]
+fn read_agent_string(input: &[u8]) -> Result<(&[u8], &[u8]), ManifestError> {
+    if input.len() < 4 {
+        return Err(ManifestError::AgentProtocol);
+    }
+    let length = usize::try_from(u32::from_be_bytes(
+        input[..4]
+            .try_into()
+            .map_err(|_| ManifestError::AgentProtocol)?,
+    ))
+    .map_err(|_| ManifestError::AgentProtocol)?;
+    let end = 4_usize
+        .checked_add(length)
+        .ok_or(ManifestError::AgentProtocol)?;
+    if end > input.len() {
+        return Err(ManifestError::AgentProtocol);
+    }
+    Ok((&input[4..end], &input[end..]))
 }
 
 fn parse_public_key(encoded: &str) -> Result<ApprovalVerificationKey, ManifestError> {
@@ -629,10 +833,12 @@ mod tests {
     use super::*;
     use std::{
         env, fs,
-        io::{self, Write},
+        io::{self, Read, Write},
         os::unix::fs::PermissionsExt,
+        os::unix::net::UnixListener,
         path::PathBuf,
         process::{Command, Stdio},
+        thread,
     };
 
     const SSH_ED25519_PRIVATE_KEY: &str = "-----BEGIN_OPENSSH_PRIVATE_KEY-----\n\
@@ -689,6 +895,22 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 .unwrap_or_else(|error| unreachable!("{error}"));
         }
         trusted
+    }
+
+    #[cfg(unix)]
+    fn write_agent_string(output: &mut Vec<u8>, value: &[u8]) -> io::Result<()> {
+        output.extend_from_slice(
+            &u32::try_from(value.len())
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "agent test string is too large",
+                    )
+                })?
+                .to_be_bytes(),
+        );
+        output.extend_from_slice(value);
+        Ok(())
     }
 
     fn ssh_keygen_path(required: bool) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
@@ -759,6 +981,78 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             verify(&wrong_algorithm, &trusted, 1, &expected(&manifest)),
             Err(ManifestError::InvalidSignature)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_agent_key_delegates_signing_without_private_key_material()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let private = SshPrivateKey::from_openssh(SSH_ED25519_PRIVATE_KEY.replace('_', " "))
+            .map_err(|_| io::Error::other("invalid test private key"))?;
+        let keypair = private
+            .key_data()
+            .ed25519()
+            .ok_or_else(|| io::Error::other("test key is not Ed25519"))?;
+        let mut seed = [0_u8; 32];
+        seed.copy_from_slice(keypair.private.as_ref());
+        let agent_signing_key = SigningKey::from_bytes(&seed);
+        let public = SshPublicKey::from_openssh(SSH_ED25519_PUBLIC_KEY)
+            .map_err(|_| io::Error::other("invalid test public key"))?;
+        let key_blob = public
+            .to_bytes()
+            .map_err(|_| io::Error::other("could not encode test public key"))?;
+        let temporary = tempfile::tempdir()?;
+        let socket = temporary.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket)?;
+        let server = thread::spawn(
+            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let (mut stream, _) = listener.accept()?;
+                let mut length = [0_u8; 4];
+                stream.read_exact(&mut length)?;
+                let body_length = u32::from_be_bytes(length) as usize;
+                let mut body = vec![0_u8; body_length];
+                stream.read_exact(&mut body)?;
+                assert_eq!(body.first().copied(), Some(AGENT_REQUEST_SIGN));
+                let (requested_key, rest) = read_agent_string(&body[1..])
+                    .map_err(|_| io::Error::other("invalid agent key request"))?;
+                assert_eq!(requested_key, key_blob.as_slice());
+                let (signed_data, rest) = read_agent_string(rest)
+                    .map_err(|_| io::Error::other("invalid agent data request"))?;
+                assert_eq!(rest, 0_u32.to_be_bytes().as_slice());
+                let signature = agent_signing_key.sign(signed_data);
+                let mut signature_blob = Vec::new();
+                write_agent_string(&mut signature_blob, b"ssh-ed25519")?;
+                write_agent_string(&mut signature_blob, signature.to_bytes().as_slice())?;
+                let mut response = Vec::new();
+                response.push(AGENT_SIGN_RESPONSE);
+                write_agent_string(&mut response, &signature_blob)?;
+                stream.write_all(&(u32::try_from(response.len())?).to_be_bytes())?;
+                stream.write_all(&response)?;
+                Ok(())
+            },
+        );
+
+        let key_spec = format!("{SSH_AGENT_KEY_PREFIX}{SSH_ED25519_PUBLIC_KEY}");
+        let key = ApprovalSigningKey::parse_with_agent(&key_spec, &socket)?;
+        assert_eq!(
+            key.encode_public()?,
+            SSH_ED25519_PUBLIC_KEY
+                .split(' ')
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let manifest = manifest();
+        let envelope = sign_manifest(&manifest, &key)?;
+        assert_eq!(
+            envelope.signatures[0].algorithm,
+            ApprovalSignatureAlgorithm::SshEd25519SshsigV1
+        );
+        verify(&envelope, &trust(&[&key]), 1, &expected(&manifest))?;
+        server
+            .join()
+            .map_err(|_| io::Error::other("agent test server panicked"))??;
+        Ok(())
     }
 
     #[test]

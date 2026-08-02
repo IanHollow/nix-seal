@@ -7124,9 +7124,19 @@ fn artifact_written(path: &Path, signatures: usize, json: bool) {
 
 fn read_signing_key(path: &Path) -> Result<nix_seal_manifest::ApprovalSigningKey> {
     let encoded = read_identity(path)?;
-    Ok(nix_seal_manifest::ApprovalSigningKey::parse(
-        encoded.expose_secret(),
-    )?)
+    let value = encoded.expose_secret();
+    if value
+        .trim()
+        .starts_with(nix_seal_manifest::SSH_AGENT_KEY_PREFIX)
+    {
+        let socket = std::env::var_os("SSH_AUTH_SOCK")
+            .map(PathBuf::from)
+            .context("SSH_AUTH_SOCK is required for an SSH-agent approval key")?;
+        return Ok(nix_seal_manifest::ApprovalSigningKey::parse_with_agent(
+            value, &socket,
+        )?);
+    }
+    Ok(nix_seal_manifest::ApprovalSigningKey::parse(value)?)
 }
 
 fn read_trusted_keys(paths: &[PathBuf]) -> Result<nix_seal_manifest::TrustedKeys> {

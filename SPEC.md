@@ -61,6 +61,9 @@ Approvals use a DSSE/in-toto-style signed envelope with Ed25519 or SSH signing
 and distinct signing/decryption keys. At least one trusted signature is the
 default, with N-of-M distinct signers supported. Missing, duplicate, untrusted,
 expired, malformed, replayed, downgraded, or target-mismatched signatures fail.
+The CLI supports explicit local SSH-agent Ed25519 signing through a public-key
+descriptor and `SSH_AUTH_SOCK`; agent requests are bounded, timeout-limited,
+key-selected, and never fall back to another identity or an interactive prompt.
 
 ## CLI contract
 
