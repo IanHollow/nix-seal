@@ -251,6 +251,9 @@ impl Cache {
     }
     /// Atomically stores bytes under their digest while holding the cache lock.
     pub fn put(&self, bytes: &[u8]) -> Result<String, CacheError> {
+        if u64::try_from(bytes.len()).map_err(|_| CacheError::Limit)? > MAX_CIPHERTEXT_BYTES {
+            return Err(CacheError::Limit);
+        }
         let digest = Self::digest(bytes);
         let lock = self.lock()?;
         let objects = self.root.join("objects");
@@ -1181,6 +1184,18 @@ mod tests {
         // The bounded reader consumes only the limit plus one byte needed to
         // prove that the input is oversized, never the complete source.
         assert_eq!(reader.position(), 9);
+    }
+
+    #[test]
+    fn put_rejects_oversized_generic_objects_before_publication() -> Result<(), CacheError> {
+        let temp = tempfile::tempdir()?;
+        let cache = Cache::open(temp.path())?;
+        let oversized_len =
+            usize::try_from(MAX_CIPHERTEXT_BYTES + 1).map_err(|_| CacheError::Limit)?;
+        let oversized = vec![0_u8; oversized_len];
+        assert!(matches!(cache.put(&oversized), Err(CacheError::Limit)));
+        assert_eq!(cache.inventory()?.object_count, 0);
+        Ok(())
     }
 
     #[test]

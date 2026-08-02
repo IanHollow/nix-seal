@@ -160,7 +160,11 @@ age scrypt-encrypted identity file after two hidden terminal prompts. The
 passphrase is never accepted from argv, stdin, or the environment and is subject
 to a minimum length check. Do not use passphrase-protected identity files for
 unattended activation; use an age plugin, agent, or hardware-backed identity
-instead.
+instead. On Unix, generated identity files are created relative to no-follow
+directory descriptors and are checked for owner-only access, regular-file type,
+and a single link. User-owned symlinked ancestry is rejected; root-owned
+platform aliases such as macOS `/tmp` are resolved to their canonical directory
+before the final no-follow open.
 
 The plan determines canonical administrator/recovery recipients. Direct mode
 additionally includes authorized target recipients and emits a history-exposure
