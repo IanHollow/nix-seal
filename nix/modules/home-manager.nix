@@ -7,6 +7,11 @@ self:
 }:
 let
   cfg = config.nixSeal;
+  bootPhases = [
+    "users"
+    "activation"
+    "services"
+  ];
   credentialId = value: builtins.head (lib.splitString ":" (toString value));
   groupCredentials = lib.foldl' (
     grouped: binding:
@@ -37,6 +42,25 @@ let
         --identity ${lib.escapeShellArg cfg.identityFile} \
         --runtime-root ${runtimeRoot}
     '';
+  runtimeRootFor =
+    phase:
+    let
+      runtimeSuffix = if phase == "activation" then "" else "/${phase}";
+    in
+    if pkgs.stdenv.hostPlatform.isLinux then
+      "%t/nix-seal${runtimeSuffix}"
+    else
+      "${config.home.homeDirectory}/Library/Caches/nix-seal${runtimeSuffix}";
+  persistentActivationArguments = phase: [
+    (lib.getExe cfg.package)
+    "activate"
+    "--spec"
+    (toString cfg.activationSpecs.${phase})
+    "--identity"
+    cfg.identityFile
+    "--runtime-root"
+    (runtimeRootFor phase)
+  ];
 in
 {
   imports = [
@@ -105,6 +129,49 @@ in
         ) (activate "services" cfg.activationSpecs.services);
       })
     ];
+    systemd.user.services = lib.mkIf pkgs.stdenv.hostPlatform.isLinux (
+      lib.listToAttrs (
+        lib.concatMap (
+          phase:
+          lib.optional (builtins.hasAttr phase cfg.activationSpecs) {
+            name = "nix-seal-${phase}";
+            value = {
+              Unit = {
+                Description = "Materialize nix-seal ${phase} generation";
+                After = [ "default.target" ];
+              };
+              Service = {
+                Type = "oneshot";
+                RemainAfterExit = true;
+                UMask = "0077";
+                ExecStart = lib.concatStringsSep " " (persistentActivationArguments phase);
+              };
+              Install.WantedBy = [ "default.target" ];
+            };
+          }
+        ) bootPhases
+      )
+    );
+    launchd.agents = lib.mkIf pkgs.stdenv.hostPlatform.isDarwin (
+      lib.listToAttrs (
+        lib.concatMap (
+          phase:
+          lib.optional (builtins.hasAttr phase cfg.activationSpecs) {
+            name = "nix-seal-${phase}";
+            value = {
+              enable = true;
+              domain = lib.mkDefault "user";
+              config = {
+                Label = "io.nix-seal.${phase}";
+                ProgramArguments = persistentActivationArguments phase;
+                RunAtLoad = true;
+                ProcessType = "Background";
+              };
+            };
+          }
+        ) bootPhases
+      )
+    );
     warnings = [
       (
         if pkgs.stdenv.hostPlatform.isLinux then

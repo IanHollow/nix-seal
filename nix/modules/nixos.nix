@@ -2,6 +2,17 @@ self:
 { config, lib, ... }:
 let
   cfg = config.nixSeal;
+  bootPhases = [
+    "users"
+    "activation"
+    "services"
+  ];
+  bootActivationCommands = lib.concatMap (
+    phase:
+    lib.optional (builtins.hasAttr phase cfg.activationSpecs) (
+      "${lib.getExe cfg.package} activate --spec ${cfg.activationSpecs.${phase}} --identity ${lib.escapeShellArg cfg.identityFile}"
+    )
+  ) bootPhases;
   credentialId = value: builtins.head (lib.splitString ":" (toString value));
   groupCredentials = lib.foldl' (
     grouped: binding:
@@ -32,6 +43,8 @@ in
         in
         {
           systemd.services = lib.mapAttrs (_: credentials: {
+            after = [ "nix-seal-activate.service" ];
+            requires = [ "nix-seal-activate.service" ];
             serviceConfig = {
               LoadCredential = lib.mkAfter credentials;
               PrivateMounts = lib.mkDefault true;
@@ -110,5 +123,17 @@ in
         };
       })
     ];
+    systemd.services.nix-seal-activate = {
+      description = "Materialize nix-seal runtime generation";
+      wantedBy = [ "multi-user.target" ];
+      before = [ "multi-user.target" ];
+      after = [ "local-fs.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        UMask = "0077";
+        ExecStart = bootActivationCommands;
+      };
+    };
   };
 }

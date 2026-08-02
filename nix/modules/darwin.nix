@@ -2,6 +2,11 @@ self:
 { config, lib, ... }:
 let
   cfg = config.nixSeal;
+  bootPhases = [
+    "users"
+    "activation"
+    "services"
+  ];
   activate = spec: ''
     ${lib.getExe cfg.package} activate \
       --spec ${spec} \
@@ -49,6 +54,27 @@ in
     system.activationScripts.postActivation.text = lib.mkAfter (
       lib.optionalString (cfg.activationSpecs ? activation) (activate cfg.activationSpecs.activation)
       + lib.optionalString (cfg.activationSpecs ? services) (activate cfg.activationSpecs.services)
+    );
+    launchd.daemons = lib.listToAttrs (
+      lib.concatMap (
+        phase:
+        lib.optional (builtins.hasAttr phase cfg.activationSpecs) {
+          name = "nix-seal-${phase}";
+          value.serviceConfig = {
+            Label = "io.nix-seal.${phase}";
+            ProgramArguments = [
+              (lib.getExe cfg.package)
+              "activate"
+              "--spec"
+              (toString cfg.activationSpecs.${phase})
+              "--identity"
+              cfg.identityFile
+            ];
+            RunAtLoad = true;
+            ProcessType = "Background";
+          };
+        }
+      ) bootPhases
     );
     warnings = [ "macOS runtime storage may not be memory-backed; inspect the selected volume" ];
   };
