@@ -616,8 +616,8 @@ reviewed native-age or hardware-backed identity before automated import.
 
 For age-tree, agenix-rekey, secretctl, and single-file ciphertext migration,
 `--identity` is the legacy source/decryption identity. `--verification-identity`
-is optional and defaults to `--identity`; when supplied it must be authorized
-by every replacement recipient and is used to authenticate the newly written
+is optional and defaults to `--identity`; when supplied it must be authorized by
+every replacement recipient and is used to authenticate the newly written
 ciphertext. This explicit split is required when a migration replaces a legacy
 SSH or age key with a new administrator or recovery key. Both private identities
 are opened only for `--execute`; dry runs inspect public metadata and paths.
@@ -674,8 +674,8 @@ Supplying `--destination`, `--identity`, and one or more `--recipient` values
 enables the same dry-run-first, side-by-side bulk rekey flow as agenix/ragenix;
 `--verification-identity` may select the new administrator/recovery identity;
 `--execute` is required before either private identity is opened. Every source
-is staged and round-trip verified before any destination changes, while the legacy
-tree remains intact for rollback. It does not infer private runtime
+is staged and round-trip verified before any destination changes, while the
+legacy tree remains intact for rollback. It does not infer private runtime
 configuration or rewrite the legacy ciphertext.
 
 ```nix
