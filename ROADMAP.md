@@ -32,7 +32,10 @@
   closed, and rollback follows the same `current` switch. Generic cache
   insertion now enforces the same bounded ciphertext limit as artifact and
   export paths before hashing or publication, preventing an untrusted caller
-  from using the cache as an unbounded local sink.
+  from using the cache as an unbounded local sink. Activation source paths are
+  normalized before validation; parent ancestry rejects user-owned symlinks and
+  is reopened descriptor-relatively with no-follow operations, with regression
+  coverage for ancestry substitution and dot-segment traversal.
 - Phase 3: authoring and lifecycle commands, identity/value rotation,
   generators, prompts, templates, and provisioning phases. Private identity,
   prompt-state, generator dependency, and generator-output permissions now use

@@ -12,7 +12,10 @@ The runtime implementation authenticates the complete artifact batch before it
 creates a plaintext transaction. It holds no-follow regular ciphertext file
 descriptors across hash/signature verification and bounded streaming age
 decryption, rejects unsafe roots, sources, modes, and destination ancestry, and
-serializes activation with a private no-follow lock. Each new generation is
+serializes activation with a private no-follow lock. Absolute source paths are
+normalized before use; their parent ancestry is inspected for user-owned
+symlinks, canonicalized only for root-owned platform aliases, and reopened
+descriptor-relatively with `openat(O_NOFOLLOW)`. Each new generation is
 fsynced and published under an immutable name before an atomic `current` symlink
 switch. Authentication or decryption failure drops the transaction and leaves
 the previous generation active.

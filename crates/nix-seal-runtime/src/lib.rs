@@ -195,8 +195,8 @@ impl ActivationSpecV2 {
     /// Enforces structural and resource constraints before filesystem access.
     pub fn validate(&self) -> Result<(), RuntimeError> {
         if self.schema != ACTIVATION_SCHEMA
-            || !self.runtime_root.is_absolute()
-            || !self.plan.is_absolute()
+            || !is_normalized_absolute_path(&self.runtime_root)
+            || !is_normalized_absolute_path(&self.plan)
             || self.runtime_generation == Some(0)
             || self.allowed_clock_skew > 86_400
             || self.artifacts.is_empty()
@@ -209,8 +209,8 @@ impl ActivationSpecV2 {
         let mut secret_ids = BTreeSet::new();
         let mut compatibility_paths = BTreeSet::new();
         for artifact in &self.artifacts {
-            if !artifact.ciphertext.is_absolute()
-                || !artifact.envelope.is_absolute()
+            if !is_normalized_absolute_path(&artifact.ciphertext)
+                || !is_normalized_absolute_path(&artifact.envelope)
                 || artifact.phase != self.phase
                 || !is_digest(&artifact.source_ciphertext_hash)
                 || artifact.artifact_generation == 0
@@ -229,7 +229,7 @@ impl ActivationSpecV2 {
         }
         for template in &self.templates {
             let destination = template_output_id(&template.template_id)?;
-            if !template.source.is_absolute()
+            if !is_normalized_absolute_path(&template.source)
                 || template.phase != self.phase
                 || !destinations.insert(destination.as_str().to_owned())
                 || template.placeholders.is_empty()
@@ -509,7 +509,7 @@ fn prepare_templates<'a>(
     let mut prepared = Vec::with_capacity(templates.len());
     for template in templates {
         validate_mode(template.mode)?;
-        if !template.source.is_absolute()
+        if !is_normalized_absolute_path(template.source)
             || template.placeholders.is_empty()
             || template.placeholders.len() > 256
             || template.placeholders.iter().any(|(name, placeholder)| {
@@ -840,6 +840,16 @@ fn valid_compatibility_path(path: &Path, runtime_root: &Path) -> bool {
     nix_seal_core::valid_compatibility_symlink(value)
         && !path.starts_with(runtime_root)
         && path.parent().is_some_and(Path::is_absolute)
+}
+
+fn is_normalized_absolute_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
 }
 
 /// Ensures every declared compatibility destination is a link to the stable
@@ -1895,9 +1905,12 @@ fn read_bounded<R: Read>(input: R, limit: u64) -> Result<Vec<u8>, RuntimeError> 
 
 #[cfg(unix)]
 fn open_regular_nofollow(path: &Path) -> Result<File, RuntimeError> {
-    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
-    let descriptor = open(
-        path,
+    use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+
+    let (parent, name) = open_source_parent(path)?;
+    let descriptor = openat(
+        &parent,
+        &name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
@@ -1914,6 +1927,86 @@ fn open_regular_nofollow(path: &Path) -> Result<File, RuntimeError> {
         return Err(RuntimeError::UnsafeSource);
     }
     Ok(File::from(descriptor))
+}
+
+#[cfg(unix)]
+fn open_source_parent(path: &Path) -> Result<(File, std::ffi::OsString), RuntimeError> {
+    if !is_normalized_absolute_path(path) {
+        return Err(RuntimeError::UnsafeSource);
+    }
+    let name = path
+        .file_name()
+        .filter(|value| !value.is_empty())
+        .ok_or(RuntimeError::UnsafeSource)?
+        .to_owned();
+    let parent_path = path.parent().ok_or(RuntimeError::UnsafeSource)?;
+    reject_user_owned_source_symlinks(parent_path)?;
+    let canonical_parent = parent_path.canonicalize().map_err(RuntimeError::Io)?;
+    Ok((open_directory_chain_nofollow(&canonical_parent)?, name))
+}
+
+#[cfg(unix)]
+fn reject_user_owned_source_symlinks(path: &Path) -> Result<(), RuntimeError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(component, std::path::Component::RootDir) {
+                continue;
+            }
+            return Err(RuntimeError::UnsafeSource);
+        };
+        current.push(name);
+        let metadata = std::fs::symlink_metadata(&current).map_err(RuntimeError::Io)?;
+        if metadata.file_type().is_symlink() && metadata.uid() != 0 {
+            return Err(RuntimeError::UnsafeSource);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory_chain_nofollow(path: &Path) -> Result<File, RuntimeError> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
+
+    if !is_normalized_absolute_path(path) {
+        return Err(RuntimeError::UnsafeSource);
+    }
+    let root = open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| RuntimeError::Io(error.into()))?;
+    let mut directory = File::from(root);
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(component, std::path::Component::RootDir) {
+                continue;
+            }
+            return Err(RuntimeError::UnsafeSource);
+        };
+        let descriptor = openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+                RuntimeError::UnsafeSource
+            } else {
+                RuntimeError::Io(error.into())
+            }
+        })?;
+        let metadata = fstat(&descriptor).map_err(|error| RuntimeError::Io(error.into()))?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
+            return Err(RuntimeError::UnsafeSource);
+        }
+        directory = File::from(descriptor);
+    }
+    Ok(directory)
 }
 
 #[cfg(unix)]
@@ -2011,6 +2104,9 @@ fn open_activation_lock(path: &Path) -> Result<File, RuntimeError> {
 
 #[cfg(not(unix))]
 fn open_regular_nofollow(path: &Path) -> Result<File, RuntimeError> {
+    if !is_normalized_absolute_path(path) {
+        return Err(RuntimeError::UnsafeSource);
+    }
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
         return Err(RuntimeError::UnsafeSource);
@@ -2699,6 +2795,18 @@ mod tests {
             excessive_skew.validate(),
             Err(RuntimeError::InvalidSpec)
         ));
+        let mut traversal = excessive_skew.clone();
+        traversal.runtime_root = PathBuf::from("/run/nix-seal/../unsafe");
+        assert!(matches!(
+            traversal.validate(),
+            Err(RuntimeError::InvalidSpec)
+        ));
+        let mut source_traversal = excessive_skew.clone();
+        source_traversal.artifacts[0].ciphertext = PathBuf::from("/tmp/../artifact.age");
+        assert!(matches!(
+            source_traversal.validate(),
+            Err(RuntimeError::InvalidSpec)
+        ));
         let invalid_actions = PostSwitchSpecV1 {
             executable: PathBuf::from("/bin/service-manager"),
             manager: ServiceManagerV1::SystemdSystem,
@@ -3094,6 +3202,43 @@ mod tests {
         let link = fixture.temporary.path().join("linked.age");
         symlink(&fixture.ciphertext, &link)?;
         let artifact = owned_artifact(&fixture, &link, &fixture.secret_id);
+        let request = ActivationRequest {
+            runtime_root: &fixture.runtime,
+            runtime_generation: Some(1),
+            plan_hash: PLAN_HASH,
+            target_policy_hash: TARGET_POLICY_HASH,
+            target_id: &fixture.target_id,
+            recipient_fingerprint: &fixture.fingerprint,
+            tool_version: "0.1.0-alpha.1",
+            now: 101,
+            allowed_clock_skew: 0,
+            target_identity: &fixture.target_identity,
+            artifacts: std::slice::from_ref(&artifact),
+            templates: &[],
+            post_switch: None,
+        };
+        assert!(matches!(
+            activate(&request),
+            Err(RuntimeError::UnsafeSource)
+        ));
+        assert!(!fixture.runtime.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_artifact_ancestry_before_decryption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let fixture = fixture()?;
+        let real = fixture.temporary.path().join("real-source");
+        std::fs::create_dir(&real)?;
+        std::fs::copy(&fixture.ciphertext, real.join("artifact.age"))?;
+        let linked = fixture.temporary.path().join("linked-source");
+        symlink(&real, &linked)?;
+        let linked_artifact = linked.join("artifact.age");
+        let artifact = owned_artifact(&fixture, &linked_artifact, &fixture.secret_id);
         let request = ActivationRequest {
             runtime_root: &fixture.runtime,
             runtime_generation: Some(1),
