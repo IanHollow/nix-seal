@@ -45,8 +45,8 @@ state while preserving portable cache locations. Inventory validates each
 content hash, artifact bundle name, exact bundle member set, byte bound, and
 private metadata before reporting aggregate counts. This deliberately makes
 `cache status` fail on unexpected cache mutations instead of presenting a
-misleading count. Every bounded cache read also applies the limit to the
-stream itself rather than trusting a prior metadata length, so a concurrent file growth
+misleading count. Every bounded cache read also applies the limit to the stream
+itself rather than trusting a prior metadata length, so a concurrent file growth
 race cannot turn a malformed entry into an unbounded allocation. Cache lifecycle
 operations build on this verified inventory.
 
