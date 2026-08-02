@@ -212,8 +212,8 @@ export/import flow or `nix copy` for a remote build or deployment transport.
 ### Target-local artifact cache (recommended)
 
 After provisioning, transfer the ciphertext-only artifact to the target and
-import it into that target's local cache. This keeps artifacts out of Git,
-flake inputs, and the Nix store. A host cache is normally
+import it into that target's local cache. This keeps artifacts out of Git, flake
+inputs, and the Nix store. A host cache is normally
 `/var/lib/nix-seal/cache/v1`; a Home Manager cache is normally
 `$XDG_CACHE_HOME/nix-seal/v1`.
 
