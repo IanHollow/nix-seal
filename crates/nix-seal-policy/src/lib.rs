@@ -1340,16 +1340,20 @@ fn validate_generator_execution(
             "built-in generator {generator_id} cannot declare secret dependencies"
         )));
     }
-    let ssh_public_output = generator.executable == "builtin:ssh-ed25519"
-        && generator.outputs.len() == 1
+    let derived_public_output = matches!(
+        generator.executable.as_str(),
+        "builtin:ssh-ed25519" | "builtin:wireguard-private-key"
+    ) && generator.outputs.len() == 1
         && generator.public_outputs.len() <= 1;
-    if is_builtin && !generator.public_outputs.is_empty() && !ssh_public_output {
+    if is_builtin && !generator.public_outputs.is_empty() && !derived_public_output {
         return Err(PolicyError::Violation(format!(
             "built-in generator {generator_id} cannot declare public outputs"
         )));
     }
-    if generator.executable == "builtin:ssh-ed25519"
-        && (generator.outputs.len() != 1 || generator.public_outputs.len() > 1)
+    if matches!(
+        generator.executable.as_str(),
+        "builtin:ssh-ed25519" | "builtin:wireguard-private-key"
+    ) && (generator.outputs.len() != 1 || generator.public_outputs.len() > 1)
     {
         return Err(PolicyError::Violation(format!(
             "built-in generator {generator_id} requires exactly one secret output and at most one public output"
@@ -1763,6 +1767,45 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn wireguard_public_output_is_admitted() -> Result<(), PolicyError> {
+        let generator = nix_seal_core::Generator {
+            executable: "builtin:wireguard-private-key".to_owned(),
+            outputs: vec![
+                Id::parse("wireguard-private")
+                    .map_err(|error| PolicyError::Violation(error.to_string()))?,
+            ],
+            public_outputs: vec![nix_seal_core::GeneratorPublicOutput {
+                id: Id::parse("wireguard-public")
+                    .map_err(|error| PolicyError::Violation(error.to_string()))?,
+                destination: "public/wireguard-key".to_owned(),
+            }],
+            parameters: BTreeMap::new(),
+            ..generator_template()
+        };
+        validate_generator_execution(
+            &Id::parse("wireguard").map_err(|error| PolicyError::Violation(error.to_string()))?,
+            &generator,
+        )
+    }
+
+    fn generator_template() -> nix_seal_core::Generator {
+        nix_seal_core::Generator {
+            executable: "builtin:wireguard-private-key".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
+            outputs: Vec::new(),
+            public_outputs: Vec::new(),
+            prompts: Vec::new(),
+            parameters: BTreeMap::new(),
+            validation: None,
+        }
     }
 
     #[test]

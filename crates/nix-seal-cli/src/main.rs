@@ -6000,7 +6000,7 @@ struct GeneratedValues {
     public: Vec<SecretBox<Vec<u8>>>,
 }
 
-type GeneratedSshKeyPair = (SecretBox<Vec<u8>>, SecretBox<Vec<u8>>);
+type GeneratedKeyPair = (SecretBox<Vec<u8>>, SecretBox<Vec<u8>>);
 
 fn generate_generator_values(
     generator: &nix_seal_core::Generator,
@@ -6022,6 +6022,17 @@ fn generate_generator_values(
         }
         if generator.executable == "builtin:ssh-ed25519" {
             let (secret, public) = generate_ssh_ed25519_values(generator)?;
+            return Ok(GeneratedValues {
+                secrets: vec![secret],
+                public: if generator.public_outputs.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![public]
+                },
+            });
+        }
+        if generator.executable == "builtin:wireguard-private-key" {
+            let (secret, public) = generate_wireguard_values(generator)?;
             return Ok(GeneratedValues {
                 secrets: vec![secret],
                 public: if generator.public_outputs.is_empty() {
@@ -6678,21 +6689,7 @@ fn generate_builtin_value(generator: &nix_seal_core::Generator) -> Result<Secret
             bail!("builtin:argon2id-password-hash requires its declared hidden password prompt")
         }
         "builtin:ssh-ed25519" => generate_ssh_ed25519_private_key(generator),
-        "builtin:wireguard-private-key" => {
-            if !generator.parameters.is_empty() {
-                bail!("builtin:wireguard-private-key does not accept parameters");
-            }
-            let mut input = nix_seal_crypto::random_bytes(32)?;
-            let bytes = input.expose_secret_mut();
-            // WireGuard uses Curve25519 private scalars. Clamp according to RFC 7748
-            // before standard base64 serialization, the format consumed by wg(8).
-            bytes[0] &= 0b1111_1000;
-            bytes[31] &= 0b0111_1111;
-            bytes[31] |= 0b0100_0000;
-            Ok(SecretBox::new(Box::new(
-                BASE64_STANDARD.encode(bytes).into_bytes(),
-            )))
-        }
+        "builtin:wireguard-private-key" => generate_wireguard_private_key(generator),
         "builtin:uuid" => {
             if !generator.parameters.is_empty() {
                 bail!("builtin:uuid does not accept parameters");
@@ -6826,12 +6823,41 @@ fn generate_ssh_ed25519_private_key(
     Ok(private)
 }
 
+fn generate_wireguard_private_key(
+    generator: &nix_seal_core::Generator,
+) -> Result<SecretBox<Vec<u8>>> {
+    let (private, _) = generate_wireguard_values(generator)?;
+    Ok(private)
+}
+
+/// Generates a clamped `WireGuard` private scalar and, when requested, the
+/// corresponding standard base64 public key from the same scalar.
+fn generate_wireguard_values(generator: &nix_seal_core::Generator) -> Result<GeneratedKeyPair> {
+    if !generator.parameters.is_empty()
+        || generator.outputs.len() != 1
+        || generator.public_outputs.len() > 1
+    {
+        bail!(
+            "builtin:wireguard-private-key accepts no parameters, exactly one secret output, and at most one public output"
+        );
+    }
+    let mut input = nix_seal_crypto::random_bytes(32)?;
+    let bytes = input.expose_secret_mut();
+    // WireGuard uses Curve25519 private scalars. Clamp according to RFC 7748
+    // before standard base64 serialization, the format consumed by wg(8).
+    bytes[0] &= 0b1111_1000;
+    bytes[31] &= 0b0111_1111;
+    bytes[31] |= 0b0100_0000;
+    let public = nix_seal_crypto::derive_wireguard_public_key(bytes)?;
+    let private_output = SecretBox::new(Box::new(BASE64_STANDARD.encode(bytes).into_bytes()));
+    let public_output = SecretBox::new(Box::new(BASE64_STANDARD.encode(public).into_bytes()));
+    Ok((private_output, public_output))
+}
+
 /// Generates an Ed25519 private key and, when requested, its standard public
 /// OpenSSH representation. The public output is derived from the same key
 /// bytes before the private value enters the authoring transaction.
-fn generate_ssh_ed25519_values(
-    generator: &nix_seal_core::Generator,
-) -> Result<GeneratedSshKeyPair> {
+fn generate_ssh_ed25519_values(generator: &nix_seal_core::Generator) -> Result<GeneratedKeyPair> {
     if !generator.parameters.is_empty()
         || generator.outputs.len() != 1
         || generator.public_outputs.len() > 1
@@ -10042,12 +10068,32 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             parameters: BTreeMap::new(),
             validation: None,
         };
-        let wireguard = generate_builtin_value(&wireguard)?;
-        let wireguard_bytes = BASE64_STANDARD.decode(wireguard.expose_secret())?;
+        let wireguard_value = generate_builtin_value(&wireguard)?;
+        let wireguard_bytes = BASE64_STANDARD.decode(wireguard_value.expose_secret())?;
         assert_eq!(wireguard_bytes.len(), 32);
         assert_eq!(wireguard_bytes[0] & 7, 0);
         assert_eq!(wireguard_bytes[31] & 128, 0);
         assert_eq!(wireguard_bytes[31] & 64, 64);
+        let wireguard_public_generator = nix_seal_core::Generator {
+            public_outputs: vec![nix_seal_core::GeneratorPublicOutput {
+                id: nix_seal_core::Id::parse("application/wireguard-public")?,
+                destination: "public/application-wireguard-key".to_owned(),
+            }],
+            ..wireguard.clone()
+        };
+        let generated = generate_generator_values(
+            &wireguard_public_generator,
+            &[],
+            GeneratorSecretInputs::None,
+        )?;
+        let generated_private = BASE64_STANDARD.decode(generated.secrets[0].expose_secret())?;
+        let expected_public = BASE64_STANDARD.encode(nix_seal_crypto::derive_wireguard_public_key(
+            &generated_private,
+        )?);
+        assert_eq!(
+            String::from_utf8(generated.public[0].expose_secret().clone())?,
+            expected_public
+        );
         let uuid = nix_seal_core::Generator {
             executable: "builtin:uuid".to_owned(),
             arguments: Vec::new(),

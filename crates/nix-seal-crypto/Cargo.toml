@@ -12,6 +12,8 @@ blake3.workspace = true
 getrandom.workspace = true
 rustix.workspace = true
 tempfile.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
 secrecy.workspace = true
 thiserror.workspace = true
 

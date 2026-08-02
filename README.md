@@ -532,8 +532,9 @@ links, oversized output, nonzero exits, and timeouts fail the full transaction
 without exposing process output. Public destinations are repository-relative,
 must not collide with ciphertext sources, and are recorded in the public plan;
 built-in generators emit encrypted secret outputs; `builtin:ssh-ed25519` may
-additionally emit one derived public OpenSSH key output without exposing any
-private material.
+additionally emit one derived public OpenSSH key, and
+`builtin:wireguard-private-key` may additionally emit one derived public
+WireGuard key, without exposing private material.
 
 Private identities, prompt state, generator dependencies, and generator outputs
 are permissioned through their already-open descriptors. Generator output paths

@@ -1385,6 +1385,8 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.19",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

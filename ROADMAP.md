@@ -48,7 +48,9 @@
   and commits each mapped secret through one all-or-recover ciphertext
   transaction. The built-in SSH Ed25519 generator can now commit its encrypted
   private key and one separately declared derived public OpenSSH key as one
-  validated transaction.
+  validated transaction. The WireGuard generator can likewise commit its
+  encrypted private scalar and one derived public key as one validated
+  transaction.
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
   starting with a synthetic low-risk secret. Public migration compatibility
   goldens now cover agenix/ragenix, agenix-rekey, SOPS metadata, Clan

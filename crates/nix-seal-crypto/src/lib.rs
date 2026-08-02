@@ -14,6 +14,8 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
+use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 const MAX_SECRET_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_IDENTITY_FILE_BYTES: u64 = 1024 * 1024;
@@ -55,6 +57,9 @@ pub enum CryptoError {
     /// invoking a plugin-specific operation.
     #[error("age plugin identity has no generic public-recipient conversion")]
     PluginIdentityPublic,
+    /// `WireGuard` private key material was not exactly one raw 32-byte scalar.
+    #[error("invalid WireGuard private key material")]
+    WireguardKey,
 }
 
 /// Returns CSPRNG bytes in a zeroizing secret container.
@@ -65,6 +70,17 @@ pub fn random_bytes(length: usize) -> Result<SecretBox<Vec<u8>>, CryptoError> {
     let mut bytes = SecretBox::new(Box::new(vec![0_u8; length]));
     getrandom::fill(bytes.expose_secret_mut().as_mut_slice()).map_err(|_| CryptoError::Random)?;
     Ok(bytes)
+}
+
+/// Derives the standard `WireGuard` public key from one raw 32-byte private
+/// scalar. The caller is responsible for decoding the `WireGuard` base64
+/// representation; this adapter keeps the scalar bounded and zeroized while
+/// the X25519 operation runs.
+pub fn derive_wireguard_public_key(private: &[u8]) -> Result<[u8; 32], CryptoError> {
+    let private: [u8; 32] = private.try_into().map_err(|_| CryptoError::WireguardKey)?;
+    let private = Zeroizing::new(private);
+    let secret = StaticSecret::from(*private);
+    Ok(PublicKey::from(&secret).to_bytes())
 }
 
 /// Generates an `X25519` identity and returns `(private, public)`.
@@ -1070,6 +1086,26 @@ body\n\
         )?;
         assert_eq!(target_plaintext, b"canary");
         assert_eq!(recipient_fingerprint(&target_recipient)?.len(), 64);
+        Ok(())
+    }
+
+    #[test]
+    fn wireguard_public_derivation_matches_rfc7748_vector() -> Result<(), CryptoError> {
+        let private = [
+            0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2,
+            0x66, 0x45, 0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5,
+            0x1d, 0xb9, 0x2c, 0x2a,
+        ];
+        let expected = [
+            0x85, 0x20, 0xf0, 0x09, 0x89, 0x30, 0xa7, 0x54, 0x74, 0x8b, 0x7d, 0xdc, 0xb4, 0x3e,
+            0xf7, 0x5a, 0x0d, 0xbf, 0x3a, 0x0d, 0x26, 0x38, 0x1a, 0xf4, 0xeb, 0xa4, 0xa9, 0x8e,
+            0xaa, 0x9b, 0x4e, 0x6a,
+        ];
+        assert_eq!(derive_wireguard_public_key(&private)?, expected);
+        assert!(matches!(
+            derive_wireguard_public_key(&private[..31]),
+            Err(CryptoError::WireguardKey)
+        ));
         Ok(())
     }
 
