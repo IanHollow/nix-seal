@@ -5186,23 +5186,15 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
             })
             .collect::<Vec<_>>();
         let generator_state_destination = generator_state_relative_path(&generator_id);
-        let mut prompt_destinations = Vec::new();
-        for prompt in &generator.prompts {
-            if prompt.persistent {
-                prompt_destinations.push(generator_prompt_state_relative_path(
-                    &generator_id,
-                    &prompt.id,
-                ));
-            }
-        }
+        let (prompt_destinations, prompt_values_for_state) =
+            persistent_prompt_metadata(&generator_id, generator, &prompt_values)?;
         let mut private_writes = prompt_destinations
             .iter()
-            .zip(generator.prompts.iter().filter(|prompt| prompt.persistent))
-            .zip(prompt_values.iter())
+            .zip(prompt_values_for_state.iter())
             .map(
-                |((destination, _prompt), value)| nix_seal_authoring::BatchPrivateWrite {
+                |(destination, value)| nix_seal_authoring::BatchPrivateWrite {
                     relative_destination: destination.as_path(),
-                    plaintext: value.expose_secret(),
+                    plaintext: value,
                 },
             )
             .collect::<Vec<_>>();
@@ -5579,6 +5571,28 @@ fn generator_prompt_state_relative_path(
         .join("v1")
         .join(generator_id.as_str())
         .join(prompt_id.as_str())
+}
+
+fn persistent_prompt_metadata<'a>(
+    generator_id: &nix_seal_core::Id,
+    generator: &nix_seal_core::Generator,
+    prompt_values: &'a [SecretBox<Vec<u8>>],
+) -> Result<(Vec<PathBuf>, Vec<&'a [u8]>)> {
+    if prompt_values.len() != generator.prompts.len() {
+        bail!("generator prompt count changed during generation");
+    }
+    let mut destinations = Vec::new();
+    let mut values = Vec::new();
+    for (prompt, value) in generator.prompts.iter().zip(prompt_values) {
+        if prompt.persistent {
+            destinations.push(generator_prompt_state_relative_path(
+                generator_id,
+                &prompt.id,
+            ));
+            values.push(value.expose_secret().as_slice());
+        }
+    }
+    Ok((destinations, values))
 }
 
 /// Stores declared persistent prompts only after all generated ciphertext
@@ -9561,6 +9575,58 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         )?;
         let restored = read_generator_prompts(&generator, &files)?;
         assert_eq!(restored[0].expose_secret(), b"persistent-prompt");
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_prompt_metadata_preserves_nonpersistent_prompt_alignment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let generator_id = nix_seal_core::Id::parse("application/bootstrap")?;
+        let ephemeral_id = nix_seal_core::Id::parse("bootstrap/ephemeral")?;
+        let persistent_id = nix_seal_core::Id::parse("bootstrap/persistent")?;
+        let generator = nix_seal_core::Generator {
+            executable: "/nix/store/example/bin/generator".to_owned(),
+            arguments: Vec::new(),
+            runtime_inputs: Vec::new(),
+            timeout_seconds: nix_seal_core::DEFAULT_GENERATOR_TIMEOUT_SECONDS,
+            max_output_bytes: nix_seal_core::DEFAULT_GENERATOR_MAX_OUTPUT_BYTES,
+            dependencies: Vec::new(),
+            secret_dependencies: Vec::new(),
+            outputs: vec![nix_seal_core::Id::parse("application/token")?],
+            public_outputs: Vec::new(),
+            prompts: vec![
+                nix_seal_core::GeneratorPrompt {
+                    id: ephemeral_id,
+                    mode: nix_seal_core::GeneratorPromptMode::Hidden,
+                    message: "Ephemeral".to_owned(),
+                    multiline: false,
+                    persistent: false,
+                },
+                nix_seal_core::GeneratorPrompt {
+                    id: persistent_id.clone(),
+                    mode: nix_seal_core::GeneratorPromptMode::Hidden,
+                    message: "Persistent".to_owned(),
+                    multiline: false,
+                    persistent: true,
+                },
+            ],
+            parameters: BTreeMap::new(),
+            validation: None,
+        };
+        let prompt_values = vec![
+            SecretBox::new(Box::new(b"ephemeral-value".to_vec())),
+            SecretBox::new(Box::new(b"persistent-value".to_vec())),
+        ];
+        let (destinations, values) =
+            persistent_prompt_metadata(&generator_id, &generator, &prompt_values)?;
+        assert_eq!(
+            destinations,
+            vec![generator_prompt_state_relative_path(
+                &generator_id,
+                &persistent_id
+            )]
+        );
+        assert_eq!(values, vec![b"persistent-value".as_slice()]);
         Ok(())
     }
 
