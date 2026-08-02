@@ -20,6 +20,10 @@ and published under an immutable name before an atomic `current` symlink switch.
 Authentication or decryption failure drops the transaction and leaves the
 previous generation active.
 
+Runtime-root creation also validates every existing ancestor before calling
+`create_dir_all`: user-owned symlink components fail closed, while missing
+components are created only after the existing ancestry has passed that check.
+
 Each activation document carries one required phase. Its artifact and template
 entries must match that phase, and a template can reference only secret outputs
 within the same phase. This gives every phase a separate lock, generation

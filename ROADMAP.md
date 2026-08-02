@@ -35,7 +35,9 @@
   from using the cache as an unbounded local sink. Activation source paths are
   normalized before validation; parent ancestry rejects user-owned symlinks and
   is reopened descriptor-relatively with no-follow operations, with regression
-  coverage for ancestry substitution and dot-segment traversal.
+  coverage for ancestry substitution and dot-segment traversal. Runtime-root
+  creation now validates existing ancestors before directory creation, so a
+  user-owned symlink cannot redirect the root through `create_dir_all`.
 - Phase 3: authoring and lifecycle commands, identity/value rotation,
   generators, prompts, templates, and provisioning phases. Private identity,
   prompt-state, generator dependency, and generator-output permissions now use

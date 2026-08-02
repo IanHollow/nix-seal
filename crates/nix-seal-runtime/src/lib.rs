@@ -619,6 +619,7 @@ impl Generation {
     /// Starts a private generation on the same filesystem as the runtime root.
     pub fn begin(root: impl Into<PathBuf>) -> Result<Self, RuntimeError> {
         let root = root.into();
+        validate_runtime_root_ancestry(&root)?;
         if let Ok(metadata) = std::fs::symlink_metadata(&root)
             && !metadata.file_type().is_dir()
         {
@@ -1719,6 +1720,74 @@ fn validate_runtime_root_identity(root: &Path) -> Result<(), RuntimeError> {
         use std::os::unix::fs::MetadataExt;
         if metadata.uid() != rustix::process::geteuid().as_raw() {
             return Err(RuntimeError::InvalidDestination);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_runtime_root_ancestry(root: &Path) -> Result<(), RuntimeError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !is_normalized_absolute_path(root) {
+        return Err(RuntimeError::InvalidDestination);
+    }
+    let mut current = PathBuf::from("/");
+    let mut missing = false;
+    for component in root.components() {
+        let std::path::Component::Normal(name) = component else {
+            if matches!(component, std::path::Component::RootDir) {
+                continue;
+            }
+            return Err(RuntimeError::InvalidDestination);
+        };
+        if missing {
+            continue;
+        }
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    if metadata.uid() != 0 || current == root {
+                        return Err(RuntimeError::InvalidDestination);
+                    }
+                } else if current != root && !metadata.file_type().is_dir() {
+                    return Err(RuntimeError::InvalidDestination);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
+            Err(error) => return Err(RuntimeError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_runtime_root_ancestry(root: &Path) -> Result<(), RuntimeError> {
+    if !is_normalized_absolute_path(root) {
+        return Err(RuntimeError::InvalidDestination);
+    }
+    let mut current = PathBuf::from("/");
+    let mut missing = false;
+    for component in root.components() {
+        if matches!(component, std::path::Component::RootDir) {
+            continue;
+        }
+        let std::path::Component::Normal(name) = component else {
+            return Err(RuntimeError::InvalidDestination);
+        };
+        if missing {
+            continue;
+        }
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(RuntimeError::InvalidDestination);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
+            Err(error) => return Err(RuntimeError::Io(error)),
         }
     }
     Ok(())
@@ -3307,6 +3376,17 @@ mod tests {
             Generation::begin(&linked_root),
             Err(RuntimeError::InvalidDestination)
         ));
+
+        let real_parent = temporary.path().join("real-parent");
+        std::fs::create_dir(&real_parent)?;
+        let linked_parent = temporary.path().join("linked-parent");
+        symlink(&real_parent, &linked_parent)?;
+        let nested_root = linked_parent.join("runtime");
+        assert!(matches!(
+            Generation::begin(&nested_root),
+            Err(RuntimeError::InvalidDestination)
+        ));
+        assert!(!real_parent.join("runtime").exists());
 
         let generation = real_root.join("generation-1");
         std::fs::create_dir(&generation)?;
