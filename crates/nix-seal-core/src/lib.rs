@@ -221,6 +221,11 @@ pub struct Secret {
     /// Runtime delivery settings.
     #[serde(default)]
     pub runtime: RuntimeSettings,
+    /// Target-specific runtime delivery settings. Entries replace `runtime`
+    /// only for the named authorized target, so one canonical ciphertext can
+    /// safely serve platforms with different account-group conventions.
+    #[serde(default)]
+    pub runtime_overrides: BTreeMap<Id, RuntimeSettings>,
     /// Lifecycle metadata.
     #[serde(default)]
     pub lifecycle: Lifecycle,
@@ -229,6 +234,16 @@ pub struct Secret {
     pub repository_only: bool,
     /// Approval policy `ID`.
     pub approval_policy: Option<Id>,
+}
+
+impl Secret {
+    /// Resolves the exact runtime settings authorized for `target_id`.
+    #[must_use]
+    pub fn runtime_for_target(&self, target_id: &Id) -> &RuntimeSettings {
+        self.runtime_overrides
+            .get(target_id)
+            .unwrap_or(&self.runtime)
+    }
 }
 
 /// Public selectors for expanding a secret's authorized target set.

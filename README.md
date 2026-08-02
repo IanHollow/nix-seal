@@ -743,6 +743,11 @@ templates explicitly. The default delivery is administrator-backed `rekeyed`;
 advanced `direct` delivery is intentionally explicit because a stolen target key
 can decrypt historical ciphertext addressed to that target.
 
+When one canonical secret serves targets with different local account-group
+conventions, `runtimeOverrides.<target-id>` may replace its public runtime
+owner/group/mode for an already-authorized target. The resolved value is part of
+that target's signed policy and cannot be changed at activation time.
+
 `migrate sops-json` is intentionally a metadata-only adapter for SOPS JSON
 files. It accepts only bounded regular files, validates the top-level `sops`
 object, MAC/version fields, provider metadata, age recipients, and SOPS key

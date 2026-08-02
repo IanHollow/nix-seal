@@ -413,19 +413,41 @@ fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
                 "secret {id} requires an explicit approval policy or at least one default signer"
             )));
         }
-        if !is_private_runtime_mode(&secret.runtime.mode) {
-            return Err(PolicyError::Violation(format!(
-                "secret {id} runtime mode must be a nonzero owner-only four-digit octal mode"
-            )));
-        }
-        if let Some(path) = &secret.runtime.compatibility_symlink
-            && !nix_seal_core::valid_compatibility_symlink(path)
-        {
-            return Err(PolicyError::Violation(format!(
-                "secret {id} compatibility symlink must be a safe absolute path without '.' or '..' components"
-            )));
+        validate_runtime_settings(id, "runtime", &secret.runtime)?;
+        for (target_id, runtime) in &secret.runtime_overrides {
+            if !plan.targets.contains_key(target_id) {
+                return Err(PolicyError::Violation(format!(
+                    "secret {id} runtime override references missing target {target_id}"
+                )));
+            }
+            if !target_is_consumer(plan, secret, target_id) {
+                return Err(PolicyError::Violation(format!(
+                    "secret {id} runtime override target {target_id} is not an authorized consumer"
+                )));
+            }
+            validate_runtime_settings(id, "runtime override", runtime)?;
         }
         validate_lifecycle(id, &secret.lifecycle)?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_settings(
+    secret_id: &Id,
+    label: &str,
+    runtime: &RuntimeSettings,
+) -> Result<(), PolicyError> {
+    if !is_private_runtime_mode(&runtime.mode) {
+        return Err(PolicyError::Violation(format!(
+            "secret {secret_id} {label} mode must be a nonzero owner-only four-digit octal mode"
+        )));
+    }
+    if let Some(path) = &runtime.compatibility_symlink
+        && !nix_seal_core::valid_compatibility_symlink(path)
+    {
+        return Err(PolicyError::Violation(format!(
+            "secret {secret_id} {label} compatibility symlink must be a safe absolute path without '.' or '..' components"
+        )));
     }
     Ok(())
 }
@@ -1468,7 +1490,7 @@ pub fn target_policy(plan: &PlanV1, target_id: &Id) -> Result<TargetPolicyV1, Po
                     source: secret.source.clone(),
                     delivery: secret.delivery.clone(),
                     phase: secret.phase,
-                    runtime: secret.runtime.clone(),
+                    runtime: secret.runtime_for_target(target_id).clone(),
                     approval: target_approval_policy(plan, secret.approval_policy.as_ref())?,
                 },
             );
@@ -1614,6 +1636,7 @@ mod tests {
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: ActivationPhase::Activation,
                 runtime: RuntimeSettings::default(),
+                runtime_overrides: BTreeMap::new(),
                 lifecycle: Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,
@@ -1942,6 +1965,7 @@ mod tests {
                 },
                 phase: ActivationPhase::Activation,
                 runtime: RuntimeSettings::default(),
+                runtime_overrides: BTreeMap::new(),
                 lifecycle: Lifecycle::default(),
                 approval_policy: Some(
                     Id::parse("approval")
@@ -2019,6 +2043,7 @@ mod tests {
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: ActivationPhase::Activation,
                 runtime: RuntimeSettings::default(),
+                runtime_overrides: BTreeMap::new(),
                 lifecycle: Lifecycle::default(),
                 repository_only: true,
                 approval_policy: None,
@@ -2088,6 +2113,7 @@ mod tests {
                     selectors: nix_seal_core::TargetSelectors::default(),
                     phase: ActivationPhase::Activation,
                     runtime: RuntimeSettings::default(),
+                    runtime_overrides: BTreeMap::new(),
                     lifecycle: Lifecycle::default(),
                     approval_policy: None,
                     repository_only: false,
@@ -2259,6 +2285,17 @@ mod tests {
                 },
                 phase: ActivationPhase::Activation,
                 runtime: RuntimeSettings::default(),
+                runtime_overrides: BTreeMap::from([(
+                    first_target.clone(),
+                    RuntimeSettings {
+                        owner: "desktop-user".to_owned(),
+                        group: "desktop-group".to_owned(),
+                        mode: "0400".to_owned(),
+                        restart_units: Vec::new(),
+                        reload_units: Vec::new(),
+                        compatibility_symlink: None,
+                    },
+                )]),
                 lifecycle: Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,
@@ -2268,6 +2305,10 @@ mod tests {
         let first_policy = target_policy(&plan, &first_target)?;
         let second_policy = target_policy(&plan, &second_target)?;
         assert_eq!(first_policy.secrets.len(), 1);
+        assert_eq!(
+            first_policy.secrets[&parse("db/password")?].runtime.group,
+            "desktop-group"
+        );
         assert!(second_policy.secrets.is_empty());
         Ok(())
     }
@@ -2349,6 +2390,7 @@ mod tests {
             selectors: nix_seal_core::TargetSelectors::default(),
             phase: ActivationPhase::Activation,
             runtime: RuntimeSettings::default(),
+            runtime_overrides: BTreeMap::new(),
             lifecycle: Lifecycle::default(),
             approval_policy: None,
             repository_only: false,
@@ -2504,6 +2546,7 @@ mod tests {
             selectors: nix_seal_core::TargetSelectors::default(),
             phase: ActivationPhase::Activation,
             runtime: RuntimeSettings::default(),
+            runtime_overrides: BTreeMap::new(),
             lifecycle: Lifecycle::default(),
             approval_policy: None,
             repository_only: false,
@@ -2648,6 +2691,7 @@ mod tests {
                 selectors: nix_seal_core::TargetSelectors::default(),
                 phase: ActivationPhase::Activation,
                 runtime: RuntimeSettings::default(),
+                runtime_overrides: BTreeMap::new(),
                 lifecycle: Lifecycle::default(),
                 approval_policy: None,
                 repository_only: false,
@@ -2691,6 +2735,7 @@ mod tests {
             selectors: nix_seal_core::TargetSelectors::default(),
             phase: ActivationPhase::Activation,
             runtime: RuntimeSettings::default(),
+            runtime_overrides: BTreeMap::new(),
             lifecycle,
             approval_policy: None,
             repository_only: false,

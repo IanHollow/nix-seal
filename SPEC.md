@@ -36,7 +36,8 @@ rejected. Only public metadata may enter the Nix store.
 The object model includes identities, groups, targets, secrets, generators,
 templates, approval policies, and versioned backends. Secrets support binary or
 text values; groups/selectors; rekeyed or advanced direct delivery;
-partitioning, users, activation, or services phases; owner/group/mode; systemd
+partitioning, users, activation, or services phases; owner/group/mode (with
+validated per-target runtime overrides for platform account conventions); systemd
 credential mapping; optional compatibility symlinks bound to the active
 generation; reload/restart lists; lifecycle and incident metadata; generators
 and dependencies; public/secret/intermediary outputs; and runtime templates.
