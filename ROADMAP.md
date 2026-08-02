@@ -23,7 +23,8 @@
   activation supplies a different or missing policy, preserving durable retry
   semantics. The Linux NixOS VM now exercises a real systemd credential consumer
   and post-switch restart after activation; service actions now reject untrusted
-  manager paths.
+  manager paths. Every authoring and migration transaction now serializes on a
+  descriptor-safe, owner-only repository lock in addition to the cache lock.
 - Phase 3: authoring and lifecycle commands, identity/value rotation,
   generators, prompts, templates, and provisioning phases. Private identity,
   prompt-state, generator dependency, and generator-output permissions now use

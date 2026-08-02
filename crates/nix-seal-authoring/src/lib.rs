@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Transactional, plan-directed canonical ciphertext authoring.
 
+use fs2::FileExt;
 use secrecy::SecretString;
 use serde::Serialize;
 use std::{
@@ -299,6 +300,74 @@ pub enum AuthoringError {
     Tombstone(#[source] serde_json::Error),
 }
 
+/// Repository-wide authoring lock. The lock file contains no secret data and
+/// is kept mode 0600 so an untrusted local user cannot interfere with a
+/// transaction by replacing or observing the lock path.
+struct RepositoryLock(File);
+
+fn acquire_repository_lock(repository_root: &Path) -> Result<RepositoryLock, AuthoringError> {
+    let root = repository_root.canonicalize().map_err(AuthoringError::Io)?;
+    let metadata = std::fs::symlink_metadata(&root).map_err(AuthoringError::Io)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(AuthoringError::UnsafePath);
+    }
+    let _lock = root.join(".nix-seal.lock");
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags, openat};
+        let directory = open_directory_nofollow(&root).map_err(AuthoringError::Io)?;
+        let descriptor = openat(
+            &directory,
+            ".nix-seal.lock",
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(std::io::Error::from)
+        .map_err(AuthoringError::Io)?;
+        File::from(descriptor)
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let existing = std::fs::symlink_metadata(&lock);
+        if existing
+            .as_ref()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(AuthoringError::UnsafePath);
+        }
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&_lock)
+            .map_err(AuthoringError::Io)?
+    };
+    let metadata = file.metadata().map_err(AuthoringError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(AuthoringError::UnsafePath);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.nlink() != 1
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(AuthoringError::UnsafePath);
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(AuthoringError::Io)?;
+    }
+    file.lock_exclusive().map_err(AuthoringError::Io)?;
+    Ok(RepositoryLock(file))
+}
+
+impl Drop for RepositoryLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Explicit editor invocation. No shell or inherited environment is used.
 pub struct EditRequest<'a> {
     /// Existing repository root.
@@ -350,6 +419,7 @@ pub fn write_secret_checked<R: Read + Send, F: FnOnce() -> Result<(), AuthoringE
     mode: WriteMode,
     final_input_check: F,
 ) -> Result<AuthoringResult, AuthoringError> {
+    let _repository_lock = acquire_repository_lock(repository_root)?;
     if !recipients.iter().any(|recipient| {
         nix_seal_crypto::identity_matches_recipient(verification_identity, recipient)
     }) {
@@ -436,6 +506,7 @@ pub fn rekey_secret_with_identities(
     verification_identity: &SecretString,
     mode: WriteMode,
 ) -> Result<AuthoringResult, AuthoringError> {
+    let _repository_lock = acquire_repository_lock(repository_root)?;
     if !recipients.iter().any(|recipient| {
         nix_seal_crypto::identity_matches_recipient(verification_identity, recipient)
     }) {
@@ -520,6 +591,7 @@ pub fn rekey_secret_batch_with_identities(
     verification_identity: &SecretString,
     mode: WriteMode,
 ) -> Result<Vec<AuthoringResult>, AuthoringError> {
+    let _repository_lock = acquire_repository_lock(repository_root)?;
     if writes.is_empty() || writes.len() > 10_000 {
         return Err(AuthoringError::UnsafePath);
     }
@@ -647,6 +719,7 @@ pub fn write_secret_file_batch(
     verification_identity: &SecretString,
     mode: WriteMode,
 ) -> Result<Vec<AuthoringResult>, AuthoringError> {
+    let _repository_lock = acquire_repository_lock(repository_root)?;
     if writes.is_empty() || writes.len() > 10_000 {
         return Err(AuthoringError::UnsafePath);
     }
@@ -767,6 +840,7 @@ pub fn write_public_file_batch(
     mode: WriteMode,
 ) -> Result<Vec<PublicAuthoringResult>, AuthoringError> {
     const MAX_PUBLIC_FILE_BYTES: u64 = 64 * 1024 * 1024;
+    let _repository_lock = acquire_repository_lock(repository_root)?;
     if writes.is_empty() || writes.len() > 10_000 {
         return Err(AuthoringError::UnsafePath);
     }
@@ -912,6 +986,7 @@ pub fn write_secret_batch(
     verification_identity: &SecretString,
     mode: WriteMode,
 ) -> Result<Vec<AuthoringResult>, AuthoringError> {
+    let _repository_lock = acquire_repository_lock(repository_root)?;
     let mut prepared = prepare_batch_writes(repository_root, writes, verification_identity, mode)?;
 
     for item in &prepared {
@@ -987,6 +1062,7 @@ pub fn write_secret_public_private_batch(
     verification_identity: &SecretString,
     mode: WriteMode,
 ) -> Result<BatchAuthoringResult, AuthoringError> {
+    let _repository_lock = acquire_repository_lock(repository_root)?;
     if secret_writes.is_empty()
         && public_writes.is_empty()
         && private_writes.is_empty()
@@ -1524,6 +1600,7 @@ fn resolve_editor_workspace_root(path: &Path) -> Result<PathBuf, AuthoringError>
 
 /// Atomically moves canonical ciphertext into a private, collision-safe quarantine tombstone.
 pub fn delete_secret(request: &DeleteRequest<'_>) -> Result<DeletionResult, AuthoringError> {
+    let _repository_lock = acquire_repository_lock(request.repository_root)?;
     if request.secret_id.is_empty() || request.deleted_at.is_empty() {
         return Err(AuthoringError::UnsafePath);
     }
@@ -1792,6 +1869,22 @@ fn set_private_file(file: &File) -> Result<(), std::io::Error> {
 }
 
 #[cfg(unix)]
+fn open_directory_nofollow(path: &Path) -> Result<File, std::io::Error> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let metadata = fstat(&descriptor).map_err(std::io::Error::from)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
+        return Err(std::io::Error::other("repository root is not a directory"));
+    }
+    Ok(File::from(descriptor))
+}
+
+#[cfg(unix)]
 fn set_public_file(file: &File) -> Result<(), std::io::Error> {
     use std::os::unix::fs::PermissionsExt;
     file.set_permissions(std::fs::Permissions::from_mode(0o644))
@@ -1950,6 +2043,38 @@ impl Write for HashingWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_lock_is_private_and_link_safe() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        {
+            let _lock = acquire_repository_lock(&root)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(root.join(".nix-seal.lock"))?
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let linked = root.join("linked-lock");
+            symlink(root.join("outside"), &linked)?;
+            std::fs::rename(&linked, root.join(".nix-seal.lock"))?;
+            assert!(matches!(
+                acquire_repository_lock(&root),
+                Err(AuthoringError::Io(_) | AuthoringError::UnsafePath)
+            ));
+        }
+        Ok(())
+    }
 
     #[test]
     fn create_and_replace_are_verified_and_atomic() -> Result<(), Box<dyn std::error::Error>> {

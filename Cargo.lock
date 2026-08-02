@@ -1342,6 +1342,7 @@ name = "nix-seal-authoring"
 version = "0.1.0-alpha.1"
 dependencies = [
  "blake3",
+ "fs2",
  "nix-seal-crypto",
  "rustix",
  "secrecy",
