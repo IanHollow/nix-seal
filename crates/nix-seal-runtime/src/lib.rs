@@ -1979,11 +1979,21 @@ fn open_regular_nofollow(path: &Path) -> Result<File, RuntimeError> {
         }
     })?;
     let metadata = fstat(&descriptor).map_err(|error| RuntimeError::Io(error.into()))?;
-    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile || metadata.st_nlink != 1
+    let immutable_nix_store_source = is_immutable_nix_store_source(path, &metadata);
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+        || (metadata.st_nlink != 1 && !immutable_nix_store_source)
     {
         return Err(RuntimeError::UnsafeSource);
     }
     Ok(File::from(descriptor))
+}
+
+/// A Nix store file may be hard-linked by store deduplication. It is still a
+/// safe artifact input only when it is root-owned and immutable; every other
+/// hard link remains rejected before decryption.
+#[cfg(unix)]
+fn is_immutable_nix_store_source(path: &Path, metadata: &rustix::fs::Stat) -> bool {
+    path.starts_with("/nix/store/") && metadata.st_uid == 0 && metadata.st_mode & 0o222 == 0
 }
 
 #[cfg(unix)]
@@ -3371,6 +3381,18 @@ mod tests {
         ));
         assert!(!fixture.runtime.exists());
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recognizes_only_direct_nix_store_artifact_paths() {
+        assert!(Path::new("/nix/store/abc-artifact/ciphertext.age").starts_with("/nix/store/"));
+        assert!(
+            !Path::new("/nix/storehouse/abc-artifact/ciphertext.age").starts_with("/nix/store/")
+        );
+        assert!(
+            !Path::new("/tmp/nix/store/abc-artifact/ciphertext.age").starts_with("/nix/store/")
+        );
     }
 
     #[cfg(unix)]
