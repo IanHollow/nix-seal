@@ -903,15 +903,16 @@ fn remove_artifact_bundle(record: &ArtifactRecord) -> Result<(), CacheError> {
     Ok(())
 }
 
-fn read_bounded(file: &mut File, limit: u64) -> Result<Vec<u8>, CacheError> {
-    let length = file.metadata()?.len();
-    if length > limit {
-        return Err(CacheError::Limit);
-    }
-    let capacity = usize::try_from(length).map_err(|_| CacheError::Limit)?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.read_to_end(&mut bytes)?;
-    if bytes.len() > capacity {
+fn read_bounded<R: Read>(reader: R, limit: u64) -> Result<Vec<u8>, CacheError> {
+    // Do not trust a metadata length observed before the read: a concurrent
+    // writer can grow a file after that check. The `Take` adapter keeps both
+    // the read and resulting allocation bounded even if the source changes.
+    let initial_capacity = usize::try_from(limit.min(16 * 1024)).map_err(|_| CacheError::Limit)?;
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).map_err(|_| CacheError::Limit)? > limit {
         return Err(CacheError::Limit);
     }
     Ok(bytes)
@@ -1167,7 +1168,21 @@ fn set_private_permissions(_path: &Path, _directory: bool) -> Result<(), std::io
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::io::Cursor;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn bounded_reader_rejects_growth_without_reading_unbounded_data() {
+        let mut reader = Cursor::new(vec![0_u8; 64]);
+        assert!(matches!(
+            read_bounded(&mut reader, 8),
+            Err(CacheError::Limit)
+        ));
+        // The bounded reader consumes only the limit plus one byte needed to
+        // prove that the input is oversized, never the complete source.
+        assert_eq!(reader.position(), 9);
+    }
+
     #[test]
     fn stores_and_verifies_content() -> Result<(), CacheError> {
         let temp = tempfile::tempdir()?;
