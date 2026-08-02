@@ -29,10 +29,10 @@
   Runtime secrets now support optional compatibility symlinks bound to the
   stable `current/<secret>` path. Existing parents and links are validated by
   no-follow descriptors, publication is atomic no-replace, mismatches fail
-  closed, and rollback follows the same `current` switch.
-  Generic cache insertion now enforces the same bounded ciphertext limit as
-  artifact and export paths before hashing or publication, preventing an
-  untrusted caller from using the cache as an unbounded local sink.
+  closed, and rollback follows the same `current` switch. Generic cache
+  insertion now enforces the same bounded ciphertext limit as artifact and
+  export paths before hashing or publication, preventing an untrusted caller
+  from using the cache as an unbounded local sink.
 - Phase 3: authoring and lifecycle commands, identity/value rotation,
   generators, prompts, templates, and provisioning phases. Private identity,
   prompt-state, generator dependency, and generator-output permissions now use
@@ -55,8 +55,8 @@
   encrypted private scalar and one derived public key as one validated
   transaction. Generated private identities are created through no-follow,
   descriptor-relative opens with exclusive creation and owner/link checks;
-  user-owned symlinked parents fail closed while root-owned platform aliases
-  are canonicalized safely.
+  user-owned symlinked parents fail closed while root-owned platform aliases are
+  canonicalized safely.
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
   starting with a synthetic low-risk secret. Public migration compatibility
   goldens now cover agenix/ragenix, agenix-rekey, SOPS metadata, Clan
