@@ -133,10 +133,9 @@ an explicit encoding transform.
 
 Dry-run-first, non-destructive migration adapters cover agenix/ragenix,
 agenix-rekey, sops-nix/SOPS, and Clan Vars/Facts. They report mappings first,
-stream plaintext directly into age,
-round-trip every ciphertext, preserve IDs/scopes where possible, and support
-side-by-side runtime directories. Source managers are never rewritten or removed
-automatically.
+stream plaintext directly into age, round-trip every ciphertext, preserve
+IDs/scopes where possible, and support side-by-side runtime directories. Source
+managers are never rewritten or removed automatically.
 
 ## Rust and security policy
 

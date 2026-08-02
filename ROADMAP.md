@@ -68,17 +68,17 @@
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
   starting with a synthetic low-risk secret. Public migration compatibility
   goldens now cover agenix/ragenix, agenix-rekey, SOPS metadata, Clan
-  Vars/Facts. The parent nix-conf flake now
-  runs a disposable end-to-end dogfood check covering generated identities,
-  canonical authoring, deep validation, signed provisioning, cache
-  export/import, activation, and template rendering without copying plaintext
-  into its output. Negative migration fixtures now cover path traversal,
-  malformed age recipients, inconsistent recipient sets, and symlinked legacy
-  trees. The dogfood migration also exercises a legacy OpenSSH source identity
-  re-encrypted to a distinct native-age administrator identity, proving the
-  explicit source/verification-key split. Deep candidate-plan validation runs
-  against side-by-side re-encrypted sources rather than legacy target-addressed
-  ciphertext. Migration of actual nix-conf secrets remains required.
+  Vars/Facts. The parent nix-conf flake now runs a disposable end-to-end dogfood
+  check covering generated identities, canonical authoring, deep validation,
+  signed provisioning, cache export/import, activation, and template rendering
+  without copying plaintext into its output. Negative migration fixtures now
+  cover path traversal, malformed age recipients, inconsistent recipient sets,
+  and symlinked legacy trees. The dogfood migration also exercises a legacy
+  OpenSSH source identity re-encrypted to a distinct native-age administrator
+  identity, proving the explicit source/verification-key split. Deep
+  candidate-plan validation runs against side-by-side re-encrypted sources
+  rather than legacy target-addressed ciphertext. Migration of actual nix-conf
+  secrets remains required.
 - Phase 5: attack-path review, sustained fuzz/mutation/platform/performance work
   (the reproducible scale benchmark protocol and scheduled Miri, sanitizer, and
   mutation jobs are now published), release build/SBOM/attestation scaffolding,

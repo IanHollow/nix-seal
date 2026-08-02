@@ -658,13 +658,13 @@ only as a migration compatibility path; encrypted SSH private keys are
 deliberately rejected in non-interactive workflows, so convert them to a
 reviewed native-age or hardware-backed identity before automated import.
 
-For age-tree, agenix-rekey, and single-file ciphertext migration,
-`--identity` is the legacy source/decryption identity. `--verification-identity`
-is optional and defaults to `--identity`; when supplied it must be authorized by
-every replacement recipient and is used to authenticate the newly written
-ciphertext. This explicit split is required when a migration replaces a legacy
-SSH or age key with a new administrator or recovery key. Both private identities
-are opened only for `--execute`; dry runs inspect public metadata and paths.
+For age-tree, agenix-rekey, and single-file ciphertext migration, `--identity`
+is the legacy source/decryption identity. `--verification-identity` is optional
+and defaults to `--identity`; when supplied it must be authorized by every
+replacement recipient and is used to authenticate the newly written ciphertext.
+This explicit split is required when a migration replaces a legacy SSH or age
+key with a new administrator or recovery key. Both private identities are opened
+only for `--execute`; dry runs inspect public metadata and paths.
 
 PGP is migration-only and never a native nix-seal encryption backend. Its
 dry-run-first bridge requires an absolute GnuPG executable and private,
@@ -702,10 +702,10 @@ standard age-compatible.
 Public migration compatibility goldens are checked into
 `crates/nix-seal-cli/tests/fixtures/migrations` and exercised through the
 released binary. They cover agenix, ragenix, agenix-rekey, SOPS JSON metadata,
-Clan Vars, and Clan Facts. The fixtures
-contain only public metadata, empty/public leaves, or ciphertext without its
-private identity; mutation adapters remain dry-run-first and require separate
-round-trip tests before a 1.0 migration claim.
+Clan Vars, and Clan Facts. The fixtures contain only public metadata,
+empty/public leaves, or ciphertext without its private identity; mutation
+adapters remain dry-run-first and require separate round-trip tests before a 1.0
+migration claim.
 
 For agenix-rekey, expose one public evaluated configuration with
 `nixSeal.lib.agenixRekeyMigrationExport`. The target must declare `id`, `kind`
@@ -740,8 +740,8 @@ Build a separate, reviewable `plan.v1.json` with the Nix or TOML frontend before
 performing a migration. The plan must name target systems, approval signers,
 administrator or recovery recipients, runtime ownership, phases, lifecycle, and
 templates explicitly. The default delivery is administrator-backed `rekeyed`;
-advanced `direct` delivery is intentionally explicit because a stolen target
-key can decrypt historical ciphertext addressed to that target.
+advanced `direct` delivery is intentionally explicit because a stolen target key
+can decrypt historical ciphertext addressed to that target.
 
 `migrate sops-json` is intentionally a metadata-only adapter for SOPS JSON
 files. It accepts only bounded regular files, validates the top-level `sops`
