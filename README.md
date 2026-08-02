@@ -139,8 +139,8 @@ ambient environment or shell. Omit `--replace` for create-only behavior.
 {
   "schema": "nix-seal.collection.v1",
   "entries": [
-    {"secret": "service/password", "path": "service.password"},
-    {"secret": "service/key", "path": "service.key", "encoding": "hex"}
+    { "secret": "service/password", "path": "service.password" },
+    { "secret": "service/key", "path": "service.key", "encoding": "hex" }
   ]
 }
 ```
