@@ -46,7 +46,9 @@
   now accepts bounded JSON, TOML, YAML, and dotenv inputs through a strict
   public mapping, supports explicit binary encodings and private editor staging,
   and commits each mapped secret through one all-or-recover ciphertext
-  transaction.
+  transaction. The built-in SSH Ed25519 generator can now commit its encrypted
+  private key and one separately declared derived public OpenSSH key as one
+  validated transaction.
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
   starting with a synthetic low-risk secret. Public migration compatibility
   goldens now cover agenix/ragenix, agenix-rekey, SOPS metadata, Clan

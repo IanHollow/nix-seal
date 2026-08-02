@@ -119,7 +119,10 @@ tokens. Generators have multi-output transactions, a cycle-checked dependency
 graph, typed prompts, declared runtime inputs, direct execution, sanitized
 environment, private workspace, resource limits, network isolation where
 enforceable, least-secret dependency exposure, validation fingerprints, and
-all-output validation before replacement.
+all-output validation before replacement. The built-in SSH Ed25519 generator may
+expose one separately declared public OpenSSH key derived from its encrypted
+private output; other built-ins reject public outputs until a safe derivation is
+defined.
 
 Templates use strict placeholders; missing/unused placeholders fail. Templates
 remain public in the store and render at activation. Binary interpolation needs

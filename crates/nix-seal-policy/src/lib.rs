@@ -1340,9 +1340,19 @@ fn validate_generator_execution(
             "built-in generator {generator_id} cannot declare secret dependencies"
         )));
     }
-    if is_builtin && !generator.public_outputs.is_empty() {
+    let ssh_public_output = generator.executable == "builtin:ssh-ed25519"
+        && generator.outputs.len() == 1
+        && generator.public_outputs.len() <= 1;
+    if is_builtin && !generator.public_outputs.is_empty() && !ssh_public_output {
         return Err(PolicyError::Violation(format!(
             "built-in generator {generator_id} cannot declare public outputs"
+        )));
+    }
+    if generator.executable == "builtin:ssh-ed25519"
+        && (generator.outputs.len() != 1 || generator.public_outputs.len() > 1)
+    {
+        return Err(PolicyError::Violation(format!(
+            "built-in generator {generator_id} requires exactly one secret output and at most one public output"
         )));
     }
     Ok(())
@@ -1699,6 +1709,15 @@ mod tests {
         );
         let ssh = nix_seal_core::Generator {
             executable: "builtin:ssh-ed25519".to_owned(),
+            outputs: vec![
+                Id::parse("ssh-private")
+                    .map_err(|error| PolicyError::Violation(error.to_string()))?,
+            ],
+            public_outputs: vec![nix_seal_core::GeneratorPublicOutput {
+                id: Id::parse("ssh-public")
+                    .map_err(|error| PolicyError::Violation(error.to_string()))?,
+                destination: "public/ssh-key".to_owned(),
+            }],
             parameters: BTreeMap::new(),
             ..generator
         };
@@ -1724,6 +1743,7 @@ mod tests {
                 ("memory-kib".to_owned(), "19456".to_owned()),
                 ("iterations".to_owned(), "2".to_owned()),
             ]),
+            public_outputs: Vec::new(),
             ..ssh
         };
         validate_generator_execution(

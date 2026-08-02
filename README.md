@@ -531,7 +531,9 @@ beneath `$NIX_SEAL_OUTPUT_DIR`, plus the same numbered protocol beneath
 links, oversized output, nonzero exits, and timeouts fail the full transaction
 without exposing process output. Public destinations are repository-relative,
 must not collide with ciphertext sources, and are recorded in the public plan;
-built-in generators currently emit encrypted secret outputs only.
+built-in generators emit encrypted secret outputs; `builtin:ssh-ed25519` may
+additionally emit one derived public OpenSSH key output without exposing any
+private material.
 
 Private identities, prompt state, generator dependencies, and generator outputs
 are permissioned through their already-open descriptors. Generator output paths

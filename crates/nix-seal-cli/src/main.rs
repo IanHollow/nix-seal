@@ -6000,6 +6000,8 @@ struct GeneratedValues {
     public: Vec<SecretBox<Vec<u8>>>,
 }
 
+type GeneratedSshKeyPair = (SecretBox<Vec<u8>>, SecretBox<Vec<u8>>);
+
 fn generate_generator_values(
     generator: &nix_seal_core::Generator,
     prompts: &[SecretBox<Vec<u8>>],
@@ -6017,6 +6019,17 @@ fn generate_generator_values(
         }
         if !generator.secret_dependencies.is_empty() {
             bail!("built-in generators do not accept secret dependencies");
+        }
+        if generator.executable == "builtin:ssh-ed25519" {
+            let (secret, public) = generate_ssh_ed25519_values(generator)?;
+            return Ok(GeneratedValues {
+                secrets: vec![secret],
+                public: if generator.public_outputs.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![public]
+                },
+            });
         }
         return Ok(GeneratedValues {
             secrets: generator
@@ -6809,8 +6822,23 @@ fn generate_passphrase(generator: &nix_seal_core::Generator) -> Result<SecretBox
 fn generate_ssh_ed25519_private_key(
     generator: &nix_seal_core::Generator,
 ) -> Result<SecretBox<Vec<u8>>> {
-    if !generator.parameters.is_empty() || generator.outputs.len() != 1 {
-        bail!("builtin:ssh-ed25519 accepts no parameters and requires exactly one secret output");
+    let (private, _) = generate_ssh_ed25519_values(generator)?;
+    Ok(private)
+}
+
+/// Generates an Ed25519 private key and, when requested, its standard public
+/// OpenSSH representation. The public output is derived from the same key
+/// bytes before the private value enters the authoring transaction.
+fn generate_ssh_ed25519_values(
+    generator: &nix_seal_core::Generator,
+) -> Result<GeneratedSshKeyPair> {
+    if !generator.parameters.is_empty()
+        || generator.outputs.len() != 1
+        || generator.public_outputs.len() > 1
+    {
+        bail!(
+            "builtin:ssh-ed25519 accepts no parameters, exactly one secret output, and at most one public output"
+        );
     }
     let seed = nix_seal_crypto::random_bytes(32)?;
     let mut secret_seed = Zeroizing::new([0_u8; 32]);
@@ -6881,7 +6909,14 @@ fn generate_ssh_ed25519_private_key(
     }
     output.extend_from_slice(b"-----END OPENSSH ");
     output.extend_from_slice(b"PRIVATE KEY-----\n");
-    Ok(SecretBox::new(Box::new(output)))
+    let mut public_output = Vec::with_capacity(public_blob.len().saturating_mul(2) + 16);
+    public_output.extend_from_slice(b"ssh-ed25519 ");
+    public_output.extend_from_slice(BASE64_STANDARD.encode(&public_blob).as_bytes());
+    public_output.push(b'\n');
+    Ok((
+        SecretBox::new(Box::new(output)),
+        SecretBox::new(Box::new(public_output)),
+    ))
 }
 
 fn ssh_write_u32(output: &mut Vec<u8>, value: u32) {
@@ -10358,6 +10393,20 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         assert!(text.ends_with(concat!("-----END OPENSSH ", "PRIVATE KEY-----\n")));
         let recipient = nix_seal_crypto::recipient_from_identity(&SecretString::from(text))?;
         assert!(recipient.starts_with("ssh-ed25519 "));
+        let public_generator = nix_seal_core::Generator {
+            public_outputs: vec![nix_seal_core::GeneratorPublicOutput {
+                id: nix_seal_core::Id::parse("application/ssh-public-key")?,
+                destination: "public/application-ssh-key".to_owned(),
+            }],
+            ..generator.clone()
+        };
+        let generated =
+            generate_generator_values(&public_generator, &[], GeneratorSecretInputs::None)?;
+        let generated_private = String::from_utf8(generated.secrets[0].expose_secret().clone())?;
+        let generated_recipient =
+            nix_seal_crypto::recipient_from_identity(&SecretString::from(generated_private))?;
+        let public = String::from_utf8(generated.public[0].expose_secret().clone())?;
+        assert_eq!(generated_recipient, public.trim());
         assert!(
             generate_ssh_ed25519_private_key(&nix_seal_core::Generator {
                 outputs: vec![
