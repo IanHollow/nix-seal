@@ -722,15 +722,21 @@ To produce a separate, reviewable `plan.v1.json` bridge from a `secretctl`
 index, provide every legacy target's Nix system, at least one independent
 approval signer, and one administrator or recovery recipient. The candidate uses
 administrator-backed `rekeyed` delivery by default; it does not modify the old
-manager or any ciphertext.
+manager or any ciphertext. Because legacy ciphertext is normally addressed to
+target SSH keys rather than the new administrator, also provide the
+repository-relative prefix where the side-by-side rekey will publish canonical
+sources. The candidate plan points at that post-migration prefix and must be
+deep-checked only after the new ciphertext exists.
 
 ```console
 nix-seal migrate secretctl --index /tmp/secretctl-index.json \
   --plan-output /tmp/nix-seal-plan.v1.json \
+  --canonical-source-prefix migrated-secretctl \
   --target-system 'home:ianmh@desktop=x86_64-linux' \
   --target-system 'host:nixos:desktop=x86_64-linux' \
   --administrator 'migration-admin=age1admin…' \
   --signer 'release=nix-seal-ed25519-v1:…'
+# First run the reviewed side-by-side migration into migrated-secretctl, then:
 nix-seal check --nix-plan /tmp/nix-seal-plan.v1.json --deep --repository-root .
 ```
 

@@ -54,8 +54,11 @@
   trees. The dogfood migration also exercises a legacy OpenSSH source identity
   re-encrypted to a distinct native-age administrator identity, proving the
   explicit source/verification-key split. Secretctl candidate plans now default
-  to administrator-backed rekeyed delivery and require an explicit opt-in for
-  legacy direct delivery. Migration of actual nix-conf secrets remains required.
+  to administrator-backed rekeyed delivery, require an explicit post-migration
+  canonical source prefix, and require an explicit opt-in for legacy direct
+  delivery. Deep candidate-plan validation now runs against the side-by-side
+  re-encrypted sources rather than legacy target-addressed ciphertext. Migration
+  of actual nix-conf secrets remains required.
 - Phase 5: attack-path review, sustained fuzz/mutation/platform/performance work
   (the reproducible scale benchmark protocol and scheduled Miri, sanitizer, and
   mutation jobs are now published), release build/SBOM/attestation scaffolding,

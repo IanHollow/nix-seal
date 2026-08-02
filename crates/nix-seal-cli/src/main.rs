@@ -900,6 +900,12 @@ struct SecretctlMigrationArgs {
     /// Write a new canonical public `plan.v1.json` candidate; refuses to overwrite.
     #[arg(long)]
     plan_output: Option<PathBuf>,
+    /// Repository-relative prefix containing the post-migration canonical
+    /// ciphertext tree used by a rekeyed candidate plan. The prefix is joined
+    /// with each legacy `secrets/*.age` path and must exist before deep plan
+    /// validation or activation.
+    #[arg(long)]
+    canonical_source_prefix: Option<PathBuf>,
     /// Required target-system mapping for a candidate plan as `LEGACY_TARGET=SYSTEM`.
     #[arg(long = "target-system", value_name = "LEGACY_TARGET=SYSTEM")]
     target_systems: Vec<String>,
@@ -3510,20 +3516,41 @@ fn migrate_clan_facts_tree(arguments: &ClanFactsMigrationArgs, json: bool) -> Re
 fn migrate_secretctl(arguments: &SecretctlMigrationArgs, json: bool) -> Result<()> {
     let index: SecretctlIndexV1 =
         read_json_bounded(&arguments.index).context("invalid strict secretctl secretIndex JSON")?;
+    if let (Some(prefix), Some(destination)) = (
+        arguments.canonical_source_prefix.as_deref(),
+        arguments.destination.as_deref(),
+    ) {
+        validate_migration_relative_path(prefix, "canonical-source-prefix")?;
+        validate_migration_relative_path(destination, "destination")?;
+        if prefix != destination {
+            bail!(
+                "--canonical-source-prefix must match --destination when a candidate plan and side-by-side import are requested together"
+            );
+        }
+    }
     let report = build_secretctl_migration_report(&index)?;
     let candidate_plan = if let Some(output) = arguments.plan_output.as_deref() {
+        if let Some(prefix) = arguments.canonical_source_prefix.as_deref() {
+            validate_migration_relative_path(prefix, "canonical-source-prefix")?;
+        } else if matches!(arguments.delivery, CandidateDelivery::Rekeyed) {
+            bail!(
+                "rekeyed candidate plans require --canonical-source-prefix pointing at the post-migration ciphertext tree"
+            );
+        }
         let plan = build_secretctl_candidate_plan(
             &index,
             &arguments.target_systems,
             &arguments.signers,
             &arguments.administrators,
             arguments.delivery,
+            arguments.canonical_source_prefix.as_deref(),
         )?;
         let canonical = nix_seal_policy::canonical_json(&plan)?;
         emit_canonical_public_json(Some(output), &canonical)?;
         Some((output, plan))
     } else {
-        if !arguments.target_systems.is_empty()
+        if arguments.canonical_source_prefix.is_some()
+            || !arguments.target_systems.is_empty()
             || !arguments.signers.is_empty()
             || !arguments.administrators.is_empty()
         {
@@ -3763,6 +3790,7 @@ fn build_secretctl_candidate_plan(
     signer_specs: &[String],
     administrator_specs: &[String],
     delivery: CandidateDelivery,
+    canonical_source_prefix: Option<&Path>,
 ) -> Result<nix_seal_core::PlanV1> {
     let _ = build_secretctl_migration_report(index)?;
     let systems = parse_target_systems(target_system_specs, &index.targets)?;
@@ -3864,10 +3892,11 @@ fn build_secretctl_candidate_plan(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let source = candidate_source_path(&secret.file, delivery, canonical_source_prefix)?;
         plan.secrets.insert(
             migrated_id(legacy_id)?,
             nix_seal_core::Secret {
-                source: secret.file.clone(),
+                source,
                 delivery: match delivery {
                     CandidateDelivery::Rekeyed => nix_seal_core::DeliveryMode::Rekeyed,
                     CandidateDelivery::Direct => nix_seal_core::DeliveryMode::Direct,
@@ -3885,6 +3914,33 @@ fn build_secretctl_candidate_plan(
     }
     nix_seal_policy::validate(&plan)?;
     Ok(plan)
+}
+
+fn candidate_source_path(
+    legacy_source: &str,
+    delivery: CandidateDelivery,
+    canonical_source_prefix: Option<&Path>,
+) -> Result<String> {
+    let Some(prefix) = canonical_source_prefix else {
+        if matches!(delivery, CandidateDelivery::Rekeyed) {
+            bail!(
+                "rekeyed candidate plans require --canonical-source-prefix pointing at the post-migration ciphertext tree"
+            );
+        }
+        return Ok(legacy_source.to_owned());
+    };
+    let joined = prefix.join(legacy_source);
+    if joined.is_absolute()
+        || joined
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("candidate canonical source path is not repository-relative");
+    }
+    joined
+        .to_str()
+        .map(str::to_owned)
+        .context("candidate canonical source path is not valid UTF-8")
 }
 
 fn parse_candidate_administrators(
@@ -10560,6 +10616,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             &[format!("release={}", signer.encode_public()?)],
             &[format!("admin={first}")],
             CandidateDelivery::Rekeyed,
+            Some(Path::new("migrated")),
         )?;
         assert_eq!(plan.targets.len(), 2);
         assert_eq!(plan.groups.len(), 1);
@@ -10567,6 +10624,10 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             plan.secrets[&nix_seal_core::Id::parse("operators.home.ianmh.token")?].delivery,
             nix_seal_core::DeliveryMode::Rekeyed
         ));
+        assert_eq!(
+            plan.secrets[&nix_seal_core::Id::parse("operators.home.ianmh.token")?].source,
+            "migrated/secrets/operators/home/ianmh/token.age"
+        );
         assert_eq!(
             nix_seal_policy::secret_recipients(
                 &plan,
@@ -10586,11 +10647,32 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             &[format!("release={}", signer.encode_public()?)],
             &[],
             CandidateDelivery::Direct,
+            None,
         )?;
         assert!(matches!(
             direct.secrets[&nix_seal_core::Id::parse("operators.home.ianmh.token")?].delivery,
             nix_seal_core::DeliveryMode::Direct
         ));
+        assert_eq!(
+            direct.secrets[&nix_seal_core::Id::parse("operators.home.ianmh.token")?].source,
+            "secrets/operators/home/ianmh/token.age"
+        );
+        assert!(
+            candidate_source_path(
+                "secrets/operators/home/ianmh/token.age",
+                CandidateDelivery::Rekeyed,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            candidate_source_path(
+                "../secrets/token.age",
+                CandidateDelivery::Direct,
+                Some(Path::new("migrated")),
+            )
+            .is_err()
+        );
         assert!(
             build_secretctl_candidate_plan(
                 &index,
@@ -10601,6 +10683,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 &[format!("release={}", signer.encode_public()?)],
                 &[],
                 CandidateDelivery::Rekeyed,
+                None,
             )
             .is_err()
         );
@@ -10614,6 +10697,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 &[format!("same-id={}", signer.encode_public()?)],
                 &[format!("same-id={first}")],
                 CandidateDelivery::Rekeyed,
+                Some(Path::new("migrated")),
             )
             .is_err()
         );
@@ -10687,6 +10771,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         let common = || SecretctlMigrationArgs {
             index: index_path.clone(),
             plan_output: None,
+            canonical_source_prefix: None,
             target_systems: Vec::new(),
             signers: Vec::new(),
             administrators: Vec::new(),
