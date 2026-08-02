@@ -37,8 +37,8 @@ The object model includes identities, groups, targets, secrets, generators,
 templates, approval policies, and versioned backends. Secrets support binary or
 text values; groups/selectors; rekeyed or advanced direct delivery;
 partitioning, users, activation, or services phases; owner/group/mode (with
-validated per-target runtime overrides for platform account conventions); systemd
-credential mapping; optional compatibility symlinks bound to the active
+validated per-target runtime overrides for platform account conventions);
+systemd credential mapping; optional compatibility symlinks bound to the active
 generation; reload/restart lists; lifecycle and incident metadata; generators
 and dependencies; public/secret/intermediary outputs; and runtime templates.
 Structured JSON/TOML/YAML/dotenv editing is a logical authoring view. Storage is
