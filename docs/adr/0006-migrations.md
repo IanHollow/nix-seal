@@ -24,6 +24,14 @@ recipient set, `--execute` additionally performs a side-by-side bulk rekey of
 the validated `secrets/*.age` sources. It streams and round-trip verifies every
 file in one transaction and leaves the legacy tree untouched.
 
+Age-ciphertext migrations distinguish the legacy source identity from the
+destination verification identity. `--identity` decrypts the source; the
+optional `--verification-identity` (defaulting to it) must match a replacement
+recipient and authenticates every staged destination before commit. This keeps
+key replacement usable when an old SSH/age identity is intentionally retired,
+without weakening the recipient-binding check. Both identities are opened only
+for an explicit `--execute`; dry runs never read private key files.
+
 SOPS JSON inspection is similarly non-destructive: it validates bounded
 cleartext metadata (including provider and age-recipient declarations) without
 decrypting values or invoking SOPS. Structured extraction and mutation remain

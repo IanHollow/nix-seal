@@ -559,6 +559,7 @@ nix-seal migrate secretctl --index /tmp/secretctl-index.json --json
 nix-seal migrate secretctl --index /tmp/secretctl-index.json \
   --repository-root . --destination secrets/nix-seal \
   --identity /absolute/private/legacy.agekey \
+  --verification-identity /absolute/private/nix-seal-admin.agekey \
   --recipient age1admin... --recipient age1recovery... --execute
 nix-seal migrate agenix --directory ./secrets --json
 # ragenix uses the same standard age ciphertext inventory format
@@ -566,10 +567,12 @@ nix-seal migrate ragenix --directory ./secrets --json
 # bulk import is side-by-side and remains dry-run-first
 nix-seal migrate agenix --repository-root . --directory legacy/secrets \
   --destination secrets/nix-seal --identity /absolute/private/admin.agekey \
+  --verification-identity /absolute/private/nix-seal-admin.agekey \
   --recipient age1admin... --recipient age1recovery... --json
 # add --execute only after reviewing every mapping and recipient
 nix-seal migrate agenix --repository-root . --directory legacy/secrets \
   --destination secrets/nix-seal --identity /absolute/private/admin.agekey \
+  --verification-identity /absolute/private/nix-seal-admin.agekey \
   --recipient age1admin... --recipient age1recovery... --execute
 # inspect an evaluated agenix-rekey policy export without decrypting data
 nix eval --json .#agenixRekeyMigration > /tmp/agenix-rekey.json
@@ -610,6 +613,14 @@ recipients. Existing unencrypted OpenSSH Ed25519/RSA identities are supported
 only as a migration compatibility path; encrypted SSH private keys are
 deliberately rejected in non-interactive workflows, so convert them to a
 reviewed native-age or hardware-backed identity before automated import.
+
+For age-tree, agenix-rekey, secretctl, and single-file ciphertext migration,
+`--identity` is the legacy source/decryption identity. `--verification-identity`
+is optional and defaults to `--identity`; when supplied it must be authorized
+by every replacement recipient and is used to authenticate the newly written
+ciphertext. This explicit split is required when a migration replaces a legacy
+SSH or age key with a new administrator or recovery key. Both private identities
+are opened only for `--execute`; dry runs inspect public metadata and paths.
 
 PGP is migration-only and never a native nix-seal encryption backend. Its
 dry-run-first bridge requires an absolute GnuPG executable and private,
@@ -661,8 +672,9 @@ set `intermediary = true`. The inventory validates all of those public values,
 normalizes recipients, and preserves intermediary secrets as repository-only.
 Supplying `--destination`, `--identity`, and one or more `--recipient` values
 enables the same dry-run-first, side-by-side bulk rekey flow as agenix/ragenix;
-`--execute` is required before the private identity is opened. Every source is
-staged and round-trip verified before any destination changes, while the legacy
+`--verification-identity` may select the new administrator/recovery identity;
+`--execute` is required before either private identity is opened. Every source
+is staged and round-trip verified before any destination changes, while the legacy
 tree remains intact for rollback. It does not infer private runtime
 configuration or rewrite the legacy ciphertext.
 

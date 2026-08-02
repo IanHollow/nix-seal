@@ -356,6 +356,30 @@ pub fn rekey_secret(
     verification_identity: &SecretString,
     mode: WriteMode,
 ) -> Result<AuthoringResult, AuthoringError> {
+    rekey_secret_with_identities(
+        repository_root,
+        relative_source,
+        relative_destination,
+        recipients,
+        verification_identity,
+        verification_identity,
+        mode,
+    )
+}
+
+/// Streams one legacy age ciphertext into fresh recipients while allowing the
+/// source/decryption identity to differ from the destination verification
+/// identity. This is required for migrations from a legacy manager to a new
+/// administrator or recovery key.
+pub fn rekey_secret_with_identities(
+    repository_root: &Path,
+    relative_source: &Path,
+    relative_destination: &Path,
+    recipients: &[String],
+    source_identity: &SecretString,
+    verification_identity: &SecretString,
+    mode: WriteMode,
+) -> Result<AuthoringResult, AuthoringError> {
     if !recipients.iter().any(|recipient| {
         nix_seal_crypto::identity_matches_recipient(verification_identity, recipient)
     }) {
@@ -371,7 +395,7 @@ pub fn rekey_secret(
     nix_seal_crypto::rekey(
         source_file,
         staged.as_file_mut(),
-        verification_identity,
+        source_identity,
         recipients,
     )?;
     staged.as_file().sync_all().map_err(AuthoringError::Io)?;
@@ -419,6 +443,27 @@ pub fn rekey_secret_batch(
     verification_identity: &SecretString,
     mode: WriteMode,
 ) -> Result<Vec<AuthoringResult>, AuthoringError> {
+    rekey_secret_batch_with_identities(
+        repository_root,
+        writes,
+        verification_identity,
+        verification_identity,
+        mode,
+    )
+}
+
+/// Streams a bounded set of legacy age ciphertexts into fresh recipients while
+/// allowing source/decryption and destination verification identities to
+/// differ. All destination recipient sets must include the verification
+/// identity, and every staged result is authenticated with it before commit.
+#[allow(clippy::too_many_lines)]
+pub fn rekey_secret_batch_with_identities(
+    repository_root: &Path,
+    writes: &[BatchRekeyWrite<'_>],
+    source_identity: &SecretString,
+    verification_identity: &SecretString,
+    mode: WriteMode,
+) -> Result<Vec<AuthoringResult>, AuthoringError> {
     if writes.is_empty() || writes.len() > 10_000 {
         return Err(AuthoringError::UnsafePath);
     }
@@ -455,7 +500,7 @@ pub fn rekey_secret_batch(
         nix_seal_crypto::rekey(
             open_nofollow_regular(&source)?,
             staged.as_file_mut(),
-            verification_identity,
+            source_identity,
             write.recipients,
         )?;
         staged.as_file().sync_all().map_err(AuthoringError::Io)?;
@@ -2015,6 +2060,40 @@ mod tests {
             &administrator_identity,
         )?;
         assert_eq!(plaintext, b"streamed-migration-value");
+        Ok(())
+    }
+
+    #[test]
+    fn rekey_supports_distinct_source_and_destination_identities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let (source_identity, source_recipient) = nix_seal_crypto::generate_x25519();
+        let (destination_identity, destination_recipient) = nix_seal_crypto::generate_x25519();
+        write_secret(
+            &root,
+            Path::new("legacy/source.age"),
+            b"separate-migration-identities".as_slice(),
+            std::slice::from_ref(&source_recipient),
+            &source_identity,
+            WriteMode::Create,
+        )?;
+        let result = rekey_secret_with_identities(
+            &root,
+            Path::new("legacy/source.age"),
+            Path::new("migrated/source.age"),
+            std::slice::from_ref(&destination_recipient),
+            &source_identity,
+            &destination_identity,
+            WriteMode::Create,
+        )?;
+        let mut plaintext = Vec::new();
+        nix_seal_crypto::decrypt(
+            File::open(result.path)?,
+            &mut plaintext,
+            &destination_identity,
+        )?;
+        assert_eq!(plaintext, b"separate-migration-identities");
         Ok(())
     }
 

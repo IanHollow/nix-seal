@@ -731,6 +731,11 @@ struct AgeTreeMigrationArgs {
     /// Private identity authorized to decrypt every legacy ciphertext.
     #[arg(long)]
     identity: Option<PathBuf>,
+    /// Optional private identity authorized to verify the replacement
+    /// ciphertexts. Defaults to `--identity`; use this when migrating to a
+    /// new administrator or recovery recipient.
+    #[arg(long)]
+    verification_identity: Option<PathBuf>,
     /// Explicit replacement recipient; repeat for each recipient.
     #[arg(long = "recipient")]
     recipients: Vec<String>,
@@ -757,6 +762,10 @@ struct AgenixRekeyMigrationArgs {
     /// Private administrator/recovery identity that can decrypt every source file.
     #[arg(long)]
     identity: Option<PathBuf>,
+    /// Optional private identity authorized to verify replacement ciphertexts.
+    /// Defaults to `--identity`.
+    #[arg(long)]
+    verification_identity: Option<PathBuf>,
     /// Explicit replacement recipient; repeat for each recipient.
     #[arg(long = "recipient")]
     recipients: Vec<String>,
@@ -838,6 +847,10 @@ struct SecretctlMigrationArgs {
     /// Private identity authorized to decrypt every legacy ciphertext.
     #[arg(long)]
     identity: Option<PathBuf>,
+    /// Optional private identity authorized to verify replacement ciphertexts.
+    /// Defaults to `--identity`; use this when migrating to a new age key.
+    #[arg(long)]
+    verification_identity: Option<PathBuf>,
     /// Explicit replacement recipient; repeat for each recipient.
     #[arg(long = "recipient")]
     recipients: Vec<String>,
@@ -942,9 +955,13 @@ enum MigrateCommand {
         /// Repository-relative native nix-seal ciphertext destination.
         #[arg(long)]
         destination: PathBuf,
-        /// Private identity authorized to decrypt the legacy source and verify the result.
+        /// Private identity authorized to decrypt the legacy source.
         #[arg(long)]
         identity: PathBuf,
+        /// Optional private identity authorized to verify the replacement
+        /// ciphertext. Defaults to `--identity`.
+        #[arg(long)]
+        verification_identity: Option<PathBuf>,
         /// Explicit canonical age recipient for the replacement; repeat as needed.
         #[arg(long = "recipient", required = true)]
         recipients: Vec<String>,
@@ -1682,6 +1699,7 @@ fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
             source,
             destination,
             identity,
+            verification_identity,
             recipients,
             replace,
             execute,
@@ -1690,6 +1708,7 @@ fn run_migrate(command: MigrateCommand, json: bool) -> Result<()> {
             &source,
             &destination,
             &identity,
+            verification_identity.as_deref(),
             &recipients,
             replace,
             execute,
@@ -1704,6 +1723,7 @@ fn migrate_ciphertext(
     source: &Path,
     destination: &Path,
     identity_path: &Path,
+    verification_identity_path: Option<&Path>,
     recipients: &[String],
     replace: bool,
     execute: bool,
@@ -1735,18 +1755,21 @@ fn migrate_ciphertext(
         }
         return Ok(());
     }
-    let identity = read_identity(identity_path)?;
+    let source_identity = read_identity(identity_path)?;
+    let verification_identity = verification_identity_path.map(read_identity).transpose()?;
+    let verification_identity = verification_identity.as_ref().unwrap_or(&source_identity);
     let mode = if replace {
         nix_seal_authoring::WriteMode::Replace
     } else {
         nix_seal_authoring::WriteMode::Create
     };
-    let result = nix_seal_authoring::rekey_secret(
+    let result = nix_seal_authoring::rekey_secret_with_identities(
         repository_root,
         source,
         destination,
         recipients,
-        &identity,
+        &source_identity,
+        verification_identity,
         mode,
     )?;
     if json {
@@ -2245,6 +2268,7 @@ fn migrate_agenix_tree(arguments: &AgeTreeMigrationArgs, source: &str, json: boo
     let directory = &arguments.directory;
     let import_requested = arguments.destination.is_some()
         || arguments.identity.is_some()
+        || arguments.verification_identity.is_some()
         || !arguments.recipients.is_empty()
         || arguments.replace
         || arguments.execute;
@@ -2303,6 +2327,11 @@ fn migrate_agenix_tree(arguments: &AgeTreeMigrationArgs, source: &str, json: boo
                 .context("bulk migration requires --identity")?;
             if !identity.is_absolute() {
                 bail!("bulk migration identity must be an absolute private path");
+            }
+            if let Some(verification_identity) = arguments.verification_identity.as_deref()
+                && !verification_identity.is_absolute()
+            {
+                bail!("bulk migration verification identity must be an absolute private path");
             }
             let replacement_recipients = normalize_migration_recipients(&arguments.recipients)?;
             (
@@ -2364,7 +2393,13 @@ fn migrate_agenix_tree(arguments: &AgeTreeMigrationArgs, source: &str, json: boo
             .identity
             .as_deref()
             .context("bulk migration identity was not provided")?;
-        let identity = read_identity(identity_path)?;
+        let source_identity = read_identity(identity_path)?;
+        let verification_identity = arguments
+            .verification_identity
+            .as_deref()
+            .map(read_identity)
+            .transpose()?;
+        let verification_identity = verification_identity.as_ref().unwrap_or(&source_identity);
         let writes = entries
             .iter()
             .map(
@@ -2375,10 +2410,11 @@ fn migrate_agenix_tree(arguments: &AgeTreeMigrationArgs, source: &str, json: boo
                 },
             )
             .collect::<Vec<_>>();
-        let results = nix_seal_authoring::rekey_secret_batch(
+        let results = nix_seal_authoring::rekey_secret_batch_with_identities(
             &repository_root,
             &writes,
-            &identity,
+            &source_identity,
+            verification_identity,
             if arguments.replace {
                 nix_seal_authoring::WriteMode::Replace
             } else {
@@ -2473,6 +2509,7 @@ fn migrate_agenix_rekey_export(arguments: &AgenixRekeyMigrationArgs, json: bool)
     }
     let import_requested = arguments.destination.is_some()
         || arguments.identity.is_some()
+        || arguments.verification_identity.is_some()
         || !arguments.recipients.is_empty()
         || arguments.replace
         || arguments.execute;
@@ -2497,6 +2534,13 @@ fn migrate_agenix_rekey_export(arguments: &AgenixRekeyMigrationArgs, json: bool)
         if !identity_path.is_absolute() {
             bail!("bulk agenix-rekey migration identity must be an absolute private path");
         }
+        if let Some(verification_identity) = arguments.verification_identity.as_deref()
+            && !verification_identity.is_absolute()
+        {
+            bail!(
+                "bulk agenix-rekey migration verification identity must be an absolute private path"
+            );
+        }
         let destination_root = repository_root.join(destination);
         for (legacy_id, secret) in &export.secrets {
             let relative_source = PathBuf::from(validate_agenix_rekey_source(&secret.rekey_file)?);
@@ -2517,7 +2561,13 @@ fn migrate_agenix_rekey_export(arguments: &AgenixRekeyMigrationArgs, json: bool)
             entries.push((relative_source, relative_destination));
         }
         if arguments.execute {
-            let identity = read_identity(identity_path)?;
+            let source_identity = read_identity(identity_path)?;
+            let verification_identity = arguments
+                .verification_identity
+                .as_deref()
+                .map(read_identity)
+                .transpose()?;
+            let verification_identity = verification_identity.as_ref().unwrap_or(&source_identity);
             let writes = entries
                 .iter()
                 .map(|(relative_source, relative_destination)| {
@@ -2528,10 +2578,11 @@ fn migrate_agenix_rekey_export(arguments: &AgenixRekeyMigrationArgs, json: bool)
                     }
                 })
                 .collect::<Vec<_>>();
-            let results = nix_seal_authoring::rekey_secret_batch(
+            let results = nix_seal_authoring::rekey_secret_batch_with_identities(
                 &repository_root,
                 &writes,
-                &identity,
+                &source_identity,
+                verification_identity,
                 if arguments.replace {
                     nix_seal_authoring::WriteMode::Replace
                 } else {
@@ -3386,6 +3437,7 @@ fn migrate_secretctl(arguments: &SecretctlMigrationArgs, json: bool) -> Result<(
     };
     let import_requested = arguments.destination.is_some()
         || arguments.identity.is_some()
+        || arguments.verification_identity.is_some()
         || !arguments.recipients.is_empty()
         || arguments.replace
         || arguments.execute;
@@ -3402,6 +3454,13 @@ fn migrate_secretctl(arguments: &SecretctlMigrationArgs, json: bool) -> Result<(
             .context("bulk secretctl migration requires --identity")?;
         if !identity.is_absolute() {
             bail!("bulk secretctl migration identity must be an absolute private path");
+        }
+        if let Some(verification_identity) = arguments.verification_identity.as_deref()
+            && !verification_identity.is_absolute()
+        {
+            bail!(
+                "bulk secretctl migration verification identity must be an absolute private path"
+            );
         }
         let replacement_recipients = normalize_migration_recipients(&arguments.recipients)?;
         let destination_root = repository_root.join(destination);
@@ -3425,12 +3484,18 @@ fn migrate_secretctl(arguments: &SecretctlMigrationArgs, json: bool) -> Result<(
         }
     }
     if import_requested && arguments.execute {
-        let identity = read_identity(
+        let source_identity = read_identity(
             arguments
                 .identity
                 .as_deref()
                 .context("bulk secretctl migration identity was not initialized")?,
         )?;
+        let verification_identity = arguments
+            .verification_identity
+            .as_deref()
+            .map(read_identity)
+            .transpose()?;
+        let verification_identity = verification_identity.as_ref().unwrap_or(&source_identity);
         let writes = entries
             .iter()
             .map(
@@ -3441,10 +3506,11 @@ fn migrate_secretctl(arguments: &SecretctlMigrationArgs, json: bool) -> Result<(
                 },
             )
             .collect::<Vec<_>>();
-        let results = nix_seal_authoring::rekey_secret_batch(
+        let results = nix_seal_authoring::rekey_secret_batch_with_identities(
             &repository_root,
             &writes,
-            &identity,
+            &source_identity,
+            verification_identity,
             if arguments.replace {
                 nix_seal_authoring::WriteMode::Replace
             } else {
@@ -8836,6 +8902,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                 repository_root: PathBuf::from("."),
                 destination: None,
                 identity: None,
+                verification_identity: None,
                 recipients: Vec::new(),
                 replace: false,
                 execute: false,
@@ -8886,6 +8953,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             repository_root: repository.clone(),
             destination: Some(PathBuf::from("migrated")),
             identity: Some(identity_path.clone()),
+            verification_identity: None,
             recipients: vec![master_recipient.clone()],
             replace: false,
             execute: false,
@@ -9782,6 +9850,12 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         ciphertext.sync_all()?;
         let identity_path = temporary.path().join("identity");
         write_private_bytes(&identity_path, private.as_bytes())?;
+        let (destination_identity, destination_recipient) = nix_seal_crypto::generate_x25519();
+        let destination_identity_path = temporary.path().join("destination-identity");
+        write_new_private(
+            &destination_identity_path,
+            destination_identity.expose_secret().as_bytes(),
+        )?;
         let index_path = temporary.path().join("secretIndex.json");
         fs::write(
             &index_path,
@@ -9815,7 +9889,8 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             repository_root: repository.clone(),
             destination: Some(PathBuf::from("migrated")),
             identity: Some(identity_path.clone()),
-            recipients: vec![recipient.to_owned()],
+            verification_identity: Some(destination_identity_path.clone()),
+            recipients: vec![destination_recipient.clone()],
             replace: false,
             execute: false,
         };
@@ -9825,9 +9900,12 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         let mut execute = common();
         execute.execute = true;
         migrate_secretctl(&execute, true)?;
-        let identity = SecretString::from(private);
         let mut plaintext = Vec::new();
-        nix_seal_crypto::decrypt(fs::File::open(destination)?, &mut plaintext, &identity)?;
+        nix_seal_crypto::decrypt(
+            fs::File::open(destination)?,
+            &mut plaintext,
+            &destination_identity,
+        )?;
         assert_eq!(plaintext, b"secretctl-canary");
         assert!(source.is_file());
         Ok(())
@@ -9885,6 +9963,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
             repository_root: repository.clone(),
             destination: Some(PathBuf::from("migrated")),
             identity: Some(identity_path.clone()),
+            verification_identity: None,
             recipients: vec![administrator_recipient.clone(), target_recipient.clone()],
             replace: false,
             execute: false,
@@ -10019,6 +10098,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
                     repository_root: PathBuf::from("."),
                     destination: None,
                     identity: None,
+                    verification_identity: None,
                     recipients: Vec::new(),
                     replace: false,
                     execute: false,
