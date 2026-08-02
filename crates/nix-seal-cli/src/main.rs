@@ -5185,27 +5185,29 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                 plaintext: output.plaintext.expose_secret(),
             })
             .collect::<Vec<_>>();
-        let mode = match action {
-            GeneratorAction::Create => nix_seal_authoring::WriteMode::Create,
-            GeneratorAction::Replace => nix_seal_authoring::WriteMode::Replace,
-            GeneratorAction::Unchanged => bail!("unchanged generator reached write transaction"),
-        };
-        let results = nix_seal_authoring::write_secret_and_public_batch(
-            &arguments.repository_root,
-            &writes,
-            &public_writes,
-            &identity,
-            mode,
-        )?;
-        persist_generator_prompts(
-            &arguments.repository_root,
-            &generator_id,
-            generator,
-            &prompt_values,
-        )?;
-        if let Some(validation) = &generator.validation {
-            write_generator_state(
-                &arguments.repository_root,
+        let generator_state_destination = generator_state_relative_path(&generator_id);
+        let mut prompt_destinations = Vec::new();
+        for prompt in &generator.prompts {
+            if prompt.persistent {
+                prompt_destinations.push(generator_prompt_state_relative_path(
+                    &generator_id,
+                    &prompt.id,
+                ));
+            }
+        }
+        let mut private_writes = prompt_destinations
+            .iter()
+            .zip(generator.prompts.iter().filter(|prompt| prompt.persistent))
+            .zip(prompt_values.iter())
+            .map(
+                |((destination, _prompt), value)| nix_seal_authoring::BatchPrivateWrite {
+                    relative_destination: destination.as_path(),
+                    plaintext: value.expose_secret(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let generator_state_bytes = generator.validation.as_deref().map(|validation| {
+            serialize_generator_state(
                 &generator_id,
                 validation,
                 &generator.outputs,
@@ -5214,10 +5216,34 @@ fn run_generate(arguments: &GenerateArgs, json: bool) -> Result<()> {
                     .iter()
                     .map(|output| output.id.clone())
                     .collect::<Vec<_>>(),
-            )?;
+            )
+        });
+        let generator_state_bytes = generator_state_bytes.transpose()?;
+        let private_deletes = if let Some(bytes) = generator_state_bytes.as_ref() {
+            private_writes.push(nix_seal_authoring::BatchPrivateWrite {
+                relative_destination: generator_state_destination.as_path(),
+                plaintext: bytes,
+            });
+            Vec::new()
         } else {
-            remove_generator_state(&arguments.repository_root, &generator_id)?;
-        }
+            vec![nix_seal_authoring::BatchPrivateDelete {
+                relative_destination: generator_state_destination.as_path(),
+            }]
+        };
+        let mode = match action {
+            GeneratorAction::Create => nix_seal_authoring::WriteMode::Create,
+            GeneratorAction::Replace => nix_seal_authoring::WriteMode::Replace,
+            GeneratorAction::Unchanged => bail!("unchanged generator reached write transaction"),
+        };
+        let results = nix_seal_authoring::write_secret_public_private_batch(
+            &arguments.repository_root,
+            &writes,
+            &public_writes,
+            &private_writes,
+            &private_deletes,
+            &identity,
+            mode,
+        )?;
         for (output, result) in generated.iter().zip(results.secrets) {
             outputs.push(serde_json::json!({
                 "generator":generator_id,
@@ -5410,6 +5436,33 @@ fn generator_state_path(
     Ok(directory.join("state.json"))
 }
 
+/// Returns the repository-relative location used by the transactional
+/// generator metadata writer. Keeping this path construction separate from
+/// the read helper avoids creating private state directories during a failed
+/// generation preflight.
+fn generator_state_relative_path(generator_id: &nix_seal_core::Id) -> PathBuf {
+    PathBuf::from(".nix-seal")
+        .join("generator-state")
+        .join("v1")
+        .join(generator_id.as_str())
+        .join("state.json")
+}
+
+fn serialize_generator_state(
+    generator_id: &nix_seal_core::Id,
+    validation: &str,
+    outputs: &[nix_seal_core::Id],
+    public_outputs: &[nix_seal_core::Id],
+) -> Result<Vec<u8>> {
+    Ok(serde_jcs::to_vec(&GeneratorStateV1 {
+        schema: GENERATOR_STATE_SCHEMA.to_owned(),
+        generator_id: generator_id.clone(),
+        validation: validation.to_owned(),
+        outputs: outputs.to_vec(),
+        public_outputs: public_outputs.to_vec(),
+    })?)
+}
+
 fn read_generator_state(
     repository_root: &Path,
     generator_id: &nix_seal_core::Id,
@@ -5436,6 +5489,7 @@ fn read_generator_state(
     Ok(Some(state))
 }
 
+#[cfg(test)]
 fn write_generator_state(
     repository_root: &Path,
     generator_id: &nix_seal_core::Id,
@@ -5447,13 +5501,7 @@ fn write_generator_state(
     let parent = path
         .parent()
         .context("generator state path has no parent")?;
-    let bytes = serde_jcs::to_vec(&GeneratorStateV1 {
-        schema: GENERATOR_STATE_SCHEMA.to_owned(),
-        generator_id: generator_id.clone(),
-        validation: validation.to_owned(),
-        outputs: outputs.to_vec(),
-        public_outputs: public_outputs.to_vec(),
-    })?;
+    let bytes = serialize_generator_state(generator_id, validation, outputs, public_outputs)?;
     let mut staged = tempfile::NamedTempFile::new_in(parent)
         .context("could not stage generator validation state")?;
     set_private_file_handle(staged.as_file())?;
@@ -5471,6 +5519,7 @@ fn write_generator_state(
     Ok(())
 }
 
+#[cfg(test)]
 fn remove_generator_state(repository_root: &Path, generator_id: &nix_seal_core::Id) -> Result<()> {
     let path = generator_state_path(repository_root, generator_id)?;
     match fs::remove_file(&path) {
@@ -5521,9 +5570,21 @@ fn generator_prompt_state_path(
     Ok(directory)
 }
 
+fn generator_prompt_state_relative_path(
+    generator_id: &nix_seal_core::Id,
+    prompt_id: &nix_seal_core::Id,
+) -> PathBuf {
+    PathBuf::from(".nix-seal")
+        .join("prompt-state")
+        .join("v1")
+        .join(generator_id.as_str())
+        .join(prompt_id.as_str())
+}
+
 /// Stores declared persistent prompts only after all generated ciphertext
 /// outputs have committed. A failed generation therefore cannot update the
 /// remembered response. The replacement is staged and durable before rename.
+#[cfg(test)]
 fn persist_generator_prompts(
     repository_root: &Path,
     generator_id: &nix_seal_core::Id,
@@ -5562,6 +5623,7 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn write_private_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()

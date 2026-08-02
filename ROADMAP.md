@@ -33,7 +33,10 @@
   already-open descriptors; compatibility path helpers verify no-follow type,
   ownership, and link count before changing modes. NixOS exposes an explicit
   installer-mode opt-in for partitioning activation specs while keeping that
-  phase out of the normal activation graph.
+  phase out of the normal activation graph. Generator ciphertext, public
+  outputs, persistent prompts, and validation state now share one bounded,
+  owner-only transaction, so metadata failures cannot leave a generation's
+  outputs and regeneration state out of sync.
 - Phase 4: dry-run migration adapters and side-by-side dogfooding in nix-conf,
   starting with a synthetic low-risk secret. Public migration compatibility
   goldens now cover agenix/ragenix, agenix-rekey, SOPS metadata, Clan
