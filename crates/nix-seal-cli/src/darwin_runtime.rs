@@ -6,10 +6,11 @@
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "macos")]
+use std::process::{Command, Stdio};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
 #[cfg(target_os = "macos")]
