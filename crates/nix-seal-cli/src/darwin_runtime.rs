@@ -154,7 +154,19 @@ pub(crate) fn cleanup_legacy_persistent(root: &Path) -> Result<()> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name == "current" || name.starts_with("generation-") {
+        if name == "current" {
+            let target = fs::read_link(entry.path())?;
+            if target.is_absolute()
+                || target.components().count() != 1
+                || !target
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.starts_with("generation-"))
+            {
+                bail!("legacy runtime cleanup encountered an unsafe current link");
+            }
+            fs::remove_file(entry.path())?;
+        } else if name.starts_with("generation-") {
             remove_tree_without_links(&entry.path())?;
         }
     }
