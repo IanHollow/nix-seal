@@ -211,10 +211,10 @@ export/import flow or `nix copy` for a remote build or deployment transport.
 
 `nix-seal.lock.json` is a generated, reviewable public deployment lock. It
 records the public plan identities together with the cache address and source
-hash for each provisioned target artifact.
-It is safe to commit, but must not be hand-edited: rerun `provision --execute
---lock-file …` after a policy or ciphertext change. Private identity locations,
-signing keys, and plaintext never appear in it.
+hash for each provisioned target artifact. It is safe to commit, but must not be
+hand-edited: rerun `provision --execute --lock-file …` after a policy or
+ciphertext change. Private identity locations, signing keys, and plaintext never
+appear in it.
 
 ### Target-local artifact cache (recommended)
 
