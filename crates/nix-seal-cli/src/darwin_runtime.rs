@@ -22,14 +22,6 @@ pub(crate) fn inspect_runtime(root: &Path) -> serde_json::Value {
         use std::os::unix::fs::MetadataExt;
 
         let mounted_root = mount_root(root).ok();
-        let file_system = mounted_root.as_ref().and_then(|mount| {
-            command_stdout(
-                "/usr/bin/stat",
-                ["-f", "%T", mount.to_string_lossy().as_ref()],
-            )
-            .ok()
-            .map(|value| value.trim().to_owned())
-        });
         let mount_line = mounted_root.as_ref().and_then(|mount| {
             command_stdout("/sbin/mount", std::iter::empty::<&str>())
                 .ok()?
@@ -37,6 +29,9 @@ pub(crate) fn inspect_runtime(root: &Path) -> serde_json::Value {
                 .find(|line| line.contains(&format!(" on {} ", mount.display())))
                 .map(str::to_owned)
         });
+        let file_system = mount_line
+            .as_ref()
+            .and_then(|line| line.strip_prefix("tmpfs on ").map(|_| "tmpfs".to_owned()));
         let mount_flags = MOUNT_FLAGS
             .split(',')
             .map(str::to_owned)
@@ -250,14 +245,13 @@ fn mount_root(root: &Path) -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn is_tmpfs(path: &Path) -> Result<bool> {
-    let output = command_stdout(
-        "/usr/bin/stat",
-        ["-f", "%T", path.to_string_lossy().as_ref()],
-    );
-    match output {
-        Ok(value) => Ok(value.trim() == "tmpfs"),
-        Err(_) => Ok(false),
-    }
+    let canonical = path
+        .canonicalize()
+        .context("could not canonicalize Darwin volatile runtime path")?;
+    let mounts = command_stdout("/sbin/mount", std::iter::empty::<&str>())?;
+    Ok(mounts.lines().any(|line| {
+        line.starts_with("tmpfs on ") && line.contains(&format!(" on {} ", canonical.display()))
+    }))
 }
 
 #[cfg(target_os = "macos")]
