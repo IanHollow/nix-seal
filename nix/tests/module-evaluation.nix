@@ -10,19 +10,39 @@ let
   source = "nix-seal.example.toml";
   planObjects = {
     identities = {
-      administrator = { kind = "administrator"; public = "age1x2k2hx0rzltg56p4et3yn4a873m6jltk62vmlrs8leamel69kamqf8ycqx"; };
-      release = { kind = "signer"; public = "nix-seal-ed25519-v1:bGfuLIxQvDrT8IMpu931WWcILSKDrDmaCJ8oPFyT3X4="; };
-      target = { kind = "target"; public = "age1x2k2hx0rzltg56p4et3yn4a873m6jltk62vmlrs8leamel69kamqf8ycqx"; };
+      administrator = {
+        kind = "administrator";
+        public = "age1x2k2hx0rzltg56p4et3yn4a873m6jltk62vmlrs8leamel69kamqf8ycqx";
+      };
+      release = {
+        kind = "signer";
+        public = "nix-seal-ed25519-v1:bGfuLIxQvDrT8IMpu931WWcILSKDrDmaCJ8oPFyT3X4=";
+      };
+      target = {
+        kind = "target";
+        public = "age1x2k2hx0rzltg56p4et3yn4a873m6jltk62vmlrs8leamel69kamqf8ycqx";
+      };
     };
-    targets.${targetId} = { kind = "nixOs"; system = system; identity = "target"; };
+    targets.${targetId} = {
+      kind = "nixOs";
+      inherit system;
+      identity = "target";
+    };
     secrets.${secretId} = {
       inherit source;
       consumers = [ targetId ];
       administrators = [ "administrator" ];
       approvalPolicy = "release";
-      runtime = { owner = "root"; group = "root"; mode = "0400"; };
+      runtime = {
+        owner = "root";
+        group = "root";
+        mode = "0400";
+      };
     };
-    approvalPolicies.release = { threshold = 1; signers = [ "release" ]; };
+    approvalPolicies.release = {
+      threshold = 1;
+      signers = [ "release" ];
+    };
   };
   configuration = inputs.nixpkgs.lib.nixosSystem {
     inherit system;
@@ -44,11 +64,12 @@ let
 in
 {
   plan-v2 =
-    assert (builtins.fromJSON (self.lib.mkPlan (planObjects // { repositoryRoot = ../../.; }))).schema == "nix-seal.plan.v2";
+    assert
+      (builtins.fromJSON (self.lib.mkPlan (planObjects // { repositoryRoot = ../../.; }))).schema
+      == "nix-seal.plan.v2";
     pkgs.runCommand "nix-seal-plan-v2" { } "touch $out";
   module-cache-discovery =
-    pkgs.runCommand "nix-seal-module-cache-discovery"
-      { nativeBuildInputs = [ pkgs.jq ]; }
+    pkgs.runCommand "nix-seal-module-cache-discovery" { nativeBuildInputs = [ pkgs.jq ]; }
       ''
         jq -e '
           .schema == "nix-seal.activation.v2" and

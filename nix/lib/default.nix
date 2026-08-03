@@ -60,7 +60,8 @@ in
         id: secret:
         if !builtins.isAttrs secret || !(secret ? source) || !builtins.isString secret.source then
           throw "nix-seal.lib.mkPlan: secret ${id} must provide a repository-relative source string"
-        else if builtins.match "[a-z0-9._/-]+" secret.source == null
+        else if
+          builtins.match "[a-z0-9._/-]+" secret.source == null
           || lib.hasPrefix "/" secret.source
           || lib.hasInfix ".." secret.source
           || lib.hasInfix "/./" secret.source

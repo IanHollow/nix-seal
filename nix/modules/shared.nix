@@ -77,25 +77,40 @@ let
     inherit (cfg) identities approvalPolicies;
     targets.${cfg.targetId} = cfg.target;
     secrets = lib.mapAttrs (_: secret: {
-      inherit (secret) source delivery administrators phase lifecycle;
+      inherit (secret)
+        source
+        delivery
+        administrators
+        phase
+        lifecycle
+        ;
       consumers = [ cfg.targetId ];
-      approvalPolicy = secret.approvalPolicy;
+      inherit (secret) approvalPolicy;
       runtime = {
-        inherit (secret) owner group mode compatibilitySymlink restartUnits reloadUnits;
+        inherit (secret)
+          owner
+          group
+          mode
+          compatibilitySymlink
+          restartUnits
+          reloadUnits
+          ;
       };
     }) configuredSecrets;
     templates = lib.mapAttrs (_: template: {
       inherit (template) source placeholders;
       runtime = {
-        inherit (template) owner group mode restartUnits reloadUnits;
+        inherit (template)
+          owner
+          group
+          mode
+          restartUnits
+          reloadUnits
+          ;
       };
     }) configuredTemplates;
   };
-  effectivePlanObjects =
-    if cfg.identities != { } then
-      compiledPlanObjects
-    else
-      cfg.planObjects;
+  effectivePlanObjects = if cfg.identities != { } then compiledPlanObjects else cfg.planObjects;
   phaseRuntimeDirectory =
     phase: if phase == "activation" then cfg.runtimeDirectory else "${cfg.runtimeDirectory}/${phase}";
   configuredSecretsForPhase =
@@ -150,7 +165,7 @@ let
       schema = "nix-seal.activation.v2";
       runtimeRoot = phaseRuntimeDirectory phase;
       plan = toString cfg.planFile;
-      artifactCacheRoot = cfg.artifactCacheRoot;
+      inherit (cfg) artifactCacheRoot;
       inherit (cfg) targetId;
       inherit phase;
       inherit (cfg) allowedClockSkew;
@@ -211,10 +226,9 @@ in
     };
     planFile = mkOption {
       type = types.nullOr types.path;
-      default =
-        pkgs.writeText "nix-seal-plan-v2.json" (
-          self.lib.mkPlan (effectivePlanObjects // { repositoryRoot = cfg.repositoryRoot; })
-        );
+      default = pkgs.writeText "nix-seal-plan-v2.json" (
+        self.lib.mkPlan (effectivePlanObjects // { inherit (cfg) repositoryRoot; })
+      );
       description = "Canonical compiled plan.v2 JSON used to derive and verify target policy.";
     };
     repositoryRoot = mkOption {
@@ -313,7 +327,10 @@ in
                 description = "Repository-relative canonical .age ciphertext source. Its hash is pinned by plan.v2, never copied to the runtime activation metadata.";
               };
               delivery = mkOption {
-                type = types.enum [ "rekeyed" "direct" ];
+                type = types.enum [
+                  "rekeyed"
+                  "direct"
+                ];
                 default = "rekeyed";
                 description = "Ciphertext delivery model.";
               };
