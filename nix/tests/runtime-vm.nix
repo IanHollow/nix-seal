@@ -79,6 +79,7 @@ pkgs.testers.nixosTest {
         "" \
         '[secrets."app/token"]' \
         'source = "secrets/app-token.age"' \
+        'sourceCiphertextHash = "0000000000000000000000000000000000000000000000000000000000000000"' \
         'administrators = ["admin"]' \
         'consumers = ["vm"]' \
         'approvalPolicy = "release"' \
@@ -107,6 +108,12 @@ pkgs.testers.nixosTest {
         --secret app/token \
         --repository-root "$root" \
         --identity "$root/admin.age"
+
+      # Canonical authoring creates the ciphertext; compile the plan again so
+      # its required public source hash is bound to the committed bytes.
+      source_hash=$(sha256sum "$root/secrets/app-token.age" | cut -d' ' -f1)
+      sed -i "s/^sourceCiphertextHash = \"[0-9a-f]*\"$/sourceCiphertextHash = \"$source_hash\"/" "$root/nix-seal.toml"
+      nix-seal plan --toml "$root/nix-seal.toml" --output "$root/plan.v2.json"
 
       result=$(nix-seal --json rekey \
         --plan "$root/plan.v2.json" \
