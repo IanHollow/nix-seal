@@ -91,7 +91,7 @@ jobs:
         run: cargo install --locked --version 0.13.2 cargo-fuzz
       - name: Fuzz strict public plan parsing
         working-directory: fuzz
-        run: cargo fuzz run plan-v1 -- -max_total_time=60
+        run: cargo fuzz run plan-v2 -- -max_total_time=60
       - name: Fuzz strict public activation parsing
         working-directory: fuzz
         run: cargo fuzz run activation-v2 -- -max_total_time=60

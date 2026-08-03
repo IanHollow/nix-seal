@@ -925,7 +925,13 @@ fn run(cli: Cli) -> Result<()> {
             repository_root,
             cache_root,
             runtime_root,
-        } => run_doctor(&plan, &repository_root, cache_root, runtime_root, cli.json)?,
+        } => run_doctor(
+            &plan,
+            &repository_root,
+            cache_root,
+            runtime_root.as_deref(),
+            cli.json,
+        )?,
         Command::Key(command) => run_key(command, cli.json)?,
         Command::Identity(command) => run_identity(command, cli.json)?,
         Command::Group(command) => run_group(command, cli.json)?,
@@ -1132,30 +1138,14 @@ fn run_check(
     Ok(())
 }
 
-fn run_doctor(
-    plan_path: &Path,
-    repository_root: &Path,
-    cache_root: Option<PathBuf>,
-    runtime_root: Option<PathBuf>,
-    json: bool,
-) -> Result<()> {
-    let plan = read_plan_bounded(plan_path)?;
-    validate_plan_templates(&plan, plan_path)?;
-    deep_check_plan(&plan, repository_root)?;
-    let plan_hash = nix_seal_policy::plan_hash(&plan)?;
-    let cache = nix_seal_cache::Cache::open(cache_root.unwrap_or_else(default_cache_root))?;
-    let inventory = cache.inventory()?;
-    let retention = authenticated_gc_retention(&cache, &plan, repository_root)?;
-    let authenticated_artifacts = u64::try_from(retention.artifact_keys.len())
-        .context("authenticated artifact count exceeds supported range")?;
-    let stale_artifacts = inventory
-        .artifact_count
-        .saturating_sub(authenticated_artifacts);
+fn doctor_warnings(
+    plan: &nix_seal_core::PlanV2,
+    runtime: Option<&serde_json::Value>,
+    filevault: darwin_runtime::FileVaultState,
+    stale_artifacts: u64,
+    unavailable_sources: u64,
+) -> Vec<String> {
     let mut warnings = Vec::new();
-    let filevault = darwin_runtime::filevault_state();
-    let runtime = runtime_root
-        .as_ref()
-        .map(|root| darwin_runtime::inspect_runtime(root));
     if cfg!(target_os = "macos") {
         match filevault {
             darwin_runtime::FileVaultState::On => {}
@@ -1164,8 +1154,7 @@ fn run_doctor(
                     .to_owned(),
             ),
             darwin_runtime::FileVaultState::Unknown => warnings.push(
-                "could not determine FileVault state; run /usr/bin/fdesetup isactive"
-                    .to_owned(),
+                "could not determine FileVault state; run /usr/bin/fdesetup isactive".to_owned(),
             ),
         }
         if runtime.is_none() {
@@ -1173,10 +1162,7 @@ fn run_doctor(
                 "no runtime root was supplied; pass --runtime-root to verify volatile tmpfs hardening"
                     .to_owned(),
             );
-        } else if runtime
-            .as_ref()
-            .is_some_and(|value| value["volatileTmpfs"] == false)
-        {
+        } else if runtime.is_some_and(|value| value["volatileTmpfs"] == false) {
             warnings.push(
                 "selected macOS runtime is persistent or unavailable; integrated nix-darwin profiles should use volatile tmpfs"
                     .to_owned(),
@@ -1221,12 +1207,49 @@ fn run_doctor(
             "{stale_artifacts} cache artifact(s) do not match the current authenticated plan and are garbage-collection candidates"
         ));
     }
-    if retention.unavailable_sources > 0 {
+    if unavailable_sources > 0 {
         warnings.push(format!(
-            "{} canonical ciphertext source(s) were unavailable while authenticating cache artifacts",
-            retention.unavailable_sources
+            "{unavailable_sources} canonical ciphertext source(s) were unavailable while authenticating cache artifacts"
         ));
     }
+    warnings
+}
+
+fn run_doctor(
+    plan_path: &Path,
+    repository_root: &Path,
+    cache_root: Option<PathBuf>,
+    runtime_root: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let plan = read_plan_bounded(plan_path)?;
+    validate_plan_templates(&plan, plan_path)?;
+    deep_check_plan(&plan, repository_root)?;
+    let plan_hash = nix_seal_policy::plan_hash(&plan)?;
+    let cache = nix_seal_cache::Cache::open(cache_root.unwrap_or_else(default_cache_root))?;
+    let inventory = cache.inventory()?;
+    let retention = authenticated_gc_retention(&cache, &plan, repository_root)?;
+    let authenticated_artifacts = u64::try_from(retention.artifact_keys.len())
+        .context("authenticated artifact count exceeds supported range")?;
+    let stale_artifacts = inventory
+        .artifact_count
+        .saturating_sub(authenticated_artifacts);
+    let filevault = darwin_runtime::filevault_state();
+    let runtime = runtime_root
+        .as_ref()
+        .map(|root| darwin_runtime::inspect_runtime(root));
+    let recovery_identity_count = plan
+        .identities
+        .values()
+        .filter(|identity| matches!(identity.kind, nix_seal_core::IdentityKind::Recovery))
+        .count();
+    let warnings = doctor_warnings(
+        &plan,
+        runtime.as_ref(),
+        filevault,
+        stale_artifacts,
+        retention.unavailable_sources,
+    );
     if json {
         println!(
             "{}",

@@ -4,14 +4,17 @@
 //! a shell, and accepts one fixed mount root. It contains no secret material.
 
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
+#[cfg(target_os = "macos")]
 const ROOT: &str = "/var/run/nix-seal";
+#[cfg(target_os = "macos")]
 const MOUNT_FLAGS: &str = "nosuid,nodev,noexec";
 
 /// Returns public, non-secret runtime storage diagnostics for `nix-seal doctor`.
@@ -41,7 +44,7 @@ pub(crate) fn inspect_runtime(root: &Path) -> serde_json::Value {
                 .iter()
                 .all(|flag| line.split([',', '(', ')', ' ']).any(|item| item == flag))
         });
-        return serde_json::json!({
+        serde_json::json!({
             "root": root,
             "mountRoot": mounted_root,
             "filesystem": file_system,
@@ -52,7 +55,7 @@ pub(crate) fn inspect_runtime(root: &Path) -> serde_json::Value {
             "uid": metadata.as_ref().map(MetadataExt::uid),
             "gid": metadata.as_ref().map(MetadataExt::gid),
             "regularDirectory": metadata.as_ref().is_some_and(|value| value.is_dir() && !value.file_type().is_symlink()),
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -66,6 +69,7 @@ pub(crate) fn inspect_runtime(root: &Path) -> serde_json::Value {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum FileVaultState {
     On,
     Off,
@@ -82,7 +86,7 @@ impl FileVaultState {
     }
 }
 
-/// Returns the FileVault state without consuming credentials or requiring root.
+/// Returns the `FileVault` state without consuming credentials or requiring root.
 #[cfg(target_os = "macos")]
 pub(crate) fn filevault_state() -> FileVaultState {
     match sanitized_command("/usr/bin/fdesetup")
@@ -134,7 +138,7 @@ pub(crate) fn cleanup_legacy_persistent(root: &Path) -> Result<()> {
             .components()
             .rev()
             .take(3)
-            .map(|component| component.as_os_str())
+            .map(std::path::Component::as_os_str)
             .eq(expected.iter().rev().map(std::ffi::OsStr::new))
     {
         bail!("legacy runtime cleanup accepts only ~/Library/Caches/nix-seal");
@@ -281,6 +285,8 @@ fn create_directory(path: &Path, mode: u32) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn create_private_root(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
     create_directory(path, 0o700)?;
     let owner = format!("{uid}:{gid}");
     let status = sanitized_command("/usr/sbin/chown")
@@ -292,7 +298,6 @@ fn create_private_root(path: &Path, uid: u32, gid: u32) -> Result<()> {
         bail!("could not set Darwin volatile runtime ownership");
     }
     let metadata = fs::symlink_metadata(path)?;
-    use std::os::unix::fs::MetadataExt;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
         || metadata.uid() != uid
@@ -319,6 +324,7 @@ fn resolve_user(user: &str) -> Result<(u32, u32)> {
     parse_dscl_ids(&output).context("could not resolve Darwin Home Manager account")
 }
 
+#[cfg(target_os = "macos")]
 fn sanitized_command(executable: &str) -> Command {
     let mut command = Command::new(executable);
     command
@@ -330,6 +336,7 @@ fn sanitized_command(executable: &str) -> Command {
     command
 }
 
+#[cfg(target_os = "macos")]
 fn command_stdout<I, S>(executable: &str, arguments: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
@@ -345,6 +352,7 @@ where
     String::from_utf8(output.stdout).context("runtime metadata was not UTF-8")
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn valid_username(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -353,6 +361,7 @@ fn valid_username(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn valid_size(value: &str) -> bool {
     let Some((digits, suffix)) = value.split_at_checked(value.len().saturating_sub(1)) else {
         return false;
@@ -371,6 +380,7 @@ fn valid_size(value: &str) -> bool {
             .is_some_and(|megabytes| (16..=4096).contains(&megabytes))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_dscl_ids(output: &str) -> Option<(u32, u32)> {
     let parse = |label: &str| {
         output
