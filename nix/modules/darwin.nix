@@ -12,7 +12,8 @@ let
     "activation"
     "services"
   ];
-  runtimeArguments = command:
+  runtimeArguments =
+    command:
     [
       (lib.getExe cfg.package)
       "__darwin-runtime"
@@ -22,14 +23,17 @@ let
       "--size"
       cfg.darwin.volatileRuntime.size
     ]
-    ++ lib.concatMap (user: [ "--user" user ]) embeddedHomeManagerUsers;
+    ++ lib.concatMap (user: [
+      "--user"
+      user
+    ]) embeddedHomeManagerUsers;
   prepareArguments = runtimeArguments "prepare";
   prepare = lib.escapeShellArgs prepareArguments;
-  activateArguments = spec:
+  activateArguments =
+    spec:
     if cfg.darwin.volatileRuntime.enable then
       runtimeArguments "activate"
       ++ [
-        "activate"
         "--spec"
         (toString spec)
         "--identity"
@@ -151,6 +155,8 @@ in
           }
         ) bootPhases
       );
-    warnings = lib.optional (!cfg.darwin.volatileRuntime.enable) "macOS nix-seal plaintext runtime is persistent; enable nixSeal.darwin.volatileRuntime for tmpfs storage";
+    warnings =
+      lib.optional (!cfg.darwin.volatileRuntime.enable)
+        "macOS nix-seal plaintext runtime is persistent; enable nixSeal.darwin.volatileRuntime for tmpfs storage";
   };
 }
