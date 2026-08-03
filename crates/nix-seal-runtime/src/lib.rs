@@ -38,8 +38,12 @@ pub struct ActivationSpecV2 {
     /// Optional explicit runtime generation; omission safely allocates the next.
     #[serde(default)]
     pub runtime_generation: Option<u64>,
-    /// Absolute path to canonical compiled `plan.v1` public JSON.
+    /// Absolute path to canonical compiled `plan.v2` public JSON.
     pub plan: PathBuf,
+    /// Target-local, ciphertext-only cache root. Activation discovers and
+    /// authenticates matching bundles below this path; artifact addresses are
+    /// intentionally never part of the Nix-built activation document.
+    pub artifact_cache_root: PathBuf,
     /// Exact target binding.
     pub target_id: Id,
     /// Phase materialized by this isolated generation directory.
@@ -96,19 +100,11 @@ pub struct PostSwitchSpecV1 {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ActivationArtifactSpecV2 {
-    /// Target-encrypted standard age file.
-    pub ciphertext: PathBuf,
-    /// Signed envelope file.
-    pub envelope: PathBuf,
     /// Signed secret and runtime destination ID.
     pub secret_id: Id,
     /// Required canonical activation phase for this secret.
     #[serde(default = "default_activation_phase")]
     pub phase: ActivationPhase,
-    /// Expected canonical source ciphertext hash.
-    pub source_ciphertext_hash: String,
-    /// Exact artifact generation.
-    pub artifact_generation: u64,
     /// Restrictive octal mode such as `0400`.
     pub mode: String,
     /// Existing operating-system account that owns the runtime file.
@@ -197,6 +193,7 @@ impl ActivationSpecV2 {
         if self.schema != ACTIVATION_SCHEMA
             || !is_normalized_absolute_path(&self.runtime_root)
             || !is_normalized_absolute_path(&self.plan)
+            || !is_normalized_absolute_path(&self.artifact_cache_root)
             || self.runtime_generation == Some(0)
             || self.allowed_clock_skew > 86_400
             || self.artifacts.is_empty()
@@ -209,11 +206,7 @@ impl ActivationSpecV2 {
         let mut secret_ids = BTreeSet::new();
         let mut compatibility_paths = BTreeSet::new();
         for artifact in &self.artifacts {
-            if !is_normalized_absolute_path(&artifact.ciphertext)
-                || !is_normalized_absolute_path(&artifact.envelope)
-                || artifact.phase != self.phase
-                || !is_digest(&artifact.source_ciphertext_hash)
-                || artifact.artifact_generation == 0
+            if artifact.phase != self.phase
                 || !destinations.insert(artifact.secret_id.as_str().to_owned())
                 || !secret_ids.insert(artifact.secret_id.clone())
                 || parse_mode(&artifact.mode).is_err()
@@ -1376,13 +1369,6 @@ fn parse_mode(value: &str) -> Result<u32, RuntimeError> {
     let mode = u32::from_str_radix(value, 8).map_err(|_| RuntimeError::InvalidSpec)?;
     validate_mode(mode)?;
     Ok(mode)
-}
-
-fn is_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn is_account_name(value: &str) -> bool {
@@ -2766,12 +2752,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = fixture()?;
         let artifact = ActivationArtifactSpecV2 {
-            ciphertext: fixture.ciphertext.clone(),
-            envelope: fixture.envelope.clone(),
             secret_id: fixture.secret_id.clone(),
             phase: ActivationPhase::Activation,
-            source_ciphertext_hash: SOURCE_HASH.to_owned(),
-            artifact_generation: 1,
             mode: "0400".to_owned(),
             owner: fixture.owner.clone(),
             group: fixture.group.clone(),
@@ -2796,7 +2778,8 @@ mod tests {
             schema: ACTIVATION_SCHEMA.to_owned(),
             runtime_root: fixture.runtime.clone(),
             runtime_generation: None,
-            plan: fixture.temporary.path().join("plan.v1.json"),
+            plan: fixture.temporary.path().join("plan.v2.json"),
+            artifact_cache_root: fixture.temporary.path().join("cache"),
             target_id: fixture.target_id,
             phase: ActivationPhase::Activation,
             allowed_clock_skew: 300,
@@ -2893,7 +2876,7 @@ mod tests {
             Err(RuntimeError::InvalidSpec)
         ));
         let mut source_traversal = excessive_skew.clone();
-        source_traversal.artifacts[0].ciphertext = PathBuf::from("/tmp/../artifact.age");
+        source_traversal.artifact_cache_root = PathBuf::from("/tmp/../cache");
         assert!(matches!(
             source_traversal.validate(),
             Err(RuntimeError::InvalidSpec)

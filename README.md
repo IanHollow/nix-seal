@@ -23,7 +23,7 @@ Before parsing private command input, Unix clients disable new core dumps; Linux
 clients also mark the process non-dumpable. This is defense in depth, not a
 replacement for operating-system policy or the documented target-root boundary.
 
-The validated `plan.v1` is the single policy authority.
+The validated `plan.v2` is the single policy authority.
 `nix-seal plan --target <id>` emits a canonical target-specific projection.
 Rekey and activation derive recipients, hashes, authorized secret/template sets,
 runtime permissions, service actions, and per-secret approval thresholds from
@@ -60,7 +60,7 @@ The flake library exposes `nixSeal.lib.mkPlan` for public Nix metadata. It has a
 closed top-level argument set (`identities`, `groups`, `targets`, `secrets`,
 `generators`, `templates`, `approvalPolicies`, and `backends`), rejects unknown
 collections and invalid collection IDs during Nix evaluation, and emits the same
-`plan.v1.json` object consumed by the Rust policy validator:
+`plan.v2.json` object consumed by the Rust policy validator:
 
 ```nix
 let
@@ -76,7 +76,7 @@ let
     };
   };
 in
-  pkgs.writeText "plan.v1.json" plan
+  pkgs.writeText "plan.v2.json" plan
 ```
 
 Secret `selectors` can select exact targets or groups and filter by target kind,
@@ -102,18 +102,18 @@ Canonical authoring is plan-directed and reads values only from stdin or an
 explicit editor transaction:
 
 ```console
-nix-seal secret create --plan plan.v1.json --secret db/password \
+nix-seal secret create --plan plan.v2.json --secret db/password \
   --identity ~/.config/age/keys.txt < password.txt
-nix-seal secret edit --plan plan.v1.json --secret db/password \
+nix-seal secret edit --plan plan.v2.json --secret db/password \
   --identity ~/.config/age/keys.txt --editor /absolute/path/to/editor
-nix-seal secret rekey --plan plan.v1.json --secret db/password \
+nix-seal secret rekey --plan plan.v2.json --secret db/password \
   --identity ~/.config/age/keys.txt --json
-nix-seal secret rekey --plan plan.v1.json --secret db/password \
+nix-seal secret rekey --plan plan.v2.json --secret db/password \
   --identity ~/.config/age/keys.txt --yes
-nix-seal secret delete --plan plan.v1.json --secret db/password --yes
-nix-seal rotate --plan plan.v1.json --secret db/password \
+nix-seal secret delete --plan plan.v2.json --secret db/password --yes
+nix-seal rotate --plan plan.v2.json --secret db/password \
   --identity ~/.config/age/keys.txt < replacement.txt
-nix-seal secret list --plan plan.v1.json --due
+nix-seal secret list --plan plan.v2.json --due
 ```
 
 `create`, `import`, `rotate`, and `edit` accept `--format json`,
@@ -199,22 +199,20 @@ ciphertext-only cache artifacts. A mixed target may supply `--identity` for its
 rekeyed secrets; direct secrets never receive or use that identity.
 
 ```console
-nix-seal provision --plan plan.v1.json --target host.example --generation 4 \
+nix-seal provision --plan plan.v2.json --target host.example --generation 4 \
   --signing-key /private/release.signing-key --identity /private/admin.agekey
-nix-seal provision --plan plan.v1.json --target host.example --generation 4 \
+nix-seal provision --plan plan.v2.json --target host.example --generation 4 \
   --signing-key /private/release.signing-key --identity /private/admin.agekey \
-  --lock-file nix-seal.lock.json --execute
+  --cache-root /var/lib/nix-seal/cache/v1 --execute
 ```
 
 Provisioning never transmits plaintext. Use the explicit ciphertext-only cache
 export/import flow or `nix copy` for a remote build or deployment transport.
 
-`nix-seal.lock.json` is a generated, reviewable public deployment lock. It
-records the public plan identities together with the cache address and source
-hash for each provisioned target artifact. It is safe to commit, but must not be
-hand-edited: rerun `provision --execute --lock-file …` after a policy or
-ciphertext change. Private identity locations, signing keys, and plaintext never
-appear in it.
+There is no deployment lock file. The compiled plan.v2 pins each canonical
+ciphertext's SHA-256 hash, while activation verifies a matching signed bundle
+directly from the target-local cache. Private identity locations, signing keys,
+and plaintext never enter the plan or Nix store.
 
 ### Target-local artifact cache (recommended)
 
@@ -230,15 +228,12 @@ nix-seal cache import --source /tmp/nix-seal-cache-export --root /var/lib/nix-se
 ```
 
 Each target artifact is a directory containing exactly `ciphertext.age` and
-`manifest.dsse.json`. Point the module at the target-local directory; Nix does
-not read it while evaluating or building the configuration:
+`manifest.dsse.json`. Configure one cache root; Nix does not read the cache
+while evaluating or building the configuration:
 
 ```nix
 {
-  nixSeal.secrets."db/password" = {
-    artifactDirectory = "/var/lib/nix-seal/cache/v1/artifacts/<cache-key>";
-    sourceCiphertextHash = "…64 lowercase hexadecimal characters…";
-  };
+  nixSeal.artifactCacheRoot = "/var/lib/nix-seal/cache/v1";
 }
 ```
 
@@ -259,13 +254,6 @@ reboot or login from the target-local artifacts, without consulting Git.
 Removing the local artifact cache or target identity prevents future activation
 and fails closed; it does not expose plaintext.
 
-### Nix/store artifact bridge (compatibility only)
-
-`nixSeal.lib.artifactBundle` remains available when a deployment deliberately
-needs a fixed, ciphertext-only store closure. It imports a two-file artifact
-directory and derives its public paths. New configurations should use
-`artifactDirectory` instead; rekeying is never implicit in either workflow.
-
 Deletion never unlinks canonical ciphertext directly. It requires `--yes` and
 atomically moves the ciphertext into a private, collision-safe
 `.nix-seal/trash/v1` tombstone containing its public secret ID, original source,
@@ -280,8 +268,8 @@ reconstructs the deterministic artifact address, and checks the current approval
 threshold before retaining an artifact:
 
 ```console
-nix-seal cache gc --plan plan.v1.json --repository-root .
-nix-seal cache gc --plan plan.v1.json --repository-root . --execute
+nix-seal cache gc --plan plan.v2.json --repository-root .
+nix-seal cache gc --plan plan.v2.json --repository-root . --execute
 ```
 
 Any malformed, expired, stale, source-mismatched, target-mismatched, or
@@ -339,7 +327,7 @@ nix build github:IanHollow/nix-seal#documentation
 
 ## Fuzzing
 
-The checked-in `fuzz` workspace exercises strict public `plan.v1`,
+The checked-in `fuzz` workspace exercises strict public `plan.v2`,
 `activation.v2`, template-parser, signed-artifact-envelope, age
 recipient/identity-parser, and ciphertext-cache state boundaries. It
 deserializes untrusted bytes, validates successful documents, checks their
@@ -350,7 +338,7 @@ sanitizer campaigns locally with a nightly Rust toolchain:
 
 ```console
 cd fuzz
-cargo fuzz run plan-v1 -- -max_total_time=60
+cargo fuzz run plan-v2 -- -max_total_time=60
 cargo fuzz run activation-v2 -- -max_total_time=60
 cargo fuzz run template-v1 -- -max_total_time=60
 cargo fuzz run artifact-envelope-v1 -- -max_total_time=60
@@ -412,7 +400,7 @@ directory and an explicit output file:
 
 ```console
 nix-seal template render \
-  --plan plan.v1.json \
+  --plan plan.v2.json \
   --template application/config \
   --repository-root . \
   --identity /private/administrator.agekey \
@@ -433,9 +421,7 @@ activated secret through systemd's per-service credential directory:
 
 ```nix
 nixSeal.secrets."db/password" = {
-  ciphertext = ./artifacts/db-password.age;
-  envelope = ./artifacts/db-password.envelope.json;
-  sourceCiphertextHash = "…64 lowercase hexadecimal characters…";
+  source = "secrets/services/db-password.age";
   serviceCredentials = [
     {
       unit = "my-app.service";
@@ -443,6 +429,8 @@ nixSeal.secrets."db/password" = {
     }
   ];
 };
+
+nixSeal.artifactCacheRoot = "/var/lib/nix-seal/cache/v1";
 ```
 
 The service reads `$CREDENTIALS_DIRECTORY/database-password`. A mapping emits
@@ -461,7 +449,7 @@ use it for production secrets yet. Report vulnerabilities according to
 
 ## Diagnostics
 
-`nix-seal doctor --plan plan.v1.json --repository-root .` performs the same deep
+`nix-seal doctor --plan plan.v2.json --repository-root .` performs the same deep
 public-policy and canonical-ciphertext checks used before deployment, then
 reports authenticated and stale cache-artifact counts plus platform/runtime
 caveats. An artifact is authenticated only when its current plan, target policy,
@@ -472,7 +460,7 @@ Non-usage failures use stable exit categories: `1` operational, `3` policy, `4`
 cryptographic or approval verification, `5` cache/canonical-storage, and `6`
 runtime activation. Clap reserves `2` for argument/usage errors.
 
-`nix-seal key list --plan plan.v1.json` inventories the identities declared by
+`nix-seal key list --plan plan.v2.json` inventories the identities declared by
 that validated public plan. It exposes only each stable ID, role, and public
 recipient, signer, or plugin reference; it never searches for or reads private
 identity files.
@@ -753,7 +741,7 @@ nixSeal.lib.agenixRekeyMigrationExport {
 }
 ```
 
-Build a separate, reviewable `plan.v1.json` with the Nix or TOML frontend before
+Build a separate, reviewable `plan.v2.json` with the Nix or TOML frontend before
 performing a migration. The plan must name target systems, approval signers,
 administrator or recovery recipients, runtime ownership, phases, lifecycle, and
 templates explicitly. The default delivery is administrator-backed `rekeyed`;

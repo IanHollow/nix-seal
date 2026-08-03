@@ -1,6 +1,6 @@
 # Security and recovery runbooks
 
-These procedures assume a reviewed `plan.v1.json`, a protected administrator
+These procedures assume a reviewed `plan.v2.json`, a protected administrator
 workstation, and private identities stored outside the Nix store. Commands that
 can mutate state are shown first in their dry-run form. Never put a secret
 value, private identity, passphrase, or decrypted fragment in an argument,
@@ -19,7 +19,7 @@ ordinary environment variable, issue, chat, or log.
    was addressed to; changing a recipient does not erase Git history.
 4. After containment, compile the reviewed TOML/Nix sources and run
    `nix-seal check --toml nix-seal.toml --nix-plan plan-from-nix.json --deep`
-   when both sources exist. Run `nix-seal doctor --plan plan.v1.json` against
+   when both sources exist. Run `nix-seal doctor --plan plan.v2.json` against
    the compiled plan before provisioning any target. Review the JSON reports as
    public metadata only.
 
@@ -40,10 +40,10 @@ does not change the credential used by the service.
 3. Compile and inspect the replacement plan:
 
    ```console
-   nix-seal plan --toml nix-seal.toml --nix-plan plan-from-nix.json --output plan.v1.json
+   nix-seal plan --toml nix-seal.toml --nix-plan plan-from-nix.json --output plan.v2.json
    nix-seal check --toml nix-seal.toml --nix-plan plan-from-nix.json \
      --deep --repository-root .
-   nix-seal doctor --plan plan.v1.json --repository-root .
+   nix-seal doctor --plan plan.v2.json --repository-root .
    ```
 
 4. For each canonical ciphertext whose recipients changed, keep at least one
@@ -52,7 +52,7 @@ does not change the credential used by the service.
    changes encryption recipients without changing the application value:
 
    ```console
-   nix-seal secret rekey --plan plan.v1.json --secret <id> \
+   nix-seal secret rekey --plan plan.v2.json --secret <id> \
      --repository-root . --identity /private/uncompromised-recovery.age --json
    ```
 
@@ -78,7 +78,7 @@ does not change the credential used by the service.
    only add `--execute` after reviewing every target and generation. Export the
    ciphertext-only cache to the deployment host and activate normally.
 6. Rotate application credentials for any service whose value may have been
-   decrypted. Use `nix-seal rotate --plan plan.v1.json --secret <id>` with the
+   decrypted. Use `nix-seal rotate --plan plan.v2.json --secret <id>` with the
    replacement value supplied through a protected stream, then reprovision and
    restart/reload only after the complete generation switches.
 7. Treat all old Git ciphertext and old cache artifacts as exposed. Retain them
@@ -116,7 +116,7 @@ does not change the credential used by the service.
    the replacement signer set. Verify each artifact before deployment:
 
    ```console
-   nix-seal provision --plan plan.v1.json --target <target> --generation <n> \
+   nix-seal provision --plan plan.v2.json --target <target> --generation <n> \
      --signing-key /private/new-signing-key --identity /private/admin.age
    nix-seal check --toml nix-seal.toml --nix-plan plan-from-nix.json \
      --deep --repository-root .
@@ -132,7 +132,7 @@ does not change the credential used by the service.
 
 1. Treat the cache as disposable ciphertext-only build output. Verify the
    canonical plan and source ciphertext from Git, not from the cache.
-2. Run `nix-seal doctor --plan plan.v1.json --repository-root .` and inspect any
+2. Run `nix-seal doctor --plan plan.v2.json --repository-root .` and inspect any
    stale, malformed, or unauthenticated object counts. Do not manually copy
    files into the cache.
 3. Recreate artifacts with `nix-seal provision` in dry-run mode, then use

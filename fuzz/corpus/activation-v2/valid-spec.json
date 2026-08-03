@@ -1,17 +1,14 @@
 {
   "schema": "nix-seal.activation.v2",
   "runtimeRoot": "/run/nix-seal",
-  "plan": "/nix/store/example-plan.v1.json",
+  "plan": "/nix/store/example-plan.v2.json",
+  "artifactCacheRoot": "/var/lib/nix-seal/cache/v1",
   "targetId": "host-one",
   "phase": "activation",
   "artifacts": [
     {
-      "ciphertext": "/nix/store/example-token.age",
-      "envelope": "/nix/store/example-token.envelope.json",
       "secretId": "application/token",
       "phase": "activation",
-      "sourceCiphertextHash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-      "artifactGeneration": 1,
       "mode": "0400",
       "owner": "root",
       "group": "root"

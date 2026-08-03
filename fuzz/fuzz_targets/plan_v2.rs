@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: &[u8]| {
-    let Ok(plan) = serde_json::from_slice::<nix_seal_core::PlanV1>(input) else {
+    let Ok(plan) = serde_json::from_slice::<nix_seal_core::PlanV2>(input) else {
         return;
     };
     if nix_seal_policy::validate(&plan).is_err() {
@@ -12,7 +12,7 @@ fuzz_target!(|input: &[u8]| {
 
     let canonical = nix_seal_policy::canonical_json(&plan)
         .expect("a validated plan must have canonical public JSON");
-    let reparsed = serde_json::from_slice::<nix_seal_core::PlanV1>(&canonical)
+    let reparsed = serde_json::from_slice::<nix_seal_core::PlanV2>(&canonical)
         .expect("canonical public JSON must deserialize");
     nix_seal_policy::validate(&reparsed).expect("canonical public JSON must validate");
 

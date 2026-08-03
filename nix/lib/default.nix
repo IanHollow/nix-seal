@@ -20,51 +20,13 @@ let
       else
         value;
 
-  artifactBundleEntries = {
-    "ciphertext.age" = "regular";
-    "manifest.dsse.json" = "regular";
-  };
 in
 {
-  schemaVersion = "nix-seal.plan.v1";
-  schema = ../../schemas/plan-v1.schema.json;
+  schemaVersion = "nix-seal.plan.v2";
+  schema = ../../schemas/plan-v2.schema.json;
   # Kept as a public helper for callers that validate IDs before constructing a
   # collection. `mkPlan` applies the same predicate to every collection key.
   inherit validId;
-
-  # Import exactly one ciphertext-only cache artifact into the Nix store.  This
-  # is deliberately an import, not a rekey operation: no identity is read and
-  # no executable is run while evaluating or building a flake.  `nix-seal
-  # cache export` produces this two-file directory layout.
-  artifactBundle =
-    {
-      path ? null,
-      target,
-      secret,
-      rekeyCommand ? "nix-seal rekey --plan plan.v1.json --target ${target} --secret ${secret} --identity /path/to/admin.agekey --signing-key /path/to/approval-signing-key",
-    }:
-    if path == null then
-      throw "nix-seal.lib.artifactBundle: missing ciphertext-only artifact for ${target}/${secret}; run ${rekeyCommand} and then use its cache export"
-    else if !validId target || !validId secret then
-      throw "nix-seal.lib.artifactBundle: target and secret must be lowercase stable IDs"
-    else if !builtins.pathExists path then
-      throw "nix-seal.lib.artifactBundle: artifact path does not exist for ${target}/${secret}; run ${rekeyCommand}"
-    else if builtins.readDir path != artifactBundleEntries then
-      throw "nix-seal.lib.artifactBundle: artifact for ${target}/${secret} must contain only ciphertext.age and manifest.dsse.json; run ${rekeyCommand}"
-    else
-      let
-        storeTarget = builtins.replaceStrings [ "/" ] [ "-" ] target;
-        storeSecret = builtins.replaceStrings [ "/" ] [ "-" ] secret;
-      in
-      builtins.path {
-        inherit path;
-        name = "nix-seal-artifact-${storeTarget}-${storeSecret}";
-      };
-
-  artifactPaths = artifact: {
-    ciphertext = "${artifact}/ciphertext.age";
-    envelope = "${artifact}/manifest.dsse.json";
-  };
 
   # Nix values are public metadata only. This intentionally has no `...` in the
   # argument pattern: a typo in a top-level collection is a hard evaluation
@@ -81,6 +43,7 @@ in
       templates ? { },
       approvalPolicies ? { },
       backends ? { },
+      repositoryRoot,
     }:
     let
       checked = {
@@ -93,10 +56,28 @@ in
         approvalPolicies = validateCollection "approvalPolicies" approvalPolicies;
         backends = validateCollection "backends" backends;
       };
+      checkedSecrets = lib.mapAttrs (
+        id: secret:
+        if !builtins.isAttrs secret || !(secret ? source) || !builtins.isString secret.source then
+          throw "nix-seal.lib.mkPlan: secret ${id} must provide a repository-relative source string"
+        else if builtins.match "[a-z0-9._/-]+" secret.source == null
+          || lib.hasPrefix "/" secret.source
+          || lib.hasInfix ".." secret.source
+          || lib.hasInfix "/./" secret.source
+        then
+          throw "nix-seal.lib.mkPlan: secret ${id} has an unsafe canonical source"
+        else
+          secret
+          // {
+            # This is a hash of age ciphertext, so it is public and safe for
+            # the Nix store. The original relative spelling remains in the IR.
+            sourceCiphertextHash = builtins.hashFile "sha256" (repositoryRoot + "/${secret.source}");
+          }
+      ) checked.secrets;
     in
     builtins.toJSON (
       {
-        schema = "nix-seal.plan.v1";
+        schema = "nix-seal.plan.v2";
       }
       // {
         # The explicit projection is intentionally closed: arbitrary caller
@@ -105,7 +86,7 @@ in
         inherit (checked) identities;
         inherit (checked) groups;
         inherit (checked) targets;
-        inherit (checked) secrets;
+        secrets = checkedSecrets;
         inherit (checked) generators;
         inherit (checked) templates;
         inherit (checked) approvalPolicies;

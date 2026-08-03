@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "PlanV1",
+  "title": "PlanV2",
   "description": "Fully compiled public plan.",
   "type": "object",
   "properties": {
@@ -74,7 +74,9 @@
     }
   },
   "additionalProperties": false,
-  "required": ["schema"],
+  "required": [
+    "schema"
+  ],
   "$defs": {
     "ActivationPhase": {
       "description": "Activation lifecycle phase.",
@@ -121,7 +123,10 @@
         }
       },
       "additionalProperties": false,
-      "required": ["threshold", "signers"]
+      "required": [
+        "threshold",
+        "signers"
+      ]
     },
     "Backend": {
       "description": "Backend declaration.",
@@ -141,7 +146,9 @@
         }
       },
       "additionalProperties": false,
-      "required": ["kind"]
+      "required": [
+        "kind"
+      ]
     },
     "BackendKind": {
       "description": "Supported backend kinds.",
@@ -256,11 +263,17 @@
         },
         "validation": {
           "description": "Public validation fingerprint.",
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false,
-      "required": ["executable", "outputs"]
+      "required": [
+        "executable",
+        "outputs"
+      ]
     },
     "GeneratorPrompt": {
       "description": "One declared external-generator prompt.",
@@ -290,7 +303,11 @@
         }
       },
       "additionalProperties": false,
-      "required": ["id", "mode", "message"]
+      "required": [
+        "id",
+        "mode",
+        "message"
+      ]
     },
     "GeneratorPromptMode": {
       "description": "Display behavior for an external-generator prompt.",
@@ -321,7 +338,10 @@
         }
       },
       "additionalProperties": false,
-      "required": ["id", "destination"]
+      "required": [
+        "id",
+        "destination"
+      ]
     },
     "Group": {
       "description": "Named group of `IDs`.",
@@ -356,7 +376,10 @@
         }
       },
       "additionalProperties": false,
-      "required": ["kind", "public"]
+      "required": [
+        "kind",
+        "public"
+      ]
     },
     "IdentityKind": {
       "description": "Identity role.",
@@ -394,37 +417,61 @@
       "properties": {
         "classification": {
           "description": "Public classification.",
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "contact": {
           "description": "Responsible contact.",
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "createdAt": {
           "description": "ISO-8601 creation time.",
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "expiresAt": {
           "description": "ISO-8601 expiry time.",
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "incidentReference": {
           "description": "Public incident or ticket reference associated with this credential.",
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "purpose": {
           "description": "Non-secret purpose.",
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "rotateAfterDays": {
           "description": "Rotation interval in days.",
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint32",
           "minimum": 0
         },
         "rotatedAt": {
           "description": "ISO-8601 time of the most recent application-credential rotation.",
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false
@@ -435,7 +482,10 @@
       "properties": {
         "compatibilitySymlink": {
           "description": "Optional stable compatibility symlink to the active runtime file.\n\nThe symlink itself is public metadata; it never contains plaintext.\nActivation creates it only when its parent is an existing protected\ndirectory and refuses to replace a mismatched existing entry.",
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "group": {
           "description": "File group.",
@@ -467,7 +517,11 @@
         }
       },
       "additionalProperties": false,
-      "required": ["owner", "group", "mode"]
+      "required": [
+        "owner",
+        "group",
+        "mode"
+      ]
     },
     "Secret": {
       "description": "Secret policy. It contains paths and metadata, never plaintext.",
@@ -565,10 +619,17 @@
         "source": {
           "description": "Repository-relative canonical age ciphertext path.",
           "type": "string"
+        },
+        "sourceCiphertextHash": {
+          "description": "SHA-256 hash of the canonical ciphertext. This binds an artifact to the\nexact encrypted source without putting secret plaintext in the plan.",
+          "type": "string"
         }
       },
       "additionalProperties": false,
-      "required": ["source"]
+      "required": [
+        "source",
+        "sourceCiphertextHash"
+      ]
     },
     "Target": {
       "description": "Target platform consumer.",
@@ -576,12 +637,18 @@
       "properties": {
         "configuration": {
           "description": "Optional Nix configuration name used by selectors.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "default": null
         },
         "environment": {
           "description": "Optional deployment environment used by selectors.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "default": null
         },
         "identity": {
@@ -606,12 +673,19 @@
         },
         "username": {
           "description": "Optional Home Manager user.",
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "default": null
         }
       },
       "additionalProperties": false,
-      "required": ["kind", "system", "identity"]
+      "required": [
+        "kind",
+        "system",
+        "identity"
+      ]
     },
     "TargetKind": {
       "description": "Supported integration type.",
@@ -732,7 +806,10 @@
         }
       },
       "additionalProperties": false,
-      "required": ["source", "placeholders"]
+      "required": [
+        "source",
+        "placeholders"
+      ]
     },
     "TemplateEncoding": {
       "description": "Supported plan-level secret-to-text transformations.",
@@ -768,7 +845,10 @@
         }
       },
       "additionalProperties": false,
-      "required": ["secret", "encoding"]
+      "required": [
+        "secret",
+        "encoding"
+      ]
     }
   }
 }

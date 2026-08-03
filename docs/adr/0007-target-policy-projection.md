@@ -2,7 +2,7 @@
 
 Status: accepted; initial plan/rekey/activation enforcement implemented
 
-`plan.v1` is the sole public policy authority. For each target, the policy crate
+`plan.v2` is the sole public policy authority. For each target, the policy crate
 deterministically resolves nested target groups and emits a canonical
 `nix-seal.target-policy.v1` projection containing the selected target recipient,
 authorized secrets, delivery modes, phases, per-secret approval policies,

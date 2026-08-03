@@ -12,7 +12,7 @@ use std::{
 use thiserror::Error;
 
 /// Current intermediate-representation schema identifier.
-pub const PLAN_SCHEMA: &str = "nix-seal.plan.v1";
+pub const PLAN_SCHEMA: &str = "nix-seal.plan.v2";
 /// Default maximum execution time for a constrained external generator.
 pub const DEFAULT_GENERATOR_TIMEOUT_SECONDS: u16 = 30;
 /// Default per-output plaintext safety limit for a constrained external generator.
@@ -81,7 +81,7 @@ pub enum IdError {
 /// Fully compiled public plan.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct PlanV1 {
+pub struct PlanV2 {
     /// Must equal [`PLAN_SCHEMA`].
     pub schema: String,
     /// Public recipients and signers.
@@ -110,7 +110,7 @@ pub struct PlanV1 {
     pub backends: BTreeMap<Id, Backend>,
 }
 
-impl Default for PlanV1 {
+impl Default for PlanV2 {
     fn default() -> Self {
         Self {
             schema: PLAN_SCHEMA.to_owned(),
@@ -203,6 +203,9 @@ pub enum TargetKind {
 pub struct Secret {
     /// Repository-relative canonical age ciphertext path.
     pub source: String,
+    /// SHA-256 hash of the canonical ciphertext. This binds an artifact to the
+    /// exact encrypted source without putting secret plaintext in the plan.
+    pub source_ciphertext_hash: String,
     /// Artifact delivery model.
     #[serde(default)]
     pub delivery: DeliveryMode,

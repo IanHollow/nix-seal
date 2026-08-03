@@ -73,13 +73,9 @@ address with different ciphertext or envelope fails closed. Artifact
 authorization remains a policy/activation operation, so importing an artifact
 never by itself grants it runtime use.
 
-The module's `artifactDirectory` option is the normal bridge. It derives the two
-fixed paths from an absolute out-of-store bundle directory, refuses a Nix store
-path or traversal spelling, and leaves all existence, no-follow, and signature
-checks to Rust activation. `artifactBundle` remains a compatibility helper for
-deployments that deliberately need a fixed ciphertext-only store closure. It
-consumes one exported target artifact directory with the exact two-member set
-`ciphertext.age`/`manifest.dsse.json`, copies public ciphertext and metadata
-through `builtins.path`, and derives module paths from it. Neither bridge reads
-an identity, invokes a process, or rekeys in a derivation; artifact signatures
-and target bindings remain verified by the Rust activation runtime.
+The module accepts one absolute, out-of-store `artifactCacheRoot`. It never
+imports a cache entry into a derivation and has no per-artifact address options.
+At activation the Rust runtime enumerates the root, rejects unsafe bundles, and
+selects the unique highest signed generation that exactly matches the local
+plan.v2 policy. Nix therefore never reads an identity, invokes a process, or
+rekeys in a derivation.

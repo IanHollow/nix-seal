@@ -2,7 +2,7 @@
 //! End-to-end plan-directed CLI authoring guarantees.
 
 use nix_seal_core::{
-    ActivationPhase, DeliveryMode, Id, Identity, IdentityKind, Lifecycle, PlanV1, RuntimeSettings,
+    ActivationPhase, DeliveryMode, Id, Identity, IdentityKind, Lifecycle, PlanV2, RuntimeSettings,
     Secret, TargetSelectors,
 };
 use secrecy::ExposeSecret;
@@ -192,14 +192,16 @@ fn plan_directed_delete_is_explicit_and_recoverable() -> Result<(), Box<dyn std:
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn logical_collection_batch_authors_independent_ciphertexts()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = fixture()?;
-    let mut plan: PlanV1 = serde_json::from_slice(&std::fs::read(&fixture.plan_path)?)?;
+    let mut plan: PlanV2 = serde_json::from_slice(&std::fs::read(&fixture.plan_path)?)?;
     plan.secrets.insert(
         Id::parse("db/token")?,
         Secret {
             source: "secrets/token.age".to_owned(),
+            source_ciphertext_hash: "0".repeat(64),
             delivery: DeliveryMode::Rekeyed,
             administrators: Vec::new(),
             consumers: Vec::new(),
@@ -351,12 +353,12 @@ struct Fixture {
 fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().canonicalize()?;
-    let plan_path = root.join("plan.v1.json");
+    let plan_path = root.join("plan.v2.json");
     let identity_path = root.join("admin.identity");
     let (identity, recipient) = nix_seal_crypto::generate_x25519();
     write_private(&identity_path, identity.expose_secret().as_bytes())?;
 
-    let mut plan = PlanV1::default();
+    let mut plan = PlanV2::default();
     plan.identities.insert(
         Id::parse("admin")?,
         Identity {
@@ -375,6 +377,7 @@ fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
         Id::parse("db/password")?,
         Secret {
             source: "secrets/db.age".to_owned(),
+            source_ciphertext_hash: "0".repeat(64),
             delivery: DeliveryMode::Rekeyed,
             administrators: Vec::new(),
             consumers: Vec::new(),

@@ -3,7 +3,7 @@
 
 use nix_seal_core::{
     ActivationPhase, ApprovalPolicy, DeliveryMode, Generator, GeneratorPromptMode, Id,
-    IdentityKind, PLAN_SCHEMA, PlanV1, RuntimeSettings, TargetKind, TemplatePlaceholder,
+    IdentityKind, PLAN_SCHEMA, PlanV2, RuntimeSettings, TargetKind, TemplatePlaceholder,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,13 @@ use std::{
 use thiserror::Error;
 
 const MAX_PLAN_BYTES: u64 = 16 * 1024 * 1024;
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 /// Exact schema for one deterministic target-specific policy projection.
 pub const TARGET_POLICY_SCHEMA: &str = "nix-seal.target-policy.v1";
@@ -72,7 +79,7 @@ pub struct SecretLifecycleReportV1 {
 pub struct TargetPolicyV1 {
     /// Must equal [`TARGET_POLICY_SCHEMA`].
     pub schema: String,
-    /// Hash of the complete canonical `plan.v1` source.
+    /// Hash of the complete canonical `plan.v2` source.
     pub plan_hash: String,
     /// Exact selected target ID.
     pub target_id: Id,
@@ -98,6 +105,8 @@ pub struct TargetPolicyV1 {
 pub struct TargetSecretPolicyV1 {
     /// Canonical repository source path from the plan.
     pub source: String,
+    /// SHA-256 hash of the canonical ciphertext pinned by the plan.
+    pub source_ciphertext_hash: String,
     /// Ciphertext delivery model.
     pub delivery: DeliveryMode,
     /// Required activation phase.
@@ -166,14 +175,14 @@ pub enum PolicyError {
 }
 
 /// Loads a strict `TOML` plan.
-pub fn load_toml(path: &Path) -> Result<PlanV1, PolicyError> {
+pub fn load_toml(path: &Path) -> Result<PlanV2, PolicyError> {
     let value = String::from_utf8(read_plan_source(path)?)
         .map_err(|_| PolicyError::Violation("TOML plan source must be valid UTF-8".to_owned()))?;
     Ok(toml::from_str(&value)?)
 }
 
 /// Loads a strict `JSON` plan, including Nix-emitted plans.
-pub fn load_json(path: &Path) -> Result<PlanV1, PolicyError> {
+pub fn load_json(path: &Path) -> Result<PlanV2, PolicyError> {
     let value = read_plan_source(path)?;
     Ok(serde_json::from_slice(&value)?)
 }
@@ -200,7 +209,7 @@ fn read_plan_source(path: &Path) -> Result<Vec<u8>, PolicyError> {
 }
 
 /// Merges disjoint authoritative sources. Any overlapping `ID` is fatal.
-pub fn merge(mut left: PlanV1, right: PlanV1) -> Result<PlanV1, PolicyError> {
+pub fn merge(mut left: PlanV2, right: PlanV2) -> Result<PlanV2, PolicyError> {
     macro_rules! disjoint_append {
         ($field:ident) => {
             for (id, value) in right.$field {
@@ -226,7 +235,7 @@ pub fn merge(mut left: PlanV1, right: PlanV1) -> Result<PlanV1, PolicyError> {
     Ok(left)
 }
 
-fn ensure_schema(plan: &PlanV1) -> Result<(), PolicyError> {
+fn ensure_schema(plan: &PlanV2) -> Result<(), PolicyError> {
     if plan.schema == PLAN_SCHEMA {
         Ok(())
     } else {
@@ -235,7 +244,7 @@ fn ensure_schema(plan: &PlanV1) -> Result<(), PolicyError> {
 }
 
 /// Validates cross-object policy invariants.
-pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
+pub fn validate(plan: &PlanV2) -> Result<(), PolicyError> {
     ensure_schema(plan)?;
     if [
         plan.identities.len(),
@@ -326,7 +335,7 @@ pub fn validate(plan: &PlanV1) -> Result<(), PolicyError> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
+fn validate_secrets(plan: &PlanV2) -> Result<(), PolicyError> {
     let mut sources = BTreeSet::new();
     for (id, secret) in &plan.secrets {
         if !valid_repository_relative_path(&secret.source) {
@@ -337,6 +346,11 @@ fn validate_secrets(plan: &PlanV1) -> Result<(), PolicyError> {
         if !sources.insert(&secret.source) {
             return Err(PolicyError::Violation(format!(
                 "secret {id} reuses a canonical ciphertext source path"
+            )));
+        }
+        if !is_sha256(&secret.source_ciphertext_hash) {
+            return Err(PolicyError::Violation(format!(
+                "secret {id} sourceCiphertextHash must be lowercase SHA-256"
             )));
         }
         for consumer in &secret.consumers {
@@ -497,7 +511,7 @@ fn validate_target(id: &Id, target: &nix_seal_core::Target) -> Result<(), Policy
 }
 
 fn validate_target_selectors(
-    plan: &PlanV1,
+    plan: &PlanV2,
     secret_id: &Id,
     secret: &nix_seal_core::Secret,
 ) -> Result<(), PolicyError> {
@@ -584,7 +598,7 @@ fn validate_bounded_selector_values<'a>(
 }
 
 fn selected_consumer_targets(
-    plan: &PlanV1,
+    plan: &PlanV2,
     secret: &nix_seal_core::Secret,
 ) -> Result<BTreeSet<Id>, PolicyError> {
     let mut selected = expand_group_leaves(plan, &secret.consumers)?;
@@ -681,7 +695,7 @@ fn validate_lifecycle(id: &Id, lifecycle: &nix_seal_core::Lifecycle) -> Result<(
 
 /// Calculates deterministic lifecycle states at an explicit system time.
 pub fn lifecycle_report(
-    plan: &PlanV1,
+    plan: &PlanV2,
     now: SystemTime,
 ) -> Result<Vec<SecretLifecycleReportV1>, PolicyError> {
     validate(plan)?;
@@ -736,7 +750,7 @@ pub fn lifecycle_report(
         .collect()
 }
 
-fn validate_templates(plan: &PlanV1) -> Result<(), PolicyError> {
+fn validate_templates(plan: &PlanV2) -> Result<(), PolicyError> {
     for (id, template) in &plan.templates {
         if !is_normalized_public_path(&template.source) {
             return Err(PolicyError::Violation(format!(
@@ -784,7 +798,7 @@ fn validate_templates(plan: &PlanV1) -> Result<(), PolicyError> {
 }
 
 fn template_phase(
-    plan: &PlanV1,
+    plan: &PlanV2,
     template_id: &Id,
     template: &nix_seal_core::Template,
 ) -> Result<ActivationPhase, PolicyError> {
@@ -841,7 +855,7 @@ fn is_placeholder_name(value: &str) -> bool {
         })
 }
 
-fn validate_group_graph(plan: &PlanV1) -> Result<(), PolicyError> {
+fn validate_group_graph(plan: &PlanV2) -> Result<(), PolicyError> {
     let mut indegree = BTreeMap::new();
     let mut dependents: BTreeMap<&Id, Vec<&Id>> = BTreeMap::new();
     for (group_id, group) in &plan.groups {
@@ -901,7 +915,7 @@ fn validate_group_graph(plan: &PlanV1) -> Result<(), PolicyError> {
     Ok(())
 }
 
-fn target_is_consumer(plan: &PlanV1, secret: &nix_seal_core::Secret, target_id: &Id) -> bool {
+fn target_is_consumer(plan: &PlanV2, secret: &nix_seal_core::Secret, target_id: &Id) -> bool {
     if selected_consumer_targets(plan, secret).is_ok_and(|targets| targets.contains(target_id)) {
         return true;
     }
@@ -932,7 +946,7 @@ fn target_is_consumer(plan: &PlanV1, secret: &nix_seal_core::Secret, target_id: 
     false
 }
 
-fn expand_group_leaves(plan: &PlanV1, references: &[Id]) -> Result<BTreeSet<Id>, PolicyError> {
+fn expand_group_leaves(plan: &PlanV2, references: &[Id]) -> Result<BTreeSet<Id>, PolicyError> {
     let mut leaves = BTreeSet::new();
     let mut pending = Vec::new();
     let mut visited = BTreeSet::new();
@@ -964,7 +978,7 @@ fn expand_group_leaves(plan: &PlanV1, references: &[Id]) -> Result<BTreeSet<Id>,
 }
 
 /// Derives the canonical encryption recipients for one secret source.
-pub fn secret_recipients(plan: &PlanV1, secret_id: &Id) -> Result<SecretRecipientsV1, PolicyError> {
+pub fn secret_recipients(plan: &PlanV2, secret_id: &Id) -> Result<SecretRecipientsV1, PolicyError> {
     validate(plan)?;
     let secret = plan.secrets.get(secret_id).ok_or_else(|| {
         PolicyError::Violation(format!(
@@ -1038,7 +1052,7 @@ pub fn secret_recipients(plan: &PlanV1, secret_id: &Id) -> Result<SecretRecipien
 }
 
 fn target_approval_policy(
-    plan: &PlanV1,
+    plan: &PlanV2,
     policy_id: Option<&Id>,
 ) -> Result<TargetApprovalPolicyV1, PolicyError> {
     let (threshold, signer_ids): (u16, Vec<&Id>) = if let Some(policy_id) = policy_id {
@@ -1077,7 +1091,7 @@ fn target_approval_policy(
     Ok(TargetApprovalPolicyV1 { threshold, signers })
 }
 
-fn validate_approval(id: &Id, policy: &ApprovalPolicy, plan: &PlanV1) -> Result<(), PolicyError> {
+fn validate_approval(id: &Id, policy: &ApprovalPolicy, plan: &PlanV2) -> Result<(), PolicyError> {
     let distinct: BTreeSet<_> = policy.signers.iter().collect();
     if policy.threshold == 0 || usize::from(policy.threshold) > distinct.len() {
         return Err(PolicyError::Violation(format!(
@@ -1098,7 +1112,7 @@ fn validate_approval(id: &Id, policy: &ApprovalPolicy, plan: &PlanV1) -> Result<
 }
 
 #[allow(clippy::too_many_lines)]
-fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
+fn validate_generator_graph(plan: &PlanV2) -> Result<(), PolicyError> {
     let mut indegree = BTreeMap::new();
     let mut dependents: BTreeMap<&Id, Vec<&Id>> = BTreeMap::new();
     let mut generated_outputs = BTreeSet::new();
@@ -1205,7 +1219,7 @@ fn validate_generator_graph(plan: &PlanV1) -> Result<(), PolicyError> {
 
 #[allow(clippy::too_many_arguments)]
 fn validate_generator_outputs<'a>(
-    plan: &PlanV1,
+    plan: &PlanV2,
     generator_id: &'a Id,
     generator: &'a nix_seal_core::Generator,
     generated_outputs: &mut BTreeSet<&'a Id>,
@@ -1242,7 +1256,7 @@ fn validate_generator_outputs<'a>(
 }
 
 fn validate_generated_secret_dependency_order(
-    plan: &PlanV1,
+    plan: &PlanV2,
     output_producers: &BTreeMap<&Id, &Id>,
 ) -> Result<(), PolicyError> {
     for (generator_id, generator) in &plan.generators {
@@ -1280,7 +1294,7 @@ fn validate_generator_prompts<'a>(
 }
 
 fn validate_generator_secret_dependencies(
-    plan: &PlanV1,
+    plan: &PlanV2,
     generator_id: &Id,
     generator: &Generator,
 ) -> Result<(), PolicyError> {
@@ -1458,17 +1472,17 @@ fn is_generator_parameter_name(value: &str) -> bool {
 }
 
 /// Returns `RFC 8785` canonical `JSON` bytes.
-pub fn canonical_json(plan: &PlanV1) -> Result<Vec<u8>, PolicyError> {
+pub fn canonical_json(plan: &PlanV2) -> Result<Vec<u8>, PolicyError> {
     Ok(serde_jcs::to_vec(plan)?)
 }
 
 /// Returns the `BLAKE3` digest of the canonical plan.
-pub fn plan_hash(plan: &PlanV1) -> Result<String, PolicyError> {
+pub fn plan_hash(plan: &PlanV2) -> Result<String, PolicyError> {
     Ok(domain_hash("nix-seal plan hash v1", &canonical_json(plan)?))
 }
 
 /// Derives the complete deterministic policy authorized for one target.
-pub fn target_policy(plan: &PlanV1, target_id: &Id) -> Result<TargetPolicyV1, PolicyError> {
+pub fn target_policy(plan: &PlanV2, target_id: &Id) -> Result<TargetPolicyV1, PolicyError> {
     validate(plan)?;
     let target = plan.targets.get(target_id).ok_or_else(|| {
         PolicyError::Violation(format!(
@@ -1488,6 +1502,7 @@ pub fn target_policy(plan: &PlanV1, target_id: &Id) -> Result<TargetPolicyV1, Po
                 secret_id.clone(),
                 TargetSecretPolicyV1 {
                     source: secret.source.clone(),
+                    source_ciphertext_hash: secret.source_ciphertext_hash.clone(),
                     delivery: secret.delivery.clone(),
                     phase: secret.phase,
                     runtime: secret.runtime_for_target(target_id).clone(),
@@ -1550,10 +1565,10 @@ fn domain_hash(context: &str, bytes: &[u8]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// Returns the `JSON` Schema for plan.v1.
+/// Returns the `JSON` Schema for plan.v2.
 pub fn json_schema() -> Result<String, PolicyError> {
     Ok(serde_json::to_string_pretty(&schemars::schema_for!(
-        PlanV1
+        PlanV2
     ))?)
 }
 
@@ -1584,7 +1599,7 @@ mod tests {
     const SSH_SIGNER: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti release@example.com";
     #[test]
     fn empty_plan_is_stable_and_valid() -> Result<(), PolicyError> {
-        let plan = PlanV1::default();
+        let plan = PlanV2::default();
         validate(&plan)?;
         assert_eq!(plan_hash(&plan)?, plan_hash(&plan)?);
         Ok(())
@@ -1609,7 +1624,7 @@ mod tests {
         assert!(!valid_repository_relative_path("secrets/./database.age"));
         assert!(!valid_repository_relative_path("secrets/\n-database.age"));
 
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         plan.identities.insert(
             Id::parse("administrator")
                 .map_err(|error| PolicyError::Violation(error.to_string()))?,
@@ -1630,6 +1645,7 @@ mod tests {
                 .map_err(|error| PolicyError::Violation(error.to_string()))?,
             Secret {
                 source: "secrets/./database.age".to_owned(),
+                source_ciphertext_hash: "0".repeat(64),
                 delivery: DeliveryMode::Rekeyed,
                 administrators: Vec::new(),
                 consumers: Vec::new(),
@@ -1655,7 +1671,7 @@ mod tests {
             .map_err(|error| PolicyError::Violation(error.to_string()))?;
         let output_id = Id::parse("application/public-key")
             .map_err(|error| PolicyError::Violation(error.to_string()))?;
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         plan.generators.insert(
             generator_id.clone(),
             Generator {
@@ -1833,7 +1849,7 @@ mod tests {
 
     #[test]
     fn duplicate_ids_are_rejected() -> Result<(), PolicyError> {
-        let (mut a, mut b) = (PlanV1::default(), PlanV1::default());
+        let (mut a, mut b) = (PlanV2::default(), PlanV2::default());
         let id = Id::parse("ops").map_err(|error| PolicyError::Violation(error.to_string()))?;
         a.groups.insert(id.clone(), nix_seal_core::Group::default());
         b.groups.insert(id, nix_seal_core::Group::default());
@@ -1844,8 +1860,8 @@ mod tests {
     #[test]
     fn property_canonical_hash_is_invariant_under_public_insertion_order() -> Result<(), PolicyError>
     {
-        let mut forward = PlanV1::default();
-        let mut reverse = PlanV1::default();
+        let mut forward = PlanV2::default();
+        let mut reverse = PlanV2::default();
         for index in 0..32 {
             let id = Id::parse(format!("administrator/{index:02}"))
                 .map_err(|error| PolicyError::Violation(error.to_string()))?;
@@ -1866,8 +1882,8 @@ mod tests {
     #[test]
     fn property_disjoint_merge_is_commutative_and_duplicate_merge_is_fatal()
     -> Result<(), PolicyError> {
-        let mut left = PlanV1::default();
-        let mut right = PlanV1::default();
+        let mut left = PlanV2::default();
+        let mut right = PlanV2::default();
         left.identities.insert(
             Id::parse("administrator/left")
                 .map_err(|error| PolicyError::Violation(error.to_string()))?,
@@ -1897,7 +1913,7 @@ mod tests {
     #[test]
     fn property_selector_authorization_is_monotonic_for_explicit_consumers()
     -> Result<(), PolicyError> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let admin = Id::parse("administrator")
             .map_err(|error| PolicyError::Violation(error.to_string()))?;
         let signer =
@@ -1956,6 +1972,7 @@ mod tests {
             secret.clone(),
             Secret {
                 source: "secrets/token.age".to_owned(),
+                source_ciphertext_hash: "0".repeat(64),
                 delivery: DeliveryMode::Rekeyed,
                 administrators: Vec::new(),
                 consumers: Vec::new(),
@@ -1989,7 +2006,7 @@ mod tests {
 
     #[test]
     fn repository_only_secrets_cannot_be_target_delivered() -> Result<(), PolicyError> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let admin = Id::parse("administrator")
             .map_err(|error| PolicyError::Violation(error.to_string()))?;
         let target_identity = Id::parse("target-identity")
@@ -2037,6 +2054,7 @@ mod tests {
             secret_id,
             Secret {
                 source: "secrets/intermediary.age".to_owned(),
+                source_ciphertext_hash: "0".repeat(64),
                 delivery: DeliveryMode::Rekeyed,
                 administrators: Vec::new(),
                 consumers: vec![target],
@@ -2055,7 +2073,7 @@ mod tests {
 
     #[test]
     fn duplicate_signer_keys_are_rejected_before_threshold_evaluation() -> Result<(), PolicyError> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let first =
             Id::parse("signer-a").map_err(|error| PolicyError::Violation(error.to_string()))?;
         let second =
@@ -2076,7 +2094,7 @@ mod tests {
     #[test]
     fn generator_secret_dependencies_are_distinct_existing_and_not_outputs()
     -> Result<(), PolicyError> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let administrator = Id::parse("administrator")
             .map_err(|error| PolicyError::Violation(error.to_string()))?;
         let signer =
@@ -2107,6 +2125,7 @@ mod tests {
                 id.clone(),
                 Secret {
                     source: source.to_owned(),
+                    source_ciphertext_hash: "0".repeat(64),
                     delivery: DeliveryMode::Rekeyed,
                     administrators: Vec::new(),
                     consumers: Vec::new(),
@@ -2171,7 +2190,7 @@ mod tests {
 
     #[test]
     fn duplicate_openssh_signer_keys_ignore_public_comments() -> Result<(), PolicyError> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let first =
             Id::parse("signer-a").map_err(|error| PolicyError::Violation(error.to_string()))?;
         let second =
@@ -2196,7 +2215,7 @@ mod tests {
 
     #[test]
     fn encryption_identities_require_a_valid_age_recipient() -> Result<(), PolicyError> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let id = Id::parse("administrator")
             .map_err(|error| PolicyError::Violation(error.to_string()))?;
         plan.identities.insert(
@@ -2212,7 +2231,7 @@ mod tests {
 
     #[test]
     fn target_selectors_expand_deterministically() -> Result<(), PolicyError> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let parse = |value: &str| {
             Id::parse(value).map_err(|error| PolicyError::Violation(error.to_string()))
         };
@@ -2275,6 +2294,7 @@ mod tests {
             secret_id,
             Secret {
                 source: "secrets/db-password.age".to_owned(),
+                source_ciphertext_hash: "0".repeat(64),
                 delivery: DeliveryMode::Rekeyed,
                 administrators: Vec::new(),
                 consumers: Vec::new(),
@@ -2315,7 +2335,7 @@ mod tests {
 
     #[test]
     fn signer_identities_require_a_valid_approval_key() -> Result<(), PolicyError> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let id = Id::parse("signer").map_err(|error| PolicyError::Violation(error.to_string()))?;
         plan.identities.insert(
             id,
@@ -2330,7 +2350,7 @@ mod tests {
 
     #[test]
     fn signer_identities_accept_openssh_ed25519_approval_keys() -> Result<(), PolicyError> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let id =
             Id::parse("ssh-signer").map_err(|error| PolicyError::Violation(error.to_string()))?;
         plan.identities.insert(
@@ -2345,7 +2365,7 @@ mod tests {
 
     #[test]
     fn plugin_identities_require_standard_age_plugin_recipients() -> Result<(), PolicyError> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let id = Id::parse("hardware-token")
             .map_err(|error| PolicyError::Violation(error.to_string()))?;
         plan.identities.insert(
@@ -2363,7 +2383,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn templates_require_valid_secret_bindings_and_noncolliding_outputs() -> Result<(), PolicyError>
     {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         plan.identities.insert(
             Id::parse("release-signer")
                 .map_err(|error| PolicyError::Violation(error.to_string()))?,
@@ -2384,6 +2404,7 @@ mod tests {
             Id::parse("db/password").map_err(|error| PolicyError::Violation(error.to_string()))?;
         let secret = Secret {
             source: "secrets/db-password.age".to_owned(),
+            source_ciphertext_hash: "0".repeat(64),
             delivery: DeliveryMode::Rekeyed,
             administrators: Vec::new(),
             consumers: Vec::new(),
@@ -2473,7 +2494,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn target_projection_resolves_nested_groups_approvals_and_templates() -> Result<(), PolicyError>
     {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let signer_id =
             Id::parse("signer").map_err(|error| PolicyError::Violation(error.to_string()))?;
         let recipient_id = Id::parse("host-recipient")
@@ -2540,6 +2561,7 @@ mod tests {
             Id::parse("other/token").map_err(|error| PolicyError::Violation(error.to_string()))?;
         let secret = |source: &str, consumer: Id| Secret {
             source: source.to_owned(),
+            source_ciphertext_hash: "0".repeat(64),
             delivery: DeliveryMode::Rekeyed,
             administrators: Vec::new(),
             consumers: vec![consumer],
@@ -2617,7 +2639,7 @@ mod tests {
 
     #[test]
     fn group_cycles_are_rejected_without_recursive_traversal() -> Result<(), PolicyError> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let first =
             Id::parse("first").map_err(|error| PolicyError::Violation(error.to_string()))?;
         let second =
@@ -2641,7 +2663,7 @@ mod tests {
     #[test]
     fn canonical_recipients_are_plan_derived_and_direct_mode_is_explicit()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let admin = Id::parse("admin")?;
         let recovery = Id::parse("recovery")?;
         let signer = Id::parse("signer")?;
@@ -2685,6 +2707,7 @@ mod tests {
             secret.clone(),
             Secret {
                 source: "secrets/db.age".to_owned(),
+                source_ciphertext_hash: "0".repeat(64),
                 delivery: DeliveryMode::Direct,
                 administrators: vec![admin.clone()],
                 consumers: vec![group],
@@ -2708,7 +2731,7 @@ mod tests {
     #[test]
     fn lifecycle_reporting_distinguishes_rotation_and_expiry()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut plan = PlanV1::default();
+        let mut plan = PlanV2::default();
         let signer = Id::parse("signer")?;
         let admin = Id::parse("admin")?;
         plan.identities.insert(
@@ -2729,6 +2752,7 @@ mod tests {
         let expired = Id::parse("expired")?;
         let base = |source: &str, lifecycle| Secret {
             source: source.to_owned(),
+            source_ciphertext_hash: "0".repeat(64),
             delivery: DeliveryMode::Rekeyed,
             administrators: Vec::new(),
             consumers: Vec::new(),
@@ -2777,7 +2801,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let generated: serde_json::Value = serde_json::from_str(&json_schema()?)?;
         let checked_in: serde_json::Value =
-            serde_json::from_str(include_str!("../../../schemas/plan-v1.schema.json"))?;
+            serde_json::from_str(include_str!("../../../schemas/plan-v2.schema.json"))?;
         assert_eq!(generated, checked_in);
         Ok(())
     }

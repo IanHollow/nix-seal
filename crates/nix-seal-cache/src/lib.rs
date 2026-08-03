@@ -156,6 +156,8 @@ pub struct ArtifactRecord {
     pub envelope: Vec<u8>,
     /// Path to the verified ciphertext file.
     pub ciphertext_path: PathBuf,
+    /// Path to the verified signed-envelope file.
+    pub envelope_path: PathBuf,
 }
 
 /// Verified, ciphertext-only cache inventory.
@@ -402,6 +404,7 @@ impl Cache {
             artifact_ciphertext_hash,
             envelope: envelope.to_vec(),
             ciphertext_path: destination.join("ciphertext.age"),
+            envelope_path: destination.join("manifest.dsse.json"),
         })
     }
 
@@ -756,6 +759,7 @@ impl Cache {
             artifact_ciphertext_hash,
             envelope,
             ciphertext_path,
+            envelope_path,
         })
     }
 }

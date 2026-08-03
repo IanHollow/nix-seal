@@ -16,7 +16,6 @@
 let
   inherit (lib) mkIf mkOption types;
   cfg = config.nixSeal;
-  digestType = types.strMatching "[0-9a-f]{64}";
   privateModeType = types.strMatching "0[1-7]00";
   idIsValid =
     value:
@@ -37,7 +36,7 @@ let
     "services"
   ];
   privateIdentityPathIsSafe = value: lib.hasPrefix "/" value && !(lib.hasPrefix "/nix/store/" value);
-  artifactDirectoryIsSafe =
+  artifactCacheRootIsSafe =
     value:
     lib.hasPrefix "/" value
     && value != "/"
@@ -50,7 +49,6 @@ let
     && !(builtins.any (character: character < " " || character == "\u007f") (
       lib.stringToCharacters value
     ));
-  runtimeArtifactPathType = types.coercedTo types.path toString types.str;
   unitType = types.strMatching "[A-Za-z0-9_.@:-]{1,256}";
   serviceUnitType = types.strMatching "[A-Za-z0-9_.@:-]{1,247}\\.service";
   credentialNameType = types.addCheck (types.strMatching "[A-Za-z0-9_.@-]{1,255}") (
@@ -72,9 +70,32 @@ let
       ))
     )
   );
-  configuredSecrets = lib.filterAttrs (_: secret: secret.ciphertext != null) cfg.secrets;
-  missingSecretArtifacts = lib.filterAttrs (_: secret: secret.ciphertext == null) cfg.secrets;
+  configuredSecrets = lib.filterAttrs (_: secret: secret.source != null) cfg.secrets;
+  missingSecretSources = lib.filterAttrs (_: secret: secret.source == null) cfg.secrets;
   configuredTemplates = lib.filterAttrs (_: template: template.source != null) cfg.templates;
+  compiledPlanObjects = {
+    inherit (cfg) identities approvalPolicies;
+    targets.${cfg.targetId} = cfg.target;
+    secrets = lib.mapAttrs (_: secret: {
+      inherit (secret) source delivery administrators phase lifecycle;
+      consumers = [ cfg.targetId ];
+      approvalPolicy = secret.approvalPolicy;
+      runtime = {
+        inherit (secret) owner group mode compatibilitySymlink restartUnits reloadUnits;
+      };
+    }) configuredSecrets;
+    templates = lib.mapAttrs (_: template: {
+      inherit (template) source placeholders;
+      runtime = {
+        inherit (template) owner group mode restartUnits reloadUnits;
+      };
+    }) configuredTemplates;
+  };
+  effectivePlanObjects =
+    if cfg.identities != { } then
+      compiledPlanObjects
+    else
+      cfg.planObjects;
   phaseRuntimeDirectory =
     phase: if phase == "activation" then cfg.runtimeDirectory else "${cfg.runtimeDirectory}/${phase}";
   configuredSecretsForPhase =
@@ -109,10 +130,6 @@ let
     ) (builtins.attrNames (configuredSecretsForPhase phase));
   serviceCredentialBindings = lib.concatMap serviceCredentialBindingsForPhase activationPhases;
   serviceCredentialKeys = map (binding: "${binding.unit}:${binding.name}") serviceCredentialBindings;
-  artifactBundleEntries = {
-    "ciphertext.age" = "regular";
-    "manifest.dsse.json" = "regular";
-  };
   reloadUnitsForPhase = explicitReloadUnitsForPhase;
   restartUnitsForPhase =
     phase:
@@ -133,15 +150,12 @@ let
       schema = "nix-seal.activation.v2";
       runtimeRoot = phaseRuntimeDirectory phase;
       plan = toString cfg.planFile;
+      artifactCacheRoot = cfg.artifactCacheRoot;
       inherit (cfg) targetId;
       inherit phase;
       inherit (cfg) allowedClockSkew;
       artifacts = lib.mapAttrsToList (name: secret: {
-        ciphertext = toString secret.ciphertext;
-        envelope = toString secret.envelope;
         secretId = name;
-        inherit (secret) sourceCiphertextHash;
-        inherit (secret) artifactGeneration;
         inherit (secret) phase;
         inherit (secret) mode;
         inherit (secret) owner;
@@ -198,25 +212,45 @@ in
     planFile = mkOption {
       type = types.nullOr types.path;
       default =
-        if cfg.planObjects == null then
-          null
-        else
-          pkgs.writeText "nix-seal-plan-v1.json" (self.lib.mkPlan cfg.planObjects);
-      description = "Canonical compiled plan.v1 JSON used to derive and verify target policy.";
+        pkgs.writeText "nix-seal-plan-v2.json" (
+          self.lib.mkPlan (effectivePlanObjects // { repositoryRoot = cfg.repositoryRoot; })
+        );
+      description = "Canonical compiled plan.v2 JSON used to derive and verify target policy.";
     };
+    repositoryRoot = mkOption {
+      type = types.path;
+      description = "Repository root used only to hash canonical ciphertext sources while compiling plan.v2.";
+    };
+    identities = mkOption {
+      type = types.attrs;
+      default = { };
+      description = "Public administrator, recovery, signer, and target identity declarations used to compile plan.v2.";
+    };
+    target = mkOption {
+      type = types.attrs;
+      description = "Public target declaration for this configuration, including its plan identity ID.";
+    };
+    approvalPolicies = mkOption {
+      type = types.attrs;
+      default = { };
+      description = "Public artifact approval policies used to compile plan.v2.";
+    };
+    # Temporary pre-release input accepted only so existing Nix declarations can
+    # be evaluated while being simplified. New configurations use the typed
+    # options above; a nonempty typed identity set always wins.
     planObjects = mkOption {
-      type = types.nullOr types.attrs;
-      default = null;
-      description = ''
-        Public Nix plan collections compiled by `nixSeal.lib.mkPlan` when
-        `planFile` is not supplied. Plaintext secret values, prompts, and
-        private identities must never be placed in this option.
-      '';
+      type = types.attrs;
+      default = { };
+      description = "Deprecated pre-release plan input; use nixSeal identities, target, approvalPolicies, and secrets instead.";
     };
     allowedClockSkew = mkOption {
       type = types.ints.between 0 86400;
       default = 300;
       description = "Maximum accepted artifact issue-time lead in seconds, capped at one day.";
+    };
+    artifactCacheRoot = mkOption {
+      type = types.addCheck types.str artifactCacheRootIsSafe;
+      description = "Absolute target-local ciphertext cache root. Activation discovers only cryptographically verified matching bundles here.";
     };
     serviceActionTimeout = mkOption {
       type = types.ints.between 1 60;
@@ -273,59 +307,30 @@ in
                   refuses to replace a mismatched existing filesystem entry.
                 '';
               };
-              artifact = mkOption {
-                type = types.nullOr types.path;
+              source = mkOption {
+                type = types.nullOr types.str;
                 default = null;
-                description = ''
-                  Ciphertext-only target artifact bundle imported from
-                  `nix-seal cache export`. The directory must contain exactly
-                  `ciphertext.age` and `manifest.dsse.json`; those paths are
-                  derived automatically and may enter the Nix store.
-                '';
+                description = "Repository-relative canonical .age ciphertext source. Its hash is pinned by plan.v2, never copied to the runtime activation metadata.";
               };
-              artifactDirectory = mkOption {
-                type = types.nullOr (types.addCheck types.str artifactDirectoryIsSafe);
+              delivery = mkOption {
+                type = types.enum [ "rekeyed" "direct" ];
+                default = "rekeyed";
+                description = "Ciphertext delivery model.";
+              };
+              administrators = mkOption {
+                type = types.listOf idType;
+                default = [ ];
+                description = "Administrator or recovery identity IDs authorized for canonical encryption.";
+              };
+              approvalPolicy = mkOption {
+                type = types.nullOr idType;
                 default = null;
-                description = ''
-                  Absolute, out-of-store directory containing this target's
-                  ciphertext-only artifact bundle. This is the recommended
-                  delivery mechanism: provision or import the bundle into the
-                  target-local nix-seal cache, then configure this directory.
-                  The module does not read or copy it during evaluation; the
-                  Rust activation runtime verifies it before decryption.
-                '';
+                description = "Approval policy ID required for this secret's artifacts.";
               };
-              ciphertext = mkOption {
-                type = types.nullOr runtimeArtifactPathType;
-                default =
-                  if config.nixSeal.secrets.${name}.artifact != null then
-                    "${config.nixSeal.secrets.${name}.artifact}/ciphertext.age"
-                  else if config.nixSeal.secrets.${name}.artifactDirectory != null then
-                    "${config.nixSeal.secrets.${name}.artifactDirectory}/ciphertext.age"
-                  else
-                    null;
-                description = "Target-encrypted artifact path. A target-local artifact directory is preferred over a Nix store path.";
-              };
-              envelope = mkOption {
-                type = types.nullOr runtimeArtifactPathType;
-                default =
-                  if config.nixSeal.secrets.${name}.artifact != null then
-                    "${config.nixSeal.secrets.${name}.artifact}/manifest.dsse.json"
-                  else if config.nixSeal.secrets.${name}.artifactDirectory != null then
-                    "${config.nixSeal.secrets.${name}.artifactDirectory}/manifest.dsse.json"
-                  else
-                    null;
-                description = "Signed public artifact manifest path.";
-              };
-              sourceCiphertextHash = mkOption {
-                type = types.nullOr digestType;
-                default = null;
-                description = "Canonical administrator ciphertext hash bound by the manifest.";
-              };
-              artifactGeneration = mkOption {
-                type = types.ints.positive;
-                default = 1;
-                description = "Exact signed artifact generation.";
+              lifecycle = mkOption {
+                type = types.attrs;
+                default = { };
+                description = "Public lifecycle metadata included in plan.v2.";
               };
               restartUnits = mkOption {
                 type = types.listOf unitType;
@@ -478,57 +483,19 @@ in
           }
           {
             assertion = cfg.planFile != null;
-            message = "nixSeal.planFile must provide canonical compiled plan.v1 JSON";
+            message = "nixSeal.planFile must provide canonical compiled plan.v2 JSON";
           }
           {
             assertion = configuredSecrets != { };
-            message = "nixSeal requires at least one configured target ciphertext artifact";
+            message = "nixSeal requires at least one configured canonical secret source";
           }
           {
-            assertion = lib.all (secret: secret.envelope != null && secret.sourceCiphertextHash != null) (
-              builtins.attrValues configuredSecrets
-            );
-            message = "every nixSeal ciphertext requires an envelope and sourceCiphertextHash";
-          }
-          {
-            assertion = missingSecretArtifacts == { };
+            assertion = missingSecretSources == { };
             message =
               let
-                secret = builtins.head (builtins.attrNames missingSecretArtifacts);
+                secret = builtins.head (builtins.attrNames missingSecretSources);
               in
-              "nixSeal secret ${secret} is missing a target ciphertext artifact; run `nix-seal rekey --plan ${toString cfg.planFile} --target ${cfg.targetId} --secret ${secret} --identity /path/to/admin.agekey --signing-key /path/to/approval-signing-key`, then import the ciphertext-only bundle into this target's local nix-seal cache";
-          }
-          {
-            assertion = lib.all (
-              secret:
-              (
-                secret.artifact == null
-                || (
-                  secret.ciphertext == "${secret.artifact}/ciphertext.age"
-                  && secret.envelope == "${secret.artifact}/manifest.dsse.json"
-                )
-              )
-              && (
-                secret.artifactDirectory == null
-                || (
-                  secret.ciphertext == "${secret.artifactDirectory}/ciphertext.age"
-                  && secret.envelope == "${secret.artifactDirectory}/manifest.dsse.json"
-                )
-              )
-            ) (builtins.attrValues cfg.secrets);
-            message = "nixSeal artifact bundles derive ciphertext and envelope paths; do not override either path";
-          }
-          {
-            assertion = lib.all (secret: secret.artifact == null || secret.artifactDirectory == null) (
-              builtins.attrValues cfg.secrets
-            );
-            message = "nixSeal secrets must use either artifact (Nix-store bridge) or artifactDirectory (target-local cache), not both";
-          }
-          {
-            assertion = lib.all (
-              secret: secret.artifact == null || builtins.readDir secret.artifact == artifactBundleEntries
-            ) (builtins.attrValues cfg.secrets);
-            message = "nixSeal artifact bundles must contain exactly ciphertext.age and manifest.dsse.json";
+              "nixSeal secret ${secret} is missing its canonical repository source";
           }
           {
             assertion =

@@ -54,7 +54,7 @@ pkgs.testers.nixosTest {
       # printf avoids a whitespace-sensitive here-document terminator inside
       # the Python test driver's indented command string.
       printf '%s\\n' \
-        'schema = "nix-seal.plan.v1"' \
+        'schema = "nix-seal.plan.v2"' \
         "" \
         '[identities.admin]' \
         'kind = "administrator"' \
@@ -97,19 +97,19 @@ pkgs.testers.nixosTest {
         'encoding = "base64"' > "$root/nix-seal.toml"
 
       printf 'token={{nix-seal:token}}\\n' > "$root/template.txt"
-      nix-seal plan --toml "$root/nix-seal.toml" --output "$root/plan.v1.json"
+      nix-seal plan --toml "$root/nix-seal.toml" --output "$root/plan.v2.json"
 
       # Keep the random canary entirely in a pipe. The activated file is a
       # printable base64 token so grep can scan the Nix store using -f without
       # putting the value in process arguments.
       head -c 32 /dev/urandom | base64 -w0 | nix-seal secret create \
-        --plan "$root/plan.v1.json" \
+        --plan "$root/plan.v2.json" \
         --secret app/token \
         --repository-root "$root" \
         --identity "$root/admin.age"
 
       result=$(nix-seal --json rekey \
-        --plan "$root/plan.v1.json" \
+        --plan "$root/plan.v2.json" \
         --repository-root "$root" \
         --identity "$root/admin.age" \
         --target vm \
@@ -117,31 +117,22 @@ pkgs.testers.nixosTest {
         --generation 1 \
         --signing-key "$root/signer.key" \
         --cache-root "$root/cache")
-      cache_key=$(printf '%s' "$result" | jq -er '.cacheKey')
-      source_hash=$(printf '%s' "$result" | jq -er '.sourceCiphertextHash')
-      artifact_dir="$root/cache/artifacts/$cache_key"
-
       jq -n \
         --arg root /run/nix-seal \
-        --arg plan "$root/plan.v1.json" \
-        --arg ciphertext "$artifact_dir/ciphertext.age" \
-        --arg envelope "$artifact_dir/manifest.dsse.json" \
+        --arg plan "$root/plan.v2.json" \
+        --arg cache "$root/cache" \
         --arg template "$root/template.txt" \
-        --arg source_hash "$source_hash" \
         '{
           schema: "nix-seal.activation.v2",
           runtimeRoot: $root,
           plan: $plan,
+          artifactCacheRoot: $cache,
           targetId: "vm",
           phase: "activation",
           allowedClockSkew: 0,
           artifacts: [{
-            ciphertext: $ciphertext,
-            envelope: $envelope,
             secretId: "app/token",
             phase: "activation",
-            sourceCiphertextHash: $source_hash,
-            artifactGeneration: 1,
             mode: "0400",
             owner: "root",
             group: "root"

@@ -20,8 +20,8 @@ serde_json = "1.0"
 tempfile = "3"
 
 [[bin]]
-name = "plan-v1"
-path = "fuzz_targets/plan_v1.rs"
+name = "plan-v2"
+path = "fuzz_targets/plan_v2.rs"
 test = false
 doc = false
 bench = false

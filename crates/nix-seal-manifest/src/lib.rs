@@ -43,7 +43,7 @@ pub struct TargetManifestV2 {
     pub schema: String,
     /// Version of the tool that produced this artifact.
     pub tool_version: String,
-    /// Hash of canonical `plan.v1.json`.
+    /// Hash of canonical `plan.v2.json`.
     pub plan_hash: String,
     /// Hash of the deterministic target policy derived from that exact plan.
     pub target_policy_hash: String,

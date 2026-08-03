@@ -8,6 +8,7 @@ use nix_seal_manifest::{
     TargetManifestV2, TrustedKeys,
 };
 use secrecy::SecretString;
+use sha2::{Digest, Sha256};
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
@@ -129,7 +130,7 @@ pub fn rekey(cache: &Cache, request: &RekeyRequest<'_>) -> Result<RekeyResult, R
     set_private_permissions(canonical.path(), false).map_err(RekeyError::Io)?;
     let source = open_regular_nofollow(request.source)?;
     let source_ciphertext_hash =
-        copy_and_hash_bounded(source, canonical.as_file_mut(), MAX_CIPHERTEXT_BYTES)?;
+        copy_and_sha256_bounded(source, canonical.as_file_mut(), MAX_CIPHERTEXT_BYTES)?;
     canonical.as_file().sync_all().map_err(RekeyError::Io)?;
     canonical
         .as_file_mut()
@@ -221,9 +222,9 @@ pub fn rekey(cache: &Cache, request: &RekeyRequest<'_>) -> Result<RekeyResult, R
 }
 
 /// Copies a direct-delivery canonical ciphertext into the target-artifact
-/// cache, signs its exact binding, and verifies the stored result. The source
-/// and artifact hashes must be identical: any re-encryption here would defeat
-/// the explicit direct-delivery model.
+/// cache, signs its exact binding, and verifies the stored result. It does not
+/// decrypt or re-encrypt the source; source and artifact hashes use their
+/// explicitly named algorithms and are bound separately in the manifest.
 pub fn stage_direct(cache: &Cache, request: &DirectRequest<'_>) -> Result<RekeyResult, RekeyError> {
     let transactions = cache.root().join("transactions");
     std::fs::create_dir_all(&transactions).map_err(RekeyError::Io)?;
@@ -233,13 +234,22 @@ pub fn stage_direct(cache: &Cache, request: &DirectRequest<'_>) -> Result<RekeyR
     set_private_permissions(canonical.path(), false).map_err(RekeyError::Io)?;
     let source = open_regular_nofollow(request.source)?;
     let source_ciphertext_hash =
-        copy_and_hash_bounded(source, canonical.as_file_mut(), MAX_CIPHERTEXT_BYTES)?;
+        copy_and_sha256_bounded(source, canonical.as_file_mut(), MAX_CIPHERTEXT_BYTES)?;
     canonical.as_file().sync_all().map_err(RekeyError::Io)?;
     canonical
         .as_file_mut()
         .seek(SeekFrom::Start(0))
         .map_err(RekeyError::Io)?;
     nix_seal_crypto::validate_ciphertext_header(canonical.as_file_mut())?;
+    canonical
+        .as_file_mut()
+        .seek(SeekFrom::Start(0))
+        .map_err(RekeyError::Io)?;
+    let artifact_ciphertext_hash = copy_and_hash_bounded(
+        canonical.as_file_mut(),
+        std::io::sink(),
+        MAX_CIPHERTEXT_BYTES,
+    )?;
 
     let recipient_fingerprint = nix_seal_crypto::recipient_fingerprint(request.target_recipient)?;
     let address = ArtifactAddress::new(
@@ -267,7 +277,7 @@ pub fn stage_direct(cache: &Cache, request: &DirectRequest<'_>) -> Result<RekeyR
         plan_hash: request.plan_hash.to_owned(),
         target_policy_hash: request.target_policy_hash.to_owned(),
         source_ciphertext_hash: source_ciphertext_hash.clone(),
-        artifact_ciphertext_hash: source_ciphertext_hash.clone(),
+        artifact_ciphertext_hash,
         target_id: request.target_id.clone(),
         secret_id: request.secret_id.clone(),
         recipient_fingerprint: recipient_fingerprint.clone(),
@@ -340,9 +350,6 @@ fn authenticate_direct_record(
     recipient_fingerprint: String,
     reused: bool,
 ) -> Result<RekeyResult, RekeyError> {
-    if record.artifact_ciphertext_hash != source_ciphertext_hash {
-        return Err(RekeyError::Manifest(ManifestError::Binding));
-    }
     let envelope: SignedEnvelopeV1 =
         serde_json::from_slice(&record.envelope).map_err(|_| RekeyError::Envelope)?;
     let mut trusted = TrustedKeys::new();
@@ -401,6 +408,40 @@ fn copy_and_hash_bounded<R: Read, W: Write>(
             .ok_or(RekeyError::Limit)?;
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Copies bounded canonical ciphertext while deriving the plan.v2 SHA-256
+/// source binding. Target-artifact cache hashes retain their existing
+/// content-addressing algorithm and are separately recorded in manifests.
+fn copy_and_sha256_bounded<R: Read, W: Write>(
+    mut input: R,
+    mut output: W,
+    limit: u64,
+) -> Result<String, RekeyError> {
+    let mut hasher = Sha256::new();
+    let mut remaining = limit;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let maximum =
+            usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| RekeyError::Limit)?;
+        if maximum == 0 {
+            let mut overflow = [0_u8; 1];
+            if input.read(&mut overflow).map_err(RekeyError::Io)? != 0 {
+                return Err(RekeyError::Limit);
+            }
+            break;
+        }
+        let read = input.read(&mut buffer[..maximum]).map_err(RekeyError::Io)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read]).map_err(RekeyError::Io)?;
+        hasher.update(&buffer[..read]);
+        remaining = remaining
+            .checked_sub(u64::try_from(read).map_err(|_| RekeyError::Limit)?)
+            .ok_or(RekeyError::Limit)?;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(unix)]
@@ -595,6 +636,10 @@ mod tests {
         assert!(!created.reused);
         assert_eq!(std::fs::read(&created.ciphertext_path)?, source_bytes);
         assert_eq!(
+            created.source_ciphertext_hash,
+            format!("{:x}", Sha256::digest(&source_bytes))
+        );
+        assert_ne!(
             created.source_ciphertext_hash,
             created.artifact_ciphertext_hash
         );

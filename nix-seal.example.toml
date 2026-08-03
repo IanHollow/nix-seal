@@ -1,4 +1,4 @@
-schema = "nix-seal.plan.v1"
+schema = "nix-seal.plan.v2"
 
 [identities.admin]
 kind = "administrator"
@@ -19,6 +19,7 @@ identity = "server"
 
 [secrets."services/example/token"]
 source = "secrets/services/example/token.age"
+sourceCiphertextHash = "0000000000000000000000000000000000000000000000000000000000000000"
 consumers = ["server"]
 administrators = ["admin"]
 

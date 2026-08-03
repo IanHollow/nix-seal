@@ -83,7 +83,7 @@
             mandoc -Tlint ${./docs/nix-seal.1}
             install -D -m 0644 ${./docs/nix-seal.1} "$out/share/man/man1/nix-seal.1"
             install -d -m 0755 "$out/share/nix-seal/schemas" "$out/share/nix-seal/completions"
-            nix-seal schema --kind plan > "$out/share/nix-seal/schemas/plan-v1.json"
+            nix-seal schema --kind plan > "$out/share/nix-seal/schemas/plan-v2.json"
             nix-seal schema --kind target-policy > "$out/share/nix-seal/schemas/target-policy-v1.json"
             nix-seal schema --kind secret-recipients > "$out/share/nix-seal/schemas/secret-recipients-v1.json"
             nix-seal schema --kind activation > "$out/share/nix-seal/schemas/activation-v2.json"

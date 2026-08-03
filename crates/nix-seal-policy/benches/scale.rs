@@ -7,7 +7,7 @@
 //! prints or persists decrypted values.
 
 use nix_seal_core::{
-    ActivationPhase, DeliveryMode, Id, Identity, IdentityKind, Lifecycle, PlanV1, RuntimeSettings,
+    ActivationPhase, DeliveryMode, Id, Identity, IdentityKind, Lifecycle, PlanV2, RuntimeSettings,
     Secret, Target, TargetKind, TargetSelectors,
 };
 use nix_seal_policy::{canonical_json, target_policy, validate};
@@ -140,9 +140,9 @@ fn elapsed_ms(duration: Duration) -> u128 {
     duration.as_micros().div_ceil(1_000)
 }
 
-fn build_plan(size: usize) -> Result<PlanV1, Box<dyn std::error::Error>> {
+fn build_plan(size: usize) -> Result<PlanV2, Box<dyn std::error::Error>> {
     let admin = Id::parse("administrator")?;
-    let mut plan = PlanV1 {
+    let mut plan = PlanV2 {
         identities: BTreeMap::from([
             (
                 admin.clone(),
@@ -159,7 +159,7 @@ fn build_plan(size: usize) -> Result<PlanV1, Box<dyn std::error::Error>> {
                 },
             ),
         ]),
-        ..PlanV1::default()
+        ..PlanV2::default()
     };
     let target_identity = Id::parse("target-identity")?;
     plan.identities.insert(
@@ -188,9 +188,11 @@ fn build_plan(size: usize) -> Result<PlanV1, Box<dyn std::error::Error>> {
             Id::parse(format!("secret-{suffix}"))?,
             Secret {
                 source: format!("secrets/{suffix}.age"),
+                source_ciphertext_hash: "0".repeat(64),
                 administrators: vec![admin.clone()],
                 consumers: vec![target_id],
                 runtime: RuntimeSettings::default(),
+                runtime_overrides: BTreeMap::default(),
                 delivery: DeliveryMode::default(),
                 selectors: TargetSelectors::default(),
                 phase: ActivationPhase::default(),

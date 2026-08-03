@@ -28,7 +28,7 @@ flake-parts modules, `lib`, and checks. Runtime paths are
 `config.nixSeal.secrets.<id>.path` and `config.nixSeal.templates.<id>.path`.
 
 Typed Nix options and `nix-seal.toml` compile into strict, versioned
-`plan.v1.json`. Unknown fields and overlapping IDs are fatal. Ordering and
+`plan.v2.json`. Unknown fields and overlapping IDs are fatal. Ordering and
 canonicalization are deterministic. IDs are lowercase slugs with `.`, `/`, `-`,
 and `_`; absolute paths, `.`/`..` segments, empty segments, and controls are
 rejected. Only public metadata may enter the Nix store.
