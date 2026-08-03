@@ -185,6 +185,7 @@ pkgs.testers.nixosTest {
 
       # A tampered artifact must fail before a generation switch and preserve
       # the working secret/template pair from the prior generation.
+      artifact_dir="$root/cache/artifacts/$(jq -r '.key' "$root/cache/index.json" | head -n1)"
       printf x >> "$artifact_dir/ciphertext.age"
       ! nix-seal activate --spec "$root/activation.json" --identity "$root/target.age"
       cut -d= -f2 /run/nix-seal/current/templates/app/config | base64 -d | cmp - /run/nix-seal/current/app/token

@@ -110,7 +110,6 @@ let
       };
     }) configuredTemplates;
   };
-  effectivePlanObjects = if cfg.identities != { } then compiledPlanObjects else cfg.planObjects;
   phaseRuntimeDirectory =
     phase: if phase == "activation" then cfg.runtimeDirectory else "${cfg.runtimeDirectory}/${phase}";
   configuredSecretsForPhase =
@@ -227,7 +226,7 @@ in
     planFile = mkOption {
       type = types.nullOr types.path;
       default = pkgs.writeText "nix-seal-plan-v2.json" (
-        self.lib.mkPlan (effectivePlanObjects // { inherit (cfg) repositoryRoot; })
+        self.lib.mkPlan (compiledPlanObjects // { inherit (cfg) repositoryRoot; })
       );
       description = "Canonical compiled plan.v2 JSON used to derive and verify target policy.";
     };
@@ -248,14 +247,6 @@ in
       type = types.attrs;
       default = { };
       description = "Public artifact approval policies used to compile plan.v2.";
-    };
-    # Temporary pre-release input accepted only so existing Nix declarations can
-    # be evaluated while being simplified. New configurations use the typed
-    # options above; a nonempty typed identity set always wins.
-    planObjects = mkOption {
-      type = types.attrs;
-      default = { };
-      description = "Deprecated pre-release plan input; use nixSeal identities, target, approvalPolicies, and secrets instead.";
     };
     allowedClockSkew = mkOption {
       type = types.ints.between 0 86400;

@@ -8,41 +8,28 @@ let
   targetId = "host/test";
   secretId = "service/token";
   source = "nix-seal.example.toml";
-  planObjects = {
-    identities = {
-      administrator = {
-        kind = "administrator";
-        public = "age1x2k2hx0rzltg56p4et3yn4a873m6jltk62vmlrs8leamel69kamqf8ycqx";
-      };
-      release = {
-        kind = "signer";
-        public = "nix-seal-ed25519-v1:bGfuLIxQvDrT8IMpu931WWcILSKDrDmaCJ8oPFyT3X4=";
-      };
-      target = {
-        kind = "target";
-        public = "age1x2k2hx0rzltg56p4et3yn4a873m6jltk62vmlrs8leamel69kamqf8ycqx";
-      };
+  identities = {
+    administrator = {
+      kind = "administrator";
+      public = "age1x2k2hx0rzltg56p4et3yn4a873m6jltk62vmlrs8leamel69kamqf8ycqx";
     };
-    targets.${targetId} = {
-      kind = "nixOs";
-      inherit system;
-      identity = "target";
+    release = {
+      kind = "signer";
+      public = "nix-seal-ed25519-v1:bGfuLIxQvDrT8IMpu931WWcILSKDrDmaCJ8oPFyT3X4=";
     };
-    secrets.${secretId} = {
-      inherit source;
-      consumers = [ targetId ];
-      administrators = [ "administrator" ];
-      approvalPolicy = "release";
-      runtime = {
-        owner = "root";
-        group = "root";
-        mode = "0400";
-      };
+    target = {
+      kind = "target";
+      public = "age1x2k2hx0rzltg56p4et3yn4a873m6jltk62vmlrs8leamel69kamqf8ycqx";
     };
-    approvalPolicies.release = {
-      threshold = 1;
-      signers = [ "release" ];
-    };
+  };
+  target = {
+    kind = "nixOs";
+    inherit system;
+    identity = "target";
+  };
+  approvalPolicies.release = {
+    threshold = 1;
+    signers = [ "release" ];
   };
   configuration = inputs.nixpkgs.lib.nixosSystem {
     inherit system;
@@ -52,11 +39,20 @@ let
         system.stateVersion = "26.05";
         nixSeal = {
           enable = true;
-          inherit targetId planObjects;
+          inherit
+            targetId
+            identities
+            target
+            approvalPolicies
+            ;
           identityFile = "/run/keys/nix-seal-target";
           artifactCacheRoot = "/var/lib/nix-seal/cache/v1";
           repositoryRoot = ../../.;
-          secrets.${secretId}.source = source;
+          secrets.${secretId} = {
+            inherit source;
+            administrators = [ "administrator" ];
+            approvalPolicy = "release";
+          };
         };
       }
     ];
@@ -65,8 +61,24 @@ in
 {
   plan-v2 =
     assert
-      (builtins.fromJSON (self.lib.mkPlan (planObjects // { repositoryRoot = ../../.; }))).schema
-      == "nix-seal.plan.v2";
+      (builtins.fromJSON (
+        self.lib.mkPlan {
+          inherit identities approvalPolicies;
+          targets.${targetId} = target;
+          secrets.${secretId} = {
+            inherit source;
+            consumers = [ targetId ];
+            administrators = [ "administrator" ];
+            approvalPolicy = "release";
+            runtime = {
+              owner = "root";
+              group = "root";
+              mode = "0400";
+            };
+          };
+          repositoryRoot = ../../.;
+        }
+      )).schema == "nix-seal.plan.v2";
     pkgs.runCommand "nix-seal-plan-v2" { } "touch $out";
   module-cache-discovery =
     pkgs.runCommand "nix-seal-module-cache-discovery" { nativeBuildInputs = [ pkgs.jq ]; }

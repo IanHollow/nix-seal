@@ -60,11 +60,13 @@ The flake library exposes `nixSeal.lib.mkPlan` for public Nix metadata. It has a
 closed top-level argument set (`identities`, `groups`, `targets`, `secrets`,
 `generators`, `templates`, `approvalPolicies`, and `backends`), rejects unknown
 collections and invalid collection IDs during Nix evaluation, and emits the same
-`plan.v2.json` object consumed by the Rust policy validator:
+`plan.v2.json` object consumed by the Rust policy validator. `repositoryRoot` is
+required so Nix can pin every canonical ciphertext by SHA-256:
 
 ```nix
 let
   plan = nixSeal.lib.mkPlan {
+    repositoryRoot = ./.;
     identities.admin = {
       kind = "administrator";
       public = "age1example...";
@@ -77,6 +79,38 @@ let
   };
 in
   pkgs.writeText "plan.v2.json" plan
+```
+
+For normal NixOS, nix-darwin, and Home Manager use, there is no separate plan
+file to maintain: declare policy next to the configuration that consumes it. The
+module compiles the same plan itself. The following is deliberately all public
+metadata; the `.age` source remains ciphertext.
+
+```nix
+{
+  nixSeal = {
+    enable = true;
+    targetId = "host/example";
+    repositoryRoot = ../../.;
+    identityFile = "/etc/nix-seal/target.agekey";
+    artifactCacheRoot = "/var/lib/nix-seal/cache/v1";
+    identities = {
+      administrator = { kind = "administrator"; public = "age1..."; };
+      target = { kind = "target"; public = "age1..."; };
+      release = { kind = "signer"; public = "nix-seal-ed25519-v1:..."; };
+    };
+    target = { kind = "nixOs"; system = "x86_64-linux"; identity = "target"; };
+    approvalPolicies.release = { threshold = 1; signers = [ "release" ]; };
+    secrets."service/token" = {
+      source = "secrets/hosts/example/service-token.age";
+      administrators = [ "administrator" ];
+      approvalPolicy = "release";
+      owner = "root";
+      group = "root";
+      mode = "0400";
+    };
+  };
+}
 ```
 
 Secret `selectors` can select exact targets or groups and filter by target kind,
