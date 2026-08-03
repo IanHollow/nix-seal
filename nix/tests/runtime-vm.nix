@@ -113,6 +113,7 @@ pkgs.testers.nixosTest {
       # its required public source hash is bound to the committed bytes.
       source_hash=$(sha256sum "$root/secrets/app-token.age" | cut -d' ' -f1)
       sed -i "s/^sourceCiphertextHash = \"[0-9a-f]*\"$/sourceCiphertextHash = \"$source_hash\"/" "$root/nix-seal.toml"
+      rm -f "$root/plan.v2.json"
       nix-seal plan --toml "$root/nix-seal.toml" --output "$root/plan.v2.json"
 
       result=$(nix-seal --json rekey \
