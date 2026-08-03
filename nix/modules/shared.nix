@@ -271,7 +271,10 @@ in
       description = "Platform runtime directory for plaintext generations.";
     };
     runtimeStorage = mkOption {
-      type = types.enum [ "persistent" "volatile-tmpfs" ];
+      type = types.enum [
+        "persistent"
+        "volatile-tmpfs"
+      ];
       default = runtimeStorage;
       internal = true;
       description = "Internal activation storage requirement selected by the platform module.";
