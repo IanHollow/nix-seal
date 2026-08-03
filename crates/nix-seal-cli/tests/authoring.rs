@@ -7,6 +7,7 @@ use nix_seal_core::{
 };
 use secrecy::ExposeSecret;
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::Write,
     path::{Path, PathBuf},
@@ -205,7 +206,7 @@ fn logical_collection_batch_authors_independent_ciphertexts()
             selectors: TargetSelectors::default(),
             phase: ActivationPhase::Activation,
             runtime: RuntimeSettings::default(),
-            runtime_overrides: Default::default(),
+            runtime_overrides: BTreeMap::default(),
             lifecycle: Lifecycle::default(),
             approval_policy: None,
             repository_only: false,
@@ -380,7 +381,7 @@ fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
             selectors: TargetSelectors::default(),
             phase: ActivationPhase::Activation,
             runtime: RuntimeSettings::default(),
-            runtime_overrides: Default::default(),
+            runtime_overrides: BTreeMap::default(),
             lifecycle: Lifecycle::default(),
             approval_policy: None,
             repository_only: false,

@@ -203,11 +203,18 @@ nix-seal provision --plan plan.v1.json --target host.example --generation 4 \
   --signing-key /private/release.signing-key --identity /private/admin.agekey
 nix-seal provision --plan plan.v1.json --target host.example --generation 4 \
   --signing-key /private/release.signing-key --identity /private/admin.agekey \
-  --execute
+  --lock-file nix-seal.lock.json --execute
 ```
 
 Provisioning never transmits plaintext. Use the explicit ciphertext-only cache
 export/import flow or `nix copy` for a remote build or deployment transport.
+
+`nix-seal.lock.json` is a generated, reviewable public deployment lock. It
+records the public plan identities together with the cache address and source
+hash for each provisioned target artifact.
+It is safe to commit, but must not be hand-edited: rerun `provision --execute
+--lock-file …` after a policy or ciphertext change. Private identity locations,
+signing keys, and plaintext never appear in it.
 
 ### Target-local artifact cache (recommended)
 
