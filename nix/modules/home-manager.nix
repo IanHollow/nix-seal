@@ -2,11 +2,22 @@ self:
 {
   config,
   lib,
+  osConfig ? null,
   pkgs,
   ...
 }:
 let
   cfg = config.nixSeal;
+  integratedDarwinVolatile =
+    pkgs.stdenv.hostPlatform.isDarwin
+    && osConfig != null
+    && (osConfig.nixSeal.enable or false)
+    && (osConfig.nixSeal.darwin.volatileRuntime.enable or false);
+  darwinRuntimeRoot = "/var/run/nix-seal/users/${config.home.username}";
+  cleanupLegacyDarwinRuntime = lib.optionalString integratedDarwinVolatile ''
+    ${lib.getExe cfg.package} __darwin-runtime cleanup-persistent \
+      --root ${lib.escapeShellArg "${config.home.homeDirectory}/Library/Caches/nix-seal"}
+  '';
   bootPhases = [
     "users"
     "activation"
@@ -27,6 +38,8 @@ let
       runtimeRoot =
         if pkgs.stdenv.hostPlatform.isLinux then
           ''"$XDG_RUNTIME_DIR/nix-seal${runtimeSuffix}"''
+        else if integratedDarwinVolatile then
+          lib.escapeShellArg "${darwinRuntimeRoot}${runtimeSuffix}"
         else
           lib.escapeShellArg "${config.home.homeDirectory}/Library/Caches/nix-seal${runtimeSuffix}";
     in
@@ -41,6 +54,7 @@ let
         --spec ${spec} \
         --identity ${lib.escapeShellArg cfg.identityFile} \
         --runtime-root ${runtimeRoot}
+      ${cleanupLegacyDarwinRuntime}
     '';
   runtimeRootFor =
     phase:
@@ -49,6 +63,8 @@ let
     in
     if pkgs.stdenv.hostPlatform.isLinux then
       "%t/nix-seal${runtimeSuffix}"
+    else if integratedDarwinVolatile then
+      "${darwinRuntimeRoot}${runtimeSuffix}"
     else
       "${config.home.homeDirectory}/Library/Caches/nix-seal${runtimeSuffix}";
   persistentActivationArguments = phase: [
@@ -69,8 +85,11 @@ in
       runtimeDirectory =
         if pkgs.stdenv.hostPlatform.isLinux then
           "%t/nix-seal"
+        else if integratedDarwinVolatile then
+          darwinRuntimeRoot
         else
           "${config.home.homeDirectory}/Library/Caches/nix-seal";
+      runtimeStorage = if integratedDarwinVolatile then "volatile-tmpfs" else "persistent";
       serviceManager = if pkgs.stdenv.hostPlatform.isLinux then "systemd-user" else "launchd-user";
       serviceExecutable =
         if pkgs.stdenv.hostPlatform.isLinux then "${pkgs.systemd}/bin/systemctl" else "/bin/launchctl";
@@ -176,6 +195,8 @@ in
       (
         if pkgs.stdenv.hostPlatform.isLinux then
           "Home Manager stores runtime plaintext under XDG_RUNTIME_DIR"
+        else if integratedDarwinVolatile then
+          "Home Manager uses the nix-darwin-managed /var/run/nix-seal tmpfs runtime"
         else
           "Home Manager stores runtime plaintext under ~/Library/Caches/nix-seal on macOS; this location is not guaranteed memory-backed"
       )

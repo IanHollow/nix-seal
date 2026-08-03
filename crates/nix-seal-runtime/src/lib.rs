@@ -27,6 +27,21 @@ const MAX_TEMPLATE_OUTPUT_BYTES: u64 = 128 * 1024 * 1024;
 /// Exact schema accepted for public activation metadata.
 pub const ACTIVATION_SCHEMA: &str = "nix-seal.activation.v2";
 
+/// Filesystem properties required for plaintext runtime generations.
+///
+/// Persistent storage is the portable default. Darwin configurations which
+/// provision a system tmpfs select [`Self::VolatileTmpfs`] so activation fails
+/// rather than silently placing plaintext on APFS.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeStorageV1 {
+    /// The runtime root may be on ordinary persistent storage.
+    #[default]
+    Persistent,
+    /// The runtime root must be on a Darwin `tmpfs` mount.
+    VolatileTmpfs,
+}
+
 /// Strict public activation document. It may enter the Nix store.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -35,6 +50,9 @@ pub struct ActivationSpecV2 {
     pub schema: String,
     /// Restrictive runtime root.
     pub runtime_root: PathBuf,
+    /// Required filesystem class for the runtime root.
+    #[serde(default)]
+    pub runtime_storage: RuntimeStorageV1,
     /// Optional explicit runtime generation; omission safely allocates the next.
     #[serde(default)]
     pub runtime_generation: Option<u64>,
@@ -580,6 +598,7 @@ pub fn activate(request: &ActivationRequest<'_>) -> Result<ActivationResult, Run
         let compatibility_changed =
             ensure_compatibility_symlinks(request.runtime_root, &compatibility)?;
         generation.finish_unchanged(&generation_path, request.plan_hash, request.post_switch)?;
+        prune_superseded_generations(request.runtime_root, generation_number(&generation_path)?)?;
         return Ok(ActivationResult {
             generation_path,
             secret_count: request.artifacts.len(),
@@ -823,6 +842,7 @@ impl Generation {
             run_post_switch(actions)?;
             clear_pending(&self.root)?;
         }
+        prune_superseded_generations(&self.root, generation)?;
         Ok(destination)
     }
 }
@@ -1100,6 +1120,64 @@ fn current_generation(root: &Path) -> Result<Option<PathBuf>, RuntimeError> {
         return Err(RuntimeError::InvalidDestination);
     }
     Ok(Some(generation))
+}
+
+/// Removes every superseded private generation after an atomic successful
+/// switch. The root is locked by [`Generation`] while this executes.
+fn prune_superseded_generations(root: &Path, current: u64) -> Result<(), RuntimeError> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix("generation-") else {
+            continue;
+        };
+        let generation = suffix
+            .parse::<u64>()
+            .map_err(|_| RuntimeError::InvalidDestination)?;
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(RuntimeError::InvalidDestination);
+        }
+        if generation != current {
+            remove_generation_tree(&entry.path())?;
+        }
+    }
+    open_directory_nofollow(root)?.sync_all()?;
+    Ok(())
+}
+
+fn generation_number(path: &Path) -> Result<u64, RuntimeError> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("generation-"))
+        .and_then(|value| value.parse().ok())
+        .ok_or(RuntimeError::InvalidDestination)
+}
+
+fn remove_generation_tree(path: &Path) -> Result<(), RuntimeError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(RuntimeError::InvalidDestination);
+    }
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() || metadata.file_type().is_file() {
+            if metadata.file_type().is_symlink() {
+                return Err(RuntimeError::InvalidDestination);
+            }
+            std::fs::remove_file(entry.path())?;
+        } else if metadata.file_type().is_dir() {
+            remove_generation_tree(&entry.path())?;
+        } else {
+            return Err(RuntimeError::InvalidDestination);
+        }
+    }
+    std::fs::remove_dir(path)?;
+    Ok(())
 }
 
 const PENDING_MARKER: &str = ".post-switch-pending-v1";
@@ -2777,6 +2855,7 @@ mod tests {
         let spec = ActivationSpecV2 {
             schema: ACTIVATION_SCHEMA.to_owned(),
             runtime_root: fixture.runtime.clone(),
+            runtime_storage: RuntimeStorageV1::Persistent,
             runtime_generation: None,
             plan: fixture.temporary.path().join("plan.v2.json"),
             artifact_cache_root: fixture.temporary.path().join("cache"),
@@ -3042,10 +3121,12 @@ mod tests {
                             result.generation_path,
                             fixture.runtime.join(format!("generation-{generation}"))
                         );
+                        generations.clear();
                         generations.insert(generation);
                         current = Some(generation);
                     } else {
                         assert_eq!(current, observed_generation()?);
+                        generations = current.into_iter().collect();
                     }
                 }
                 1 => {
@@ -3054,6 +3135,7 @@ mod tests {
                     let result = activate(&request)?;
                     assert!(!result.changed);
                     assert_eq!(current, observed_generation()?);
+                    generations = current.into_iter().collect();
                 }
                 2 => {
                     request.runtime_generation = None;
@@ -3068,13 +3150,23 @@ mod tests {
                     }
                     let result = activate(&request)?;
                     assert!(result.changed);
+                    let previous = current;
                     let generation = generations.iter().next_back().copied().unwrap_or(0) + 1;
                     assert_eq!(
                         result.generation_path,
                         fixture.runtime.join(format!("generation-{generation}"))
                     );
+                    generations.clear();
                     generations.insert(generation);
                     current = Some(generation);
+                    if let Some(previous) = previous {
+                        assert!(
+                            !fixture
+                                .runtime
+                                .join(format!("generation-{previous}"))
+                                .exists()
+                        );
+                    }
                 }
                 3 => {
                     request.runtime_generation = None;

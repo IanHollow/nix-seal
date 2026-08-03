@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Command-line interface. Plaintext output is limited to `secret reveal`.
 
+mod darwin_runtime;
 mod migration;
 
 // Migration unit tests remain in this crate while command extraction proceeds;
@@ -180,6 +181,9 @@ enum Command {
         /// Override the standard XDG cache root.
         #[arg(long)]
         cache_root: Option<PathBuf>,
+        /// Inspect this runtime root in addition to public policy and cache state.
+        #[arg(long)]
+        runtime_root: Option<PathBuf>,
     },
     /// Identity operations.
     #[command(subcommand)]
@@ -202,6 +206,9 @@ enum Command {
     /// Internal authenticated runtime activation entrypoint.
     #[command(hide = true)]
     Activate(ActivateArgs),
+    /// Internal Darwin volatile-runtime setup entrypoint.
+    #[command(name = "__darwin-runtime", hide = true)]
+    DarwinRuntime(DarwinRuntimeArgs),
     /// Internal isolated age-plugin worker. This is not a stable user command.
     #[command(name = "__plugin-worker", hide = true)]
     PluginWorker,
@@ -574,6 +581,46 @@ struct ActivateArgs {
     runtime_root: Option<PathBuf>,
 }
 
+#[derive(Args)]
+struct DarwinRuntimeArgs {
+    #[command(subcommand)]
+    command: DarwinRuntimeCommand,
+}
+
+#[derive(Subcommand)]
+enum DarwinRuntimeCommand {
+    /// Mount and prepare the root-owned Darwin tmpfs runtime hierarchy.
+    Prepare {
+        /// The fixed shared mount root managed by nix-seal.
+        #[arg(long, default_value = "/var/run/nix-seal")]
+        root: PathBuf,
+        /// Maximum total tmpfs capacity, such as 256m.
+        #[arg(long, default_value = "256m")]
+        size: String,
+        /// Embedded Home Manager account to prepare. May be repeated.
+        #[arg(long = "user")]
+        users: Vec<String>,
+    },
+    /// Prepare the Darwin tmpfs and activate one authenticated system phase.
+    Activate {
+        #[arg(long, default_value = "/var/run/nix-seal")]
+        root: PathBuf,
+        #[arg(long, default_value = "256m")]
+        size: String,
+        #[arg(long = "user")]
+        users: Vec<String>,
+        #[arg(long)]
+        spec: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+    },
+    /// Remove only legacy plaintext generations after a verified tmpfs activation.
+    CleanupPersistent {
+        #[arg(long)]
+        root: PathBuf,
+    },
+}
+
 #[derive(Subcommand)]
 enum SecretCommand {
     /// Create a new plan-declared canonical ciphertext from stdin.
@@ -877,7 +924,8 @@ fn run(cli: Cli) -> Result<()> {
             plan,
             repository_root,
             cache_root,
-        } => run_doctor(&plan, &repository_root, cache_root, cli.json)?,
+            runtime_root,
+        } => run_doctor(&plan, &repository_root, cache_root, runtime_root, cli.json)?,
         Command::Key(command) => run_key(command, cli.json)?,
         Command::Identity(command) => run_identity(command, cli.json)?,
         Command::Group(command) => run_group(command, cli.json)?,
@@ -886,6 +934,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Provision(arguments) => run_provision(arguments, cli.json)?,
         Command::Generate(arguments) => run_generate(&arguments, cli.json)?,
         Command::Activate(arguments) => run_activate(&arguments, cli.json)?,
+        Command::DarwinRuntime(arguments) => run_darwin_runtime(&arguments, cli.json)?,
         Command::PluginWorker => run_plugin_worker()?,
         Command::GeneratorWorker(arguments) => run_generator_worker_main(&arguments)?,
         Command::Secret(command) => run_secret(command, cli.json)?,
@@ -1087,6 +1136,7 @@ fn run_doctor(
     plan_path: &Path,
     repository_root: &Path,
     cache_root: Option<PathBuf>,
+    runtime_root: Option<PathBuf>,
     json: bool,
 ) -> Result<()> {
     let plan = read_plan_bounded(plan_path)?;
@@ -1102,11 +1152,36 @@ fn run_doctor(
         .artifact_count
         .saturating_sub(authenticated_artifacts);
     let mut warnings = Vec::new();
+    let filevault = darwin_runtime::filevault_state();
+    let runtime = runtime_root
+        .as_ref()
+        .map(|root| darwin_runtime::inspect_runtime(root));
     if cfg!(target_os = "macos") {
-        warnings.push(
-            "macOS runtime directories are not guaranteed to be memory-backed; review the selected Home Manager runtime directory"
-                .to_owned(),
-        );
+        match filevault {
+            darwin_runtime::FileVaultState::On => {}
+            darwin_runtime::FileVaultState::Off => warnings.push(
+                "FileVault is off; APFS-backed runtime plaintext and artifacts lack configured volume-at-rest protection"
+                    .to_owned(),
+            ),
+            darwin_runtime::FileVaultState::Unknown => warnings.push(
+                "could not determine FileVault state; run /usr/bin/fdesetup isactive"
+                    .to_owned(),
+            ),
+        }
+        if runtime.is_none() {
+            warnings.push(
+                "no runtime root was supplied; pass --runtime-root to verify volatile tmpfs hardening"
+                    .to_owned(),
+            );
+        } else if runtime
+            .as_ref()
+            .is_some_and(|value| value["volatileTmpfs"] == false)
+        {
+            warnings.push(
+                "selected macOS runtime is persistent or unavailable; integrated nix-darwin profiles should use volatile tmpfs"
+                    .to_owned(),
+            );
+        }
     }
     if !cfg!(target_os = "linux") {
         warnings.push(
@@ -1170,6 +1245,8 @@ fn run_doctor(
                     "staleArtifacts":stale_artifacts,
                     "unavailableSources":retention.unavailable_sources
                 },
+                "fileVault":filevault.as_str(),
+                "runtime":runtime,
                 "warnings":warnings
             })
         );
@@ -4227,6 +4304,9 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
         spec.runtime_root.clone_from(runtime_root);
     }
     spec.validate()?;
+    if spec.runtime_storage == nix_seal_runtime::RuntimeStorageV1::VolatileTmpfs {
+        darwin_runtime::ensure_tmpfs(&spec.runtime_root)?;
+    }
     let plan = read_plan_bounded(&spec.plan)?;
     let policy = nix_seal_policy::target_policy(&plan, &spec.target_id)?;
     verify_activation_projection(&spec, &policy)?;
@@ -4329,6 +4409,58 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
                 "unchanged"
             }
         );
+    }
+    Ok(())
+}
+
+fn run_darwin_runtime(arguments: &DarwinRuntimeArgs, json: bool) -> Result<()> {
+    match &arguments.command {
+        DarwinRuntimeCommand::Prepare { root, size, users } => {
+            let root = darwin_runtime::prepare(root, users, size)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema":"nix-seal.output.v1",
+                        "prepared":true,
+                        "runtimeRoot":root,
+                        "users":users,
+                        "fileVault":darwin_runtime::filevault_state().as_str(),
+                    })
+                );
+            } else {
+                println!("{}", root.display());
+                eprintln!(
+                    "prepared Darwin volatile runtime for {} user(s)",
+                    users.len()
+                );
+            }
+        }
+        DarwinRuntimeCommand::Activate {
+            root,
+            size,
+            users,
+            spec,
+            identity,
+        } => {
+            darwin_runtime::prepare(root, users, size)?;
+            run_activate(
+                &ActivateArgs {
+                    spec: spec.clone(),
+                    identity: identity.clone(),
+                    runtime_root: None,
+                },
+                json,
+            )?;
+        }
+        DarwinRuntimeCommand::CleanupPersistent { root } => {
+            darwin_runtime::cleanup_legacy_persistent(root)?;
+            if json {
+                println!("{}", serde_json::json!({ "cleaned": root }));
+            } else {
+                println!("{}", root.display());
+            }
+        }
     }
     Ok(())
 }
@@ -8535,6 +8667,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         let mut spec = nix_seal_runtime::ActivationSpecV2 {
             schema: nix_seal_runtime::ACTIVATION_SCHEMA.to_owned(),
             runtime_root: runtime_root.clone(),
+            runtime_storage: nix_seal_runtime::RuntimeStorageV1::Persistent,
             runtime_generation: None,
             plan: plan_path,
             artifact_cache_root: cache_root,
