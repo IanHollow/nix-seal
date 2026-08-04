@@ -37,17 +37,16 @@ Each secret belongs to `partitioning`, `users`, `activation`, or `services`. The
 Rust activation document carries exactly one phase and rejects an artifact or
 template from another phase. Templates may reference only secrets from their own
 phase, so one phase cannot read a plaintext generation owned by another. The
-NixOS enables a root-managed, size-capped `tmpfs` at `/run/nix-seal` by
-default, with `noswap`, `nosuid`, `nodev`, and `noexec`. System generations
-live below `/run/nix-seal/system`; embedded Home Manager profiles receive a
-private `/run/nix-seal/users/<username>` subtree. Activation verifies the
-mount type and flags from `/proc/self/mountinfo` before decrypting and fails
-closed if the expected mount is absent or changed. Standalone Home Manager
-cannot create a root-owned mount, so it uses its session's
-`$XDG_RUNTIME_DIR/nix-seal` and should be paired with an administrator-managed
-volatile runtime when swap exposure is unacceptable. `noswap` prevents tmpfs
-pages from being written to swap; it does not override a system's suspend or
-hibernation policy.
+NixOS enables a root-managed, size-capped `tmpfs` at `/run/nix-seal` by default,
+with `noswap`, `nosuid`, `nodev`, and `noexec`. System generations live below
+`/run/nix-seal/system`; embedded Home Manager profiles receive a private
+`/run/nix-seal/users/<username>` subtree. Activation verifies the mount type and
+flags from `/proc/self/mountinfo` before decrypting and fails closed if the
+expected mount is absent or changed. Standalone Home Manager cannot create a
+root-owned mount, so it uses its session's `$XDG_RUNTIME_DIR/nix-seal` and
+should be paired with an administrator-managed volatile runtime when swap
+exposure is unacceptable. `noswap` prevents tmpfs pages from being written to
+swap; it does not override a system's suspend or hibernation policy.
 
 NixOS schedules `users` after `specialfs` and before account creation,
 `activation` after account creation, and `services` after the normal nix-seal
