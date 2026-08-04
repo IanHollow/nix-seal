@@ -80,6 +80,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
+      - name: Materialize partition source
+        run: nix store add-path flake/dev
       - run: nix flake check --keep-going --show-trace --print-build-logs --system "${{ matrix.system }}"
   tooling:
     runs-on: ubuntu-24.04
