@@ -191,15 +191,10 @@ in
         ) bootPhases
       )
     );
-    warnings = [
-      (
-        if pkgs.stdenv.hostPlatform.isLinux then
-          "Home Manager stores runtime plaintext under XDG_RUNTIME_DIR"
-        else if integratedDarwinVolatile then
-          "Home Manager uses the nix-darwin-managed /var/run/nix-seal tmpfs runtime"
-        else
-          "Home Manager stores runtime plaintext under ~/Library/Caches/nix-seal on macOS; this location is not guaranteed memory-backed"
-      )
-    ];
+    warnings =
+      lib.optional pkgs.stdenv.hostPlatform.isLinux "Home Manager stores runtime plaintext under XDG_RUNTIME_DIR"
+      ++
+        lib.optional (pkgs.stdenv.hostPlatform.isDarwin && !integratedDarwinVolatile)
+          "Home Manager stores runtime plaintext under ~/Library/Caches/nix-seal on macOS; this location is not guaranteed memory-backed";
   };
 }
