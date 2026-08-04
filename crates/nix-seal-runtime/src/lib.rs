@@ -29,9 +29,10 @@ pub const ACTIVATION_SCHEMA: &str = "nix-seal.activation.v2";
 
 /// Filesystem properties required for plaintext runtime generations.
 ///
-/// Persistent storage is the portable default. Darwin configurations which
-/// provision a system tmpfs select [`Self::VolatileTmpfs`] so activation fails
-/// rather than silently placing plaintext on APFS.
+/// Persistent storage is the portable default. Platform modules select one of
+/// the volatile variants only when they provision and validate the required
+/// filesystem, so activation fails rather than silently falling back to an
+/// ordinary filesystem.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeStorageV1 {
@@ -40,6 +41,9 @@ pub enum RuntimeStorageV1 {
     Persistent,
     /// The runtime root must be on a Darwin `tmpfs` mount.
     VolatileTmpfs,
+    /// The runtime root must be on a Linux `tmpfs` mounted with `noswap`.
+    #[serde(rename = "volatile-tmpfs-noswap")]
+    VolatileTmpfsNoSwap,
 }
 
 /// Strict public activation document. It may enter the Nix store.

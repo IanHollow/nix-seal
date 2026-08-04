@@ -8,11 +8,17 @@ self:
 }:
 let
   cfg = config.nixSeal;
+  integratedLinuxVolatile =
+    pkgs.stdenv.hostPlatform.isLinux
+    && osConfig != null
+    && (osConfig.nixSeal.enable or false)
+    && (osConfig.nixSeal.linux.volatileRuntime.enable or false);
   integratedDarwinVolatile =
     pkgs.stdenv.hostPlatform.isDarwin
     && osConfig != null
     && (osConfig.nixSeal.enable or false)
     && (osConfig.nixSeal.darwin.volatileRuntime.enable or false);
+  linuxRuntimeRoot = "/run/nix-seal/users/${config.home.username}";
   darwinRuntimeRoot = "/var/run/nix-seal/users/${config.home.username}";
   cleanupLegacyDarwinRuntime = lib.optionalString integratedDarwinVolatile ''
     ${lib.getExe cfg.package} __darwin-runtime cleanup-persistent \
@@ -36,7 +42,9 @@ let
     let
       runtimeSuffix = if phase == "activation" then "" else "/${phase}";
       runtimeRoot =
-        if pkgs.stdenv.hostPlatform.isLinux then
+        if integratedLinuxVolatile then
+          lib.escapeShellArg "${linuxRuntimeRoot}${runtimeSuffix}"
+        else if pkgs.stdenv.hostPlatform.isLinux then
           ''"$XDG_RUNTIME_DIR/nix-seal${runtimeSuffix}"''
         else if integratedDarwinVolatile then
           lib.escapeShellArg "${darwinRuntimeRoot}${runtimeSuffix}"
@@ -44,7 +52,7 @@ let
           lib.escapeShellArg "${config.home.homeDirectory}/Library/Caches/nix-seal${runtimeSuffix}";
     in
     ''
-      ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+      ${lib.optionalString (pkgs.stdenv.hostPlatform.isLinux && !integratedLinuxVolatile) ''
         if [ -z "''${XDG_RUNTIME_DIR:-}" ]; then
           echo "nix-seal: XDG_RUNTIME_DIR is required for Linux Home Manager activation" >&2
           exit 1
@@ -61,7 +69,9 @@ let
     let
       runtimeSuffix = if phase == "activation" then "" else "/${phase}";
     in
-    if pkgs.stdenv.hostPlatform.isLinux then
+    if integratedLinuxVolatile then
+      "${linuxRuntimeRoot}${runtimeSuffix}"
+    else if pkgs.stdenv.hostPlatform.isLinux then
       "%t/nix-seal${runtimeSuffix}"
     else if integratedDarwinVolatile then
       "${darwinRuntimeRoot}${runtimeSuffix}"
@@ -83,13 +93,21 @@ in
     ((import ./shared.nix) {
       inherit self;
       runtimeDirectory =
-        if pkgs.stdenv.hostPlatform.isLinux then
+        if integratedLinuxVolatile then
+          linuxRuntimeRoot
+        else if pkgs.stdenv.hostPlatform.isLinux then
           "%t/nix-seal"
         else if integratedDarwinVolatile then
           darwinRuntimeRoot
         else
           "${config.home.homeDirectory}/Library/Caches/nix-seal";
-      runtimeStorage = if integratedDarwinVolatile then "volatile-tmpfs" else "persistent";
+      runtimeStorage =
+        if integratedLinuxVolatile then
+          "volatile-tmpfs-noswap"
+        else if integratedDarwinVolatile then
+          "volatile-tmpfs"
+        else
+          "persistent";
       serviceManager = if pkgs.stdenv.hostPlatform.isLinux then "systemd-user" else "launchd-user";
       serviceExecutable =
         if pkgs.stdenv.hostPlatform.isLinux then "${pkgs.systemd}/bin/systemctl" else "/bin/launchctl";
@@ -192,9 +210,7 @@ in
       )
     );
     warnings =
-      lib.optional pkgs.stdenv.hostPlatform.isLinux "Home Manager stores runtime plaintext under XDG_RUNTIME_DIR"
-      ++
-        lib.optional (pkgs.stdenv.hostPlatform.isDarwin && !integratedDarwinVolatile)
-          "Home Manager stores runtime plaintext under ~/Library/Caches/nix-seal on macOS; this location is not guaranteed memory-backed";
+      lib.optional (pkgs.stdenv.hostPlatform.isDarwin && !integratedDarwinVolatile)
+        "Home Manager stores runtime plaintext under ~/Library/Caches/nix-seal on macOS; this location is not guaranteed memory-backed";
   };
 }

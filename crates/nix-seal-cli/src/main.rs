@@ -2,6 +2,7 @@
 //! Command-line interface. Plaintext output is limited to `secret reveal`.
 
 mod darwin_runtime;
+mod linux_runtime;
 mod migration;
 
 // Migration unit tests remain in this crate while command extraction proceeds;
@@ -209,6 +210,9 @@ enum Command {
     /// Internal Darwin volatile-runtime setup entrypoint.
     #[command(name = "__darwin-runtime", hide = true)]
     DarwinRuntime(DarwinRuntimeArgs),
+    /// Internal Linux volatile-runtime setup entrypoint.
+    #[command(name = "__linux-runtime", hide = true)]
+    LinuxRuntime(LinuxRuntimeArgs),
     /// Internal isolated age-plugin worker. This is not a stable user command.
     #[command(name = "__plugin-worker", hide = true)]
     PluginWorker,
@@ -587,6 +591,25 @@ struct DarwinRuntimeArgs {
     command: DarwinRuntimeCommand,
 }
 
+#[derive(Args)]
+struct LinuxRuntimeArgs {
+    #[command(subcommand)]
+    command: LinuxRuntimeCommand,
+}
+
+#[derive(Subcommand)]
+enum LinuxRuntimeCommand {
+    /// Verify the NixOS noswap tmpfs and prepare private system/user roots.
+    Prepare {
+        /// The fixed shared mount root managed by NixOS.
+        #[arg(long, default_value = "/run/nix-seal")]
+        root: PathBuf,
+        /// Embedded Home Manager account to prepare. May be repeated.
+        #[arg(long = "user")]
+        users: Vec<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum DarwinRuntimeCommand {
     /// Mount and prepare the root-owned Darwin tmpfs runtime hierarchy.
@@ -941,6 +964,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Generate(arguments) => run_generate(&arguments, cli.json)?,
         Command::Activate(arguments) => run_activate(&arguments, cli.json)?,
         Command::DarwinRuntime(arguments) => run_darwin_runtime(&arguments, cli.json)?,
+        Command::LinuxRuntime(arguments) => run_linux_runtime(&arguments, cli.json)?,
         Command::PluginWorker => run_plugin_worker()?,
         Command::GeneratorWorker(arguments) => run_generator_worker_main(&arguments)?,
         Command::Secret(command) => run_secret(command, cli.json)?,
@@ -1175,11 +1199,20 @@ fn doctor_warnings(
                 .to_owned(),
         );
     }
-    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-        warnings.push(
-            "XDG_RUNTIME_DIR is unset; standalone Home Manager activation needs an explicit secure runtime directory"
-                .to_owned(),
-        );
+    if cfg!(target_os = "linux") {
+        if let Some(runtime) = runtime {
+            if runtime["volatileTmpfsNoSwap"] != true {
+                warnings.push(
+                    "Linux runtime is not a verified noswap tmpfs; plaintext may be written to pageable storage"
+                        .to_owned(),
+                );
+            }
+        } else if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+            warnings.push(
+                "XDG_RUNTIME_DIR is unset and no root-managed Linux runtime was supplied for inspection"
+                    .to_owned(),
+            );
+        }
     }
     if plan
         .secrets
@@ -1235,9 +1268,13 @@ fn run_doctor(
         .artifact_count
         .saturating_sub(authenticated_artifacts);
     let filevault = darwin_runtime::filevault_state();
-    let runtime = runtime_root
-        .as_ref()
-        .map(|root| darwin_runtime::inspect_runtime(root));
+    let runtime = runtime_root.as_ref().map(|root| {
+        if cfg!(target_os = "linux") {
+            linux_runtime::inspect_runtime(root)
+        } else {
+            darwin_runtime::inspect_runtime(root)
+        }
+    });
     let recovery_identity_count = plan
         .identities
         .values()
@@ -4327,8 +4364,14 @@ fn run_activate(arguments: &ActivateArgs, json: bool) -> Result<()> {
         spec.runtime_root.clone_from(runtime_root);
     }
     spec.validate()?;
-    if spec.runtime_storage == nix_seal_runtime::RuntimeStorageV1::VolatileTmpfs {
-        darwin_runtime::ensure_tmpfs(&spec.runtime_root)?;
+    match spec.runtime_storage {
+        nix_seal_runtime::RuntimeStorageV1::Persistent => {}
+        nix_seal_runtime::RuntimeStorageV1::VolatileTmpfs => {
+            darwin_runtime::ensure_tmpfs(&spec.runtime_root)?;
+        }
+        nix_seal_runtime::RuntimeStorageV1::VolatileTmpfsNoSwap => {
+            linux_runtime::ensure_noswap_tmpfs(&spec.runtime_root)?;
+        }
     }
     let plan = read_plan_bounded(&spec.plan)?;
     let policy = nix_seal_policy::target_policy(&plan, &spec.target_id)?;
@@ -4482,6 +4525,33 @@ fn run_darwin_runtime(arguments: &DarwinRuntimeArgs, json: bool) -> Result<()> {
                 println!("{}", serde_json::json!({ "cleaned": root }));
             } else {
                 println!("{}", root.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_linux_runtime(arguments: &LinuxRuntimeArgs, json: bool) -> Result<()> {
+    match &arguments.command {
+        LinuxRuntimeCommand::Prepare { root, users } => {
+            let root = linux_runtime::prepare(root, users)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": "nix-seal.output.v1",
+                        "prepared": true,
+                        "runtimeRoot": root,
+                        "users": users,
+                        "storage": "tmpfs-noswap",
+                    })
+                );
+            } else {
+                println!("{}", root.display());
+                eprintln!(
+                    "prepared Linux volatile runtime for {} user(s)",
+                    users.len()
+                );
             }
         }
     }

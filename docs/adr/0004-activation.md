@@ -49,8 +49,10 @@ normal `activation` phase runs after `users`; `services` runs after it.
 timing and transport depend on the installer. It remains an explicit public
 activation spec to be invoked only by reviewed installation orchestration. Home
 Manager orders `users`, normal `activation`, and `services` with explicit DAG
-edges and phase-isolated `XDG_RUNTIME_DIR` roots; it rejects installer-only
-`partitioning`. nix-darwin continues to reject non-normal phases until it has
+edges and phase-isolated roots. Integrated NixOS profiles use private roots
+inside the NixOS-managed `noswap` tmpfs; standalone profiles use
+`XDG_RUNTIME_DIR` and do not claim a RAM-only guarantee. It rejects
+installer-only `partitioning`. nix-darwin continues to reject non-normal phases until it has
 platform-specific safe ordering contracts.
 
 Nix modules emit a strict `nix-seal.activation.v2` public document containing a
@@ -107,8 +109,11 @@ restart set because systemd credentials are immutable for the lifetime of one
 service activation. Duplicate names within a service are rejected across the
 entire nix-seal configuration. System-service mappings on NixOS default to
 `PrivateMounts=true`, following systemd's recommendation that credential users
-receive a private mount namespace. Linux Home Manager uses the corresponding
-user-service setting. Darwin and macOS Home Manager reject credential mappings
+receive a private mount namespace. Integrated NixOS Home Manager profiles use
+a private subtree of the NixOS-managed `noswap` tmpfs; standalone profiles
+retain their session runtime directory and do not claim a RAM-only guarantee.
+Linux Home Manager uses the corresponding user-service setting. Darwin and
+macOS Home Manager reject credential mappings
 because launchd has no equivalent contract.
 
 Public runtime templates use the reserved placeholder grammar

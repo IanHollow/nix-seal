@@ -274,6 +274,7 @@ in
       type = types.enum [
         "persistent"
         "volatile-tmpfs"
+        "volatile-tmpfs-noswap"
       ];
       default = runtimeStorage;
       internal = true;
