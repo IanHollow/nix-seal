@@ -14,12 +14,16 @@
   config,
   pkgs,
   nixSealCatalog ? { },
-  targetName ? null,
   ...
 }:
 let
   inherit (lib) mkIf mkOption types;
   cfg = config.nixSeal;
+  # Module arguments are resolved by the Nix module system before the module
+  # function's defaults are applied. Read this optional framework argument
+  # from _module.args so standalone consumers can evaluate the module without
+  # having to define targetName.
+  targetName = config._module.args.targetName or null;
   privateModeType = types.strMatching "0[1-7]00";
   idIsValid =
     value:
