@@ -48,7 +48,7 @@ pub(crate) fn inspect_runtime(root: &Path) -> serde_json::Value {
                     .iter()
                     .all(|flag| value.options.contains(*flag))
         });
-        return serde_json::json!({
+        serde_json::json!({
             "root": root,
             "mountRoot": mount.as_ref().map(|value| &value.mountpoint),
             "filesystem": filesystem,
@@ -61,7 +61,7 @@ pub(crate) fn inspect_runtime(root: &Path) -> serde_json::Value {
             "uid": metadata.as_ref().map(MetadataExt::uid),
             "gid": metadata.as_ref().map(MetadataExt::gid),
             "regularDirectory": metadata.as_ref().is_some_and(|value| value.is_dir() && !value.file_type().is_symlink()),
-        });
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -93,7 +93,7 @@ pub(crate) fn ensure_noswap_tmpfs(root: &Path) -> Result<()> {
         if mount.filesystem != "tmpfs" {
             bail!("Linux volatile runtime is not mounted as tmpfs");
         }
-        if let Some(metadata) = fs::symlink_metadata(root).ok() {
+        if let Ok(metadata) = fs::symlink_metadata(root) {
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 bail!("Linux volatile runtime root is not a regular directory");
             }
@@ -111,7 +111,7 @@ pub(crate) fn ensure_noswap_tmpfs(root: &Path) -> Result<()> {
         {
             bail!("Linux volatile runtime tmpfs lacks required noswap or restrictive mount flags");
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -145,7 +145,7 @@ pub(crate) fn prepare(root: &Path, users: &[String]) -> Result<PathBuf> {
                 account.primary_group_id(),
             )?;
         }
-        return Ok(root.to_owned());
+        Ok(root.to_owned())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -224,10 +224,10 @@ fn validate_runtime_path(root: &Path) -> Result<()> {
     for component in root.strip_prefix(ROOT)?.components() {
         if let std::path::Component::Normal(name) = component {
             current.push(name);
-            if let Ok(metadata) = fs::symlink_metadata(&current) {
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    bail!("Linux volatile runtime contains an unsafe path component");
-                }
+            if let Ok(metadata) = fs::symlink_metadata(&current)
+                && (metadata.file_type().is_symlink() || !metadata.is_dir())
+            {
+                bail!("Linux volatile runtime contains an unsafe path component");
             }
         }
     }
