@@ -99,9 +99,16 @@ pub(crate) fn ensure_noswap_tmpfs(root: &Path) -> Result<()> {
             }
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.permissions().mode() & 0o077 != 0 {
-                    bail!("Linux volatile runtime root is accessible by group or other users");
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                let mode = metadata.permissions().mode() & 0o7777;
+                if root == Path::new(ROOT) {
+                    if metadata.uid() != 0 || metadata.gid() != 0 || mode != 0o711 {
+                        bail!("Linux volatile runtime mount root has unsafe ownership or mode");
+                    }
+                } else if mode & 0o077 != 0 {
+                    bail!(
+                        "Linux volatile runtime child root is accessible by group or other users"
+                    );
                 }
             }
         }

@@ -120,7 +120,9 @@ in
       device = "tmpfs";
       fsType = "tmpfs";
       options = [
-        "mode=0700"
+        # The mount root must be traversable by embedded Home Manager users;
+        # its system and per-user children remain private 0700 directories.
+        "mode=0711"
         "size=${cfg.linux.volatileRuntime.size}"
         "nosuid"
         "nodev"
