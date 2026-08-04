@@ -25,6 +25,10 @@
             enable = true;
             entry = "cargo fmt --all -- --check";
             language = "system";
+            extraPackages = [
+              pkgs.cargo
+              pkgs.rustfmt
+            ];
             always_run = true;
             pass_filenames = false;
             after = [ "treefmt" ];
