@@ -1,0 +1,6 @@
+title = "nix-seal Gitleaks configuration"
+
+[[allowlists]]
+description = "The activation integration test uses a deterministic, non-secret password canary."
+paths = ['''^crates/nix-seal-cli/src/main\.rs$''']
+regexes = ['''password=Y2xpLWFjdGl2YXRpb24tY2FuYXJ5''']
