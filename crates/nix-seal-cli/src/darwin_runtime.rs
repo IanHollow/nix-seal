@@ -17,6 +17,8 @@ use std::{
 const ROOT: &str = "/var/run/nix-seal";
 #[cfg(target_os = "macos")]
 const MOUNT_FLAGS: &str = "nosuid,nodev,noexec";
+#[cfg(target_os = "macos")]
+const TRAVERSAL_MODE: u32 = 0o711;
 
 /// Returns public, non-secret runtime storage diagnostics for `nix-seal doctor`.
 pub(crate) fn inspect_runtime(root: &Path) -> serde_json::Value {
@@ -121,6 +123,11 @@ pub(crate) fn ensure_tmpfs(root: &Path) -> Result<()> {
     if status["mountFlagsSecure"] != true {
         bail!("Darwin volatile runtime mount lacks required security flags");
     }
+    let mount_root_status = inspect_runtime(Path::new(ROOT));
+    if mount_root_status["uid"] != 0 || mount_root_status["mode"] != format!("{TRAVERSAL_MODE:04o}")
+    {
+        bail!("Darwin volatile runtime mount root has unsafe ownership or mode");
+    }
     Ok(())
 }
 
@@ -214,10 +221,12 @@ pub(crate) fn prepare(root: &Path, users: &[String], size: &str) -> Result<PathB
             bail!("could not mount the Darwin volatile runtime tmpfs");
         }
     }
+    fs::set_permissions(root, fs::Permissions::from_mode(TRAVERSAL_MODE))
+        .context("could not set Darwin volatile runtime mount root mode")?;
     ensure_tmpfs(root)?;
     create_private_root(&root.join("system"), 0, 0)?;
     let users_root = root.join("users");
-    create_directory(&users_root, 0o755)?;
+    create_directory(&users_root, TRAVERSAL_MODE)?;
     for user in users {
         let (uid, gid) = resolve_user(user)?;
         create_private_root(&users_root.join(user), uid, gid)?;

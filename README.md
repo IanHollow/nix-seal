@@ -48,6 +48,12 @@ should be paired with an administrator-managed volatile runtime when swap
 exposure is unacceptable. `noswap` prevents tmpfs pages from being written to
 swap; it does not override a system's suspend or hibernation policy.
 
+nix-darwin similarly mounts `/var/run/nix-seal` as a size-capped tmpfs with
+`nosuid`, `nodev`, and `noexec`. Its mount and `users` roots are deliberately
+`0711` so embedded Home Manager users can traverse to their own private
+`0700` directory without being able to list the root contents. Activation
+rejects a missing mount or unsafe root mode.
+
 NixOS schedules `users` after `specialfs` and before account creation,
 `activation` after account creation, and `services` after the normal nix-seal
 activation step. `users` outputs must remain `root:root` because user accounts
