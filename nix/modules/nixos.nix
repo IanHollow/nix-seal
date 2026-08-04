@@ -49,6 +49,7 @@ in
   imports = [
     ((import ./shared.nix) {
       inherit self;
+      targetKind = "nixOs";
       runtimeDirectory = "/run/nix-seal/system";
       runtimeStorage = "volatile-tmpfs-noswap";
       serviceManager = "systemd-system";

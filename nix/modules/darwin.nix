@@ -54,6 +54,7 @@ in
   imports = [
     ((import ./shared.nix) {
       inherit self;
+      targetKind = "darwin";
       runtimeDirectory = "/var/run/nix-seal/system";
       serviceManager = "launchd-system";
       serviceExecutable = "/bin/launchctl";
