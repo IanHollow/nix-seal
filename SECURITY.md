@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Do not open a public issue. Submit a report through
-[GitHub's private vulnerability-report form for nix-seal](https://github.com/IanHollow/nix-seal/security/advisories/new).
+[GitHub's private vulnerability-report form for nix-seal](https://github.com/nix-forge/nix-seal/security/advisories/new).
 If that is unavailable, contact the maintainer through the private address
 listed on the GitHub profile and request an encrypted channel. Do not include
 live secrets, private identities, or exploit output in ordinary email.

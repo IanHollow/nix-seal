@@ -401,7 +401,7 @@ Bash/Zsh/Fish/Nushell completion definitions generated from the released CLI,
 and `nix-seal(1)`. Build it directly with:
 
 ```console
-nix build github:IanHollow/nix-seal#documentation
+nix build github:nix-forge/nix-seal#documentation
 ```
 
 ## Fuzzing
