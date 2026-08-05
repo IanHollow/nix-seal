@@ -77,7 +77,7 @@ jobs:
           test -n "${GITHUB_REF_NAME}"
           test -n "$(find dist -type f -name 'nix-seal-*' -not -name '*.cdx.json' -not -name '*.sha256' -not -name '*.build-info' | head -n1)"
           sha256sum -c dist/*.sha256
-      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: dist/nix-seal-*
       - name: Publish signed release assets
