@@ -7,16 +7,21 @@
   supportsServiceCredentials,
   serviceCredentialConfig,
   homeManagerRuntimeIdentity,
+  targetKind,
 }:
-{
+args@{
   lib,
   config,
   pkgs,
+  nixSealCatalog ? { },
   ...
 }:
 let
   inherit (lib) mkIf mkOption types;
   cfg = config.nixSeal;
+  # Capture the complete module argument set so target metadata is used when
+  # a framework supplies it, without making it mandatory for standalone users.
+  targetName = args.targetName or null;
   privateModeType = types.strMatching "0[1-7]00";
   idIsValid =
     value:
@@ -24,6 +29,22 @@ let
     && !lib.hasInfix ".." value
     && lib.all (segment: segment != ".") (lib.splitString "/" value);
   idType = types.addCheck types.str idIsValid;
+  localIdIsValid =
+    value:
+    idIsValid value
+    && (
+      cfg.administrator == null
+      || (
+        !(lib.any (administrator: lib.hasPrefix "${administrator}/" value) (
+          builtins.attrNames administratorCatalog
+        ))
+        && !(lib.hasPrefix "host/" value)
+        && !(lib.hasPrefix "home/" value)
+        && !(lib.hasPrefix "hosts/" value)
+        && !(lib.hasPrefix "users/" value)
+      )
+    );
+  localIdType = types.addCheck types.str localIdIsValid;
   activationPhaseType = types.enum [
     "partitioning"
     "users"
@@ -71,45 +92,182 @@ let
       ))
     )
   );
+  administratorCatalog = nixSealCatalog.administrators or { };
+  selectedAdministrator =
+    if cfg.administrator != null && builtins.hasAttr cfg.administrator administratorCatalog then
+      administratorCatalog.${cfg.administrator}
+    else
+      { };
+  targetScopeFromId =
+    targetId:
+    let
+      parts = lib.splitString "/" targetId;
+    in
+    if lib.hasPrefix "home/" targetId && builtins.length parts >= 2 then
+      "users/${builtins.elemAt parts 1}"
+    else if lib.hasPrefix "host/" targetId then
+      "hosts/${lib.removePrefix "host/" targetId}"
+    else
+      null;
+  derivedTargetName = targetName;
+  derivedTargetId =
+    if derivedTargetName == null then
+      null
+    else if targetKind == "homeManager" then
+      "home/${config.home.username}/${derivedTargetName}"
+    else
+      "host/${if targetKind == "nixOs" then "nixos" else "darwin"}/${derivedTargetName}";
+  derivedSecretScope =
+    if targetKind == "homeManager" then
+      "users/${config.home.username}"
+    else if derivedTargetName != null then
+      "hosts/${if targetKind == "nixOs" then "nixos" else "darwin"}/${derivedTargetName}"
+    else if cfg.targetId != null then
+      targetScopeFromId cfg.targetId
+    else
+      null;
+  canonicalSecretId =
+    name: if cfg.administrator == null then name else "${cfg.administrator}/${cfg.secretScope}/${name}";
+  canonicalTemplateId =
+    name: if cfg.administrator == null then name else "${cfg.administrator}/${cfg.secretScope}/${name}";
+  qualifyReference =
+    kind: value:
+    if cfg.administrator == null then
+      value
+    else
+      let
+        first = builtins.head (lib.splitString "/" value);
+        selectedPrefix = "${cfg.administrator}/";
+      in
+      if lib.hasPrefix selectedPrefix value then
+        value
+      else if builtins.hasAttr first administratorCatalog && first != cfg.administrator then
+        throw "nixSeal ${kind} '${value}' references administrator '${first}', but target follows '${cfg.administrator}'"
+      else
+        "${selectedPrefix}${value}";
+  projectAdminGroups =
+    if cfg.administrator == null then
+      { }
+    else
+      lib.mapAttrs' (
+        name: group:
+        lib.nameValuePair "${cfg.administrator}/${name}" (
+          group // { members = map (qualifyReference "administrator group member") (group.members or [ ]); }
+        )
+      ) (selectedAdministrator.groups or { });
+  projectAdminApprovalPolicies =
+    if cfg.administrator == null then
+      { }
+    else
+      lib.mapAttrs' (
+        name: policy:
+        lib.nameValuePair "${cfg.administrator}/${name}" (
+          policy // { signers = map (qualifyReference "approval signer") (policy.signers or [ ]); }
+        )
+      ) (selectedAdministrator.approvalPolicies or { });
+  projectAdminIdentities =
+    if cfg.administrator == null then
+      { }
+    else
+      lib.mapAttrs' (name: identity: lib.nameValuePair "${cfg.administrator}/${name}" identity) (
+        selectedAdministrator.identities or { }
+      );
+  projectLocalGroups =
+    if cfg.administrator == null then
+      cfg.groups
+    else
+      lib.mapAttrs' (
+        name: group:
+        lib.nameValuePair "${cfg.administrator}/${name}" (
+          group // { members = map (qualifyReference "group member") (group.members or [ ]); }
+        )
+      ) cfg.groups;
+  projectLocalApprovalPolicies =
+    if cfg.administrator == null then
+      cfg.approvalPolicies
+    else
+      lib.mapAttrs' (
+        name: policy:
+        lib.nameValuePair "${cfg.administrator}/${name}" (
+          policy // { signers = map (qualifyReference "approval signer") (policy.signers or [ ]); }
+        )
+      ) cfg.approvalPolicies;
+  defaultApprovalPolicy = selectedAdministrator.defaultApprovalPolicy or null;
+  defaultAdministratorReferences =
+    if cfg.administrator == null then
+      [ ]
+    else
+      lib.filter (
+        name:
+        lib.elem
+          (
+            if builtins.hasAttr name (selectedAdministrator.identities or { }) then
+              selectedAdministrator.identities.${name}.kind
+            else
+              null
+          )
+          [
+            "administrator"
+            "recovery"
+          ]
+      ) (builtins.attrNames (selectedAdministrator.identities or { }));
   configuredSecrets = lib.filterAttrs (_: secret: secret.source != null) cfg.secrets;
   missingSecretSources = lib.filterAttrs (_: secret: secret.source == null) cfg.secrets;
   configuredTemplates = lib.filterAttrs (_: template: template.source != null) cfg.templates;
   compiledPlanObjects = {
-    inherit (cfg) identities approvalPolicies;
-    targets.${cfg.targetId} = cfg.target;
-    secrets = lib.mapAttrs (_: secret: {
-      inherit (secret)
-        source
-        delivery
-        administrators
-        phase
-        lifecycle
-        ;
-      consumers = [ cfg.targetId ];
-      inherit (secret) approvalPolicy;
-      runtime = {
+    identities = projectAdminIdentities // cfg.identities;
+    groups = projectAdminGroups // projectLocalGroups;
+    approvalPolicies = projectAdminApprovalPolicies // projectLocalApprovalPolicies;
+    targets = lib.optionalAttrs (cfg.targetId != null) { ${cfg.targetId} = cfg.target; };
+    secrets = lib.mapAttrs' (
+      name: secret:
+      lib.nameValuePair (canonicalSecretId name) {
         inherit (secret)
-          owner
-          group
-          mode
-          compatibilitySymlink
-          restartUnits
-          reloadUnits
+          source
+          delivery
+          phase
+          lifecycle
           ;
-      };
-    }) configuredSecrets;
-    templates = lib.mapAttrs (_: template: {
-      inherit (template) source placeholders;
-      runtime = {
-        inherit (template)
-          owner
-          group
-          mode
-          restartUnits
-          reloadUnits
-          ;
-      };
-    }) configuredTemplates;
+        administrators = map (qualifyReference "administrator") secret.administrators;
+        consumers = lib.optional (cfg.targetId != null) cfg.targetId;
+        approvalPolicy =
+          if secret.approvalPolicy != null then
+            qualifyReference "approval policy" secret.approvalPolicy
+          else if defaultApprovalPolicy != null then
+            qualifyReference "default approval policy" defaultApprovalPolicy
+          else
+            null;
+        runtime = {
+          inherit (secret)
+            owner
+            group
+            mode
+            compatibilitySymlink
+            restartUnits
+            reloadUnits
+            ;
+        };
+      }
+    ) configuredSecrets;
+    templates = lib.mapAttrs' (
+      name: template:
+      lib.nameValuePair (canonicalTemplateId name) {
+        inherit (template) source;
+        placeholders = lib.mapAttrs (_: placeholderDef: {
+          secret = canonicalSecretId placeholderDef.secret;
+          inherit (placeholderDef) encoding;
+        }) template.placeholders;
+        runtime = {
+          inherit (template)
+            owner
+            group
+            mode
+            restartUnits
+            reloadUnits
+            ;
+        };
+      }
+    ) configuredTemplates;
   };
   phaseRuntimeDirectory =
     phase: if phase == "activation" then cfg.runtimeDirectory else "${cfg.runtimeDirectory}/${phase}";
@@ -170,20 +328,20 @@ let
       inherit (cfg) targetId;
       inherit phase;
       inherit (cfg) allowedClockSkew;
-      artifacts = lib.mapAttrsToList (name: secret: {
-        secretId = name;
+      artifacts = lib.mapAttrsToList (_name: secret: {
+        secretId = secret.id;
         inherit (secret) phase;
         inherit (secret) mode;
         inherit (secret) owner;
         inherit (secret) group;
         inherit (secret) compatibilitySymlink;
       }) secrets;
-      templates = lib.mapAttrsToList (name: template: {
+      templates = lib.mapAttrsToList (_: template: {
         source = toString template.source;
-        templateId = name;
-        placeholders = lib.mapAttrs (_: placeholder: {
-          secretId = placeholder.secret;
-          inherit (placeholder) encoding;
+        templateId = template.id;
+        placeholders = lib.mapAttrs (_: placeholderDef: {
+          secretId = cfg.secrets.${placeholderDef.secret}.id;
+          inherit (placeholderDef) encoding;
         }) template.placeholders;
         inherit (template) phase;
         inherit (template) mode owner group;
@@ -216,9 +374,20 @@ in
       defaultText = lib.literalExpression "nix-seal.packages.\${pkgs.stdenv.hostPlatform.system}.nix-seal";
       description = "nix-seal package used by activation tooling.";
     };
+    administrator = mkOption {
+      type = types.nullOr idType;
+      default = null;
+      description = "Flake-level administrator catalog entry followed by this target.";
+    };
     targetId = mkOption {
-      type = types.str;
-      description = "Stable lowercase target ID bound into signed artifacts.";
+      type = types.nullOr idType;
+      default = null;
+      description = "Stable target ID bound into signed artifacts; derived from framework metadata when available.";
+    };
+    secretScope = mkOption {
+      type = types.nullOr idType;
+      default = null;
+      description = "Administrator-relative secret namespace; derived from the target when available.";
     };
     identityFile = mkOption {
       type = types.nullOr types.str;
@@ -241,8 +410,14 @@ in
       default = { };
       description = "Public administrator, recovery, signer, and target identity declarations used to compile plan.v2.";
     };
+    groups = mkOption {
+      type = types.attrs;
+      default = { };
+      description = "Public plan groups declared by this target or administrator projection.";
+    };
     target = mkOption {
       type = types.attrs;
+      default = { };
       description = "Public target declaration for this configuration, including its plan identity ID.";
     };
     approvalPolicies = mkOption {
@@ -286,10 +461,18 @@ in
         types.submodule (
           { name, ... }: {
             options = {
+              id = mkOption {
+                type = idType;
+                readOnly = true;
+                default = canonicalSecretId name;
+                description = "Canonical plan ID derived from the selected administrator and target scope.";
+              };
               path = mkOption {
                 type = types.str;
                 readOnly = true;
-                default = "${phaseRuntimeDirectory config.nixSeal.secrets.${name}.phase}/current/${name}";
+                default = "${phaseRuntimeDirectory config.nixSeal.secrets.${name}.phase}/current/${
+                  config.nixSeal.secrets.${name}.id
+                }";
                 description = "Runtime path of the activated secret.";
               };
               phase = mkOption {
@@ -326,8 +509,12 @@ in
               };
               source = mkOption {
                 type = types.nullOr types.str;
-                default = null;
-                description = "Repository-relative canonical .age ciphertext source. Its hash is pinned by plan.v2, never copied to the runtime activation metadata.";
+                default =
+                  if cfg.administrator != null && cfg.secretScope != null then
+                    "secrets/${canonicalSecretId name}.age"
+                  else
+                    null;
+                description = "Repository-relative canonical .age ciphertext source; scoped targets derive this from the canonical ID.";
               };
               delivery = mkOption {
                 type = types.enum [
@@ -339,8 +526,8 @@ in
               };
               administrators = mkOption {
                 type = types.listOf idType;
-                default = [ ];
-                description = "Administrator or recovery identity IDs authorized for canonical encryption.";
+                default = defaultAdministratorReferences;
+                description = "Administrator or recovery identity IDs; scoped targets qualify local references under the selected administrator.";
               };
               approvalPolicy = mkOption {
                 type = types.nullOr idType;
@@ -394,12 +581,18 @@ in
         types.submodule (
           { name, ... }: {
             options = {
+              id = mkOption {
+                type = idType;
+                readOnly = true;
+                default = canonicalTemplateId name;
+                description = "Canonical plan ID derived from the selected administrator and target scope.";
+              };
               path = mkOption {
                 type = types.str;
                 readOnly = true;
-                default = "${
-                  phaseRuntimeDirectory config.nixSeal.templates.${name}.phase
-                }/current/templates/${name}";
+                default = "${phaseRuntimeDirectory config.nixSeal.templates.${name}.phase}/current/templates/${
+                  config.nixSeal.templates.${name}.id
+                }";
                 description = "Runtime path of the atomically rendered template.";
               };
               phase = mkOption {
@@ -418,8 +611,8 @@ in
                   types.submodule {
                     options = {
                       secret = mkOption {
-                        type = idType;
-                        description = "ID of the secret inserted at this placeholder.";
+                        type = localIdType;
+                        description = "Local ID of the secret inserted at this placeholder.";
                       };
                       encoding = mkOption {
                         type = types.enum [
@@ -484,14 +677,39 @@ in
   config = mkIf cfg.enable (
     lib.mkMerge [
       {
+        nixSeal.target = lib.mkDefault (
+          {
+            kind = targetKind;
+            system = pkgs.stdenv.hostPlatform.system;
+            identity = "target";
+          }
+          // lib.optionalAttrs (targetName != null) { configuration = targetName; }
+          // lib.optionalAttrs (targetKind == "homeManager") { username = config.home.username; }
+        );
+        nixSeal.targetId = lib.mkDefault derivedTargetId;
+        nixSeal.secretScope = lib.mkDefault derivedSecretScope;
         assertions = [
           {
-            assertion = idIsValid cfg.targetId;
-            message = "nixSeal.targetId must be a lowercase stable ID";
+            assertion = cfg.targetId != null && idIsValid cfg.targetId;
+            message = "nixSeal.targetId must be a lowercase stable ID or be derivable from framework metadata";
           }
           {
-            assertion = lib.all idIsValid (builtins.attrNames cfg.secrets ++ builtins.attrNames cfg.templates);
-            message = "nixSeal secret and template names must be lowercase stable IDs";
+            assertion = cfg.target != { } && cfg.target ? identity;
+            message = "nixSeal.target must declare a target identity";
+          }
+          {
+            assertion = lib.all localIdIsValid (
+              builtins.attrNames cfg.secrets ++ builtins.attrNames cfg.templates
+            );
+            message = "nixSeal scoped secret and template names must be local lowercase stable IDs";
+          }
+          {
+            assertion = cfg.administrator == null || builtins.hasAttr cfg.administrator administratorCatalog;
+            message = "nixSeal.administrator must reference an administrator in the flake nixSeal catalog";
+          }
+          {
+            assertion = cfg.administrator == null || cfg.secretScope != null;
+            message = "nixSeal.secretScope must be derivable or explicitly set when nixSeal.administrator is selected";
           }
           {
             assertion = cfg.identityFile != null;
@@ -542,7 +760,7 @@ in
           {
             assertion = lib.all (
               template:
-              lib.all (placeholder: builtins.hasAttr placeholder.secret configuredSecrets) (
+              lib.all (placeholderDef: builtins.hasAttr placeholderDef.secret configuredSecrets) (
                 builtins.attrValues template.placeholders
               )
             ) (builtins.attrValues configuredTemplates);
@@ -552,9 +770,9 @@ in
             assertion = lib.all (
               template:
               lib.all (
-                placeholder:
-                builtins.hasAttr placeholder.secret configuredSecrets
-                && cfg.secrets.${placeholder.secret}.phase == template.phase
+                placeholderDef:
+                builtins.hasAttr placeholderDef.secret configuredSecrets
+                && cfg.secrets.${placeholderDef.secret}.phase == template.phase
               ) (builtins.attrValues template.placeholders)
             ) (builtins.attrValues configuredTemplates);
             message = "every nixSeal template may reference secrets from exactly its own activation phase";

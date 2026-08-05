@@ -3,16 +3,23 @@ on:
   pull_request:
   push:
     branches: [main]
-permissions:
-  contents: read
+  workflow_dispatch:
+  merge_group:
+    types: [checks_requested]
+permissions: {}
 concurrency:
   group: "${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}"
   cancel-in-progress: true
 jobs:
   legacy-symbols:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Reject removed manager symbols and runtime references
         run: |
           if git grep -nEi 'secret[c]tl|secret[I]ndex|config[.]age[.]secrets|inputs[.]agenix'; then
@@ -25,9 +32,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-14]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.0
           components: rustfmt, clippy
@@ -37,9 +49,14 @@ jobs:
       - run: cargo test --workspace --locked
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: "1.93.0"
       - run: cargo check --workspace --all-targets --locked
@@ -47,17 +64,49 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        include:
+          - os: ubuntu-24.04
+            system: x86_64-linux
+          - os: ubuntu-24.04-arm
+            system: aarch64-linux
+          - os: macos-14
+            system: aarch64-darwin
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
-      - run: nix flake check --print-build-logs
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
+      - name: Materialize partition source
+        run: nix store add-path flake/dev
+      - run: nix flake check --keep-going --show-trace --print-build-logs --system "${{ matrix.system }}"
+  tooling:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
+      - name: Materialize partition source
+        run: nix store add-path flake/dev
+      - run: nix develop --command prek run --all-files
+      - run: nix develop --command gitleaks detect --source . --redact --baseline-path=.gitleaks-baseline.json
   vet:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.0
       - name: Install cargo-vet
@@ -65,9 +114,14 @@ jobs:
       - run: cargo vet --locked
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.0
       - name: Install cargo-audit
@@ -78,13 +132,18 @@ jobs:
       - run: cargo audit --ignore RUSTSEC-2023-0071
   fuzz-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
     env:
       # The repository's stable rust-toolchain file otherwise overrides the
       # nightly selected below when cargo-fuzz starts rustc with -Z flags.
       RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: nightly
       - name: Install cargo-fuzz
@@ -109,9 +168,14 @@ jobs:
         run: cargo fuzz run cache-state-v1 -- -max_total_time=60
   benchmarks:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.0
       - name: Record runner metadata
@@ -133,6 +197,11 @@ jobs:
             benchmark-environment.txt
   policy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1

@@ -1,0 +1,10 @@
+files.extend-exclude = [
+  "flake.lock",
+  "Cargo.lock",
+  "fuzz/Cargo.lock",
+  ".git/**",
+  "target/**",
+]
+
+[default.extend-words]
+WRONLY = "WRONLY"

@@ -251,7 +251,7 @@ impl Secret {
 
 /// Public selectors for expanding a secret's authorized target set.
 ///
-/// Non-empty fields are `ANDed`, while values within one field are `ORed`. The
+/// Non-empty fields are `ANDead`, while values within one field are `ORed`. The
 /// `tags` field is the exception: every listed tag is required. Explicit
 /// consumers remain a separate union, so adding a selector never removes an
 /// existing target authorization.

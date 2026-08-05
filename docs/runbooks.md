@@ -73,7 +73,6 @@ does not change the credential used by the service.
    in the same reviewed change; never delete the old source until the new
    ciphertext has passed an independent round-trip check. Repeat for every
    affected source or use an explicitly reviewed bulk adapter.
-
 5. Rebuild target artifacts from the new plan. `provision` is dry-run-first;
    only add `--execute` after reviewing every target and generation. Export the
    ciphertext-only cache to the deployment host and activate normally.
@@ -123,7 +122,6 @@ does not change the credential used by the service.
    ```
 
    Add `--execute` only after the complete dry-run report has been reviewed.
-
 4. Remove stale artifacts with `nix-seal cache gc` after confirming the active
    plan and signer threshold. Activation must reject old envelopes because the
    current plan no longer trusts the compromised signer.

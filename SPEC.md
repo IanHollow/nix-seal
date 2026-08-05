@@ -25,7 +25,10 @@ Required release platforms are x86_64/aarch64 NixOS, available x86_64/aarch64
 nix-darwin runners, and Home Manager on Linux/macOS in standalone and integrated
 modes. The flake exports `packages`, `apps`, NixOS, Darwin, Home Manager and
 flake-parts modules, `lib`, and checks. Runtime paths are
-`config.nixSeal.secrets.<id>.path` and `config.nixSeal.templates.<id>.path`.
+`config.nixSeal.secrets.<local-name>.path` and
+`config.nixSeal.templates.<local-name>.path`. In scoped mode, target-local names
+are qualified into canonical administrator/target IDs and the read-only `id`
+field exposes that canonical value for CLI and rekey workflows.
 
 Typed Nix options and `nix-seal.toml` compile into strict, versioned
 `plan.v2.json`. Unknown fields and overlapping IDs are fatal. Ordering and
@@ -80,6 +83,17 @@ Secret values are not accepted in argv or ordinary environment variables. Errors
 may identify a secret but never contain values or decrypted fragments.
 
 ## Cache, Nix bridge, and activation
+
+The Nix front end exposes a typed `flake.nixSeal.administrators` catalog. Each
+NixOS, nix-darwin, or Home Manager target selects one administrator with
+`nixSeal.administrator`; the module projects only that administrator's
+identities, groups, and approval policies into its plan. Framework-provided
+target metadata derives host and user scopes, with explicit `targetId` and
+`secretScope` overrides for standalone or unusual layouts. The optional
+`nix-seal.flakeModules.nix-config-framework` adapter forwards the catalog via
+the framework's generic `extraSpecialArgs`, while the framework itself only
+provides a reusable `targetName` argument. Omitting the selector preserves the
+legacy explicit-identity mode.
 
 The cache is `$XDG_CACHE_HOME/nix-seal/v1`, contains only ciphertext, signed
 manifests, and public metadata, and addresses objects by plan, target policy,

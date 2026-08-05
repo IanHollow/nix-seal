@@ -11,7 +11,14 @@ ignore = ["RUSTSEC-2023-0071"]
 [licenses]
 version = 2
 confidence-threshold = 0.93
-allow = ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "CC0-1.0", "MIT", "Unicode-3.0"]
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "MIT",
+  "Unicode-3.0",
+]
 
 [bans]
 multiple-versions = "warn"

@@ -1,12 +1,66 @@
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: /
+    directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+      day: monday
+      time: "05:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 10
+    rebase-strategy: auto
+    labels: ["dependencies", "rust"]
+    commit-message:
+      prefix: "deps"
+      include: scope
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
   - package-ecosystem: github-actions
-    directory: /
+    directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+      day: monday
+      time: "05:30"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 10
+    rebase-strategy: auto
+    labels: ["dependencies", "github-actions"]
+    commit-message:
+      prefix: "ci"
+      include: scope
+    groups:
+      github-actions-minor-patch:
+        update-types: ["minor", "patch"]
+  - package-ecosystem: nix
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 10
+    rebase-strategy: auto
+    labels: ["dependencies", "nix"]
+    commit-message:
+      prefix: "build"
+      include: scope
+    groups:
+      nix-inputs-minor-patch:
+        update-types: ["minor", "patch"]
+  - package-ecosystem: nix
+    directory: "/flake/dev"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:30"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 10
+    rebase-strategy: auto
+    labels: ["dependencies", "nix", "tooling"]
+    commit-message:
+      prefix: "build"
+      include: scope
+    groups:
+      nix-dev-inputs-minor-patch:
+        update-types: ["minor", "patch"]

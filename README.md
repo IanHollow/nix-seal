@@ -99,28 +99,52 @@ in
 
 For normal NixOS, nix-darwin, and Home Manager use, there is no separate plan
 file to maintain: declare policy next to the configuration that consumes it. The
-module compiles the same plan itself. The following is deliberately all public
-metadata; the `.age` source remains ciphertext.
+module compiles the same plan itself. Administrator catalogs belong at the flake
+level, while each target selects exactly one catalog entry. Import
+`nix-seal.flakeModules.nix-config-framework` when using `nix-config-framework`;
+the adapter passes the catalog through its existing `extraSpecialArgs` channel.
+
+```nix
+{
+  flake.nixSeal = {
+    administrators.ianhollow = {
+      identities = {
+        administrator = { kind = "administrator"; public = "age1..."; };
+        recovery = { kind = "recovery"; public = "age1..."; };
+        release = { kind = "signer"; public = "nix-seal-ed25519-v1:..."; };
+      };
+      approvalPolicies.release = { threshold = 1; signers = [ "release" ]; };
+      defaultApprovalPolicy = "release";
+    };
+  };
+}
+```
+
+Target-local secret names are automatically qualified with the selected
+administrator and target scope. For example, a Home Manager target named `ianmh`
+produces the canonical plan ID `ianhollow/users/ianmh/nix-access-tokens` and
+source `secrets/ianhollow/users/ianmh/nix-access-tokens.age`; callers still use
+`config.nixSeal.secrets."nix-access-tokens".path`. NixOS and nix-darwin use
+`<administrator>/hosts/{nixos,darwin}/<target>/<secret>`. Framework metadata
+supplies target names; standalone or unusual configurations can override
+`nixSeal.targetId` and `nixSeal.secretScope` explicitly.
+
+The following is deliberately all public metadata; the `.age` source remains
+ciphertext.
 
 ```nix
 {
   nixSeal = {
     enable = true;
-    targetId = "host/example";
+    administrator = "ianhollow";
     repositoryRoot = ../../.;
     identityFile = "/etc/nix-seal/target.agekey";
     artifactCacheRoot = "/var/lib/nix-seal/cache/v1";
     identities = {
-      administrator = { kind = "administrator"; public = "age1..."; };
       target = { kind = "target"; public = "age1..."; };
-      release = { kind = "signer"; public = "nix-seal-ed25519-v1:..."; };
     };
-    target = { kind = "nixOs"; system = "x86_64-linux"; identity = "target"; };
-    approvalPolicies.release = { threshold = 1; signers = [ "release" ]; };
-    secrets."service/token" = {
-      source = "secrets/hosts/example/service-token.age";
+    secrets."service-token" = {
       administrators = [ "administrator" ];
-      approvalPolicy = "release";
       owner = "root";
       group = "root";
       mode = "0400";
@@ -129,9 +153,14 @@ metadata; the `.age` source remains ciphertext.
 }
 ```
 
+When `nixSeal.administrator` is omitted, the legacy explicit-identity mode
+remains available for migration and unusual layouts. In that mode IDs and
+sources are used exactly as declared; scoped targets reject hard-coded IDs from
+another administrator.
+
 Secret `selectors` can select exact targets or groups and filter by target kind,
 system, username, configuration, environment, and tags. Non-empty selector
-fields are ANDed (values within one field are ORed); tags are all-required, and
+fields are ANDead (values within one field are ORed); tags are all-required, and
 the result is unioned with explicit `consumers`. Selector references are
 validated against the target/group graph before recipient derivation.
 
@@ -171,7 +200,7 @@ nix-seal secret list --plan plan.v2.json --due
 collection before it is encrypted. The original bytes are retained, so
 formatting and ordering are not rewritten. Structured input is limited to 64 MiB
 and must be valid UTF-8. dotenv validation accepts only unique shell-compatible
-`KEY=VALUE` entries (with an optional `export ` prefix); it does not evaluate
+`KEY=VALUE` entries (with an optional `export` prefix); it does not evaluate
 shell syntax. An edit that fails its declared format check never replaces the
 existing ciphertext. Each canonical source remains one independent standard age
 file. Keep any plaintext input file private and remove it according to your

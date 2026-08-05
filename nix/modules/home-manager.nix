@@ -92,6 +92,7 @@ in
   imports = [
     ((import ./shared.nix) {
       inherit self;
+      targetKind = "homeManager";
       runtimeDirectory =
         if integratedLinuxVolatile then
           linuxRuntimeRoot

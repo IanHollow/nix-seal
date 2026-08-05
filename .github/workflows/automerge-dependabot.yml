@@ -1,0 +1,24 @@
+name: Auto-merge Dependabot
+on: # zizmor: ignore[dangerous-triggers] This workflow neither checks out nor executes PR code.
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+permissions: {}
+concurrency:
+  group: dependabot-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  enable:
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.base.repo.full_name == 'IanHollow/nix-seal' && github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name && github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Enable squash auto-merge after required checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: gh pr merge "$PR_NUMBER" --repo "$REPOSITORY" --auto --squash --delete-branch
