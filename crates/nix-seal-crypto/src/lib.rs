@@ -1459,7 +1459,13 @@ body\n\
             .payload_sha256
             .as_deref()
             .ok_or("CCTV age vector omits payload hash")?;
-        assert_eq!(format!("{:x}", Sha256::digest(plaintext)), expected);
+        assert_eq!(
+            format!(
+                "{:x}",
+                base16ct::HexDisplay(Sha256::digest(plaintext).as_slice())
+            ),
+            expected
+        );
         Ok(())
     }
 }

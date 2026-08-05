@@ -1321,6 +1321,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "argon2",
+ "base16ct",
  "base64 0.23.0",
  "blake3",
  "clap",
@@ -1390,6 +1391,7 @@ name = "nix-seal-crypto"
 version = "0.1.0-alpha.1"
 dependencies = [
  "age",
+ "base16ct",
  "bech32 0.12.0",
  "blake3",
  "getrandom 0.4.3",
@@ -1441,6 +1443,7 @@ dependencies = [
 name = "nix-seal-rekey"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "base16ct",
  "blake3",
  "nix-seal-cache",
  "nix-seal-core",

@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 age.workspace = true
+base16ct.workspace = true
 blake3.workspace = true
 getrandom.workspace = true
 rustix.workspace = true
