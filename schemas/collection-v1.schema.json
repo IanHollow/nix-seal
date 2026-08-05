@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/IanHollow/nix-seal/schema/collection-v1.json",
+  "$id": "https://github.com/nix-forge/nix-seal/schema/collection-v1.json",
   "title": "nix-seal logical collection mapping v1",
   "type": "object",
   "additionalProperties": false,

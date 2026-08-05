@@ -18,7 +18,7 @@ edition = "2024"
 rust-version = "1.93"
 authors = ["Ian Hollow"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/IanHollow/nix-seal"
+repository = "https://github.com/nix-forge/nix-seal"
 
 [workspace.dependencies]
 age = { version = "=0.12.1", default-features = false, features = [

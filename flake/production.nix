@@ -31,7 +31,7 @@ let
       cargoTestFlags = [ "--workspace" ];
       meta = {
         description = "Security-first secret management for Nix";
-        homepage = "https://github.com/IanHollow/nix-seal";
+        homepage = "https://github.com/nix-forge/nix-seal";
         license = with lib.licenses; [
           mit
           asl20
