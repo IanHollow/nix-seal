@@ -48,7 +48,7 @@ dependencies = [
  "age-core",
  "base64",
  "bcrypt-pbkdf",
- "bech32",
+ "bech32 0.11.1",
  "cbc",
  "chacha20poly1305",
  "cipher",
@@ -86,7 +86,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01d4375964d1501e5f1b32aef2ead573913893ff238448d4e9fdf1522d828656"
 dependencies = [
  "base64",
- "bech32",
+ "bech32 0.11.1",
  "chacha20poly1305",
  "cookie-factory",
  "hkdf",
@@ -237,6 +237,12 @@ name = "bech32"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
+
+[[package]]
+name = "bech32"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efbd3e1070bbdf4cd88a75264e18e8a26f7cb5c6949eadf0ceb85fb159cf08f8"
 
 [[package]]
 name = "bitflags"
@@ -1378,7 +1384,7 @@ name = "nix-seal-crypto"
 version = "0.1.0-alpha.1"
 dependencies = [
  "age",
- "bech32",
+ "bech32 0.12.0",
  "blake3",
  "getrandom 0.4.3",
  "rustix",
