@@ -124,12 +124,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.97.0
+      - uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
+      - name: Materialize partition source
+        run: nix store add-path flake/dev
       - name: Install cargo-audit
         run: cargo install --locked --version 0.22.2 cargo-audit
       # RustCrypto RSA is retained only for the documented OpenSSH migration
       # compatibility path; see ADR 0009 for the compensating controls and
       # explicit pre-1.0 release-blocker status.
       - run: cargo audit --ignore RUSTSEC-2023-0071
+      - name: Scan all supported lockfiles
+        run: nix develop --command osv-scanner scan source --recursive --config osv-scanner.toml .
   fuzz-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 45

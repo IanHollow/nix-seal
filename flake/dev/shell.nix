@@ -35,6 +35,7 @@ _: {
             nixf-diagnose
             nixfmt
             nixfmt-rfc-style
+            osv-scanner
             pinact
             prettier
             prek
