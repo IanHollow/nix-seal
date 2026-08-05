@@ -46,7 +46,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "age-core",
- "base64",
+ "base64 0.22.1",
  "bcrypt-pbkdf",
  "bech32 0.11.1",
  "cbc",
@@ -85,7 +85,7 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01d4375964d1501e5f1b32aef2ead573913893ff238448d4e9fdf1522d828656"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bech32 0.11.1",
  "chacha20poly1305",
  "cookie-factory",
@@ -205,6 +205,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
 
 [[package]]
 name = "base64ct"
@@ -1315,7 +1321,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "argon2",
- "base64",
+ "base64 0.23.0",
  "blake3",
  "clap",
  "clap_complete",
@@ -1400,7 +1406,7 @@ dependencies = [
 name = "nix-seal-manifest"
 version = "0.1.0-alpha.1"
 dependencies = [
- "base64",
+ "base64 0.23.0",
  "blake3",
  "ed25519-dalek 3.0.0",
  "getrandom 0.4.3",
@@ -1452,7 +1458,7 @@ dependencies = [
 name = "nix-seal-runtime"
 version = "0.1.0-alpha.1"
 dependencies = [
- "base64",
+ "base64 0.23.0",
  "blake3",
  "fs2",
  "nix-seal-core",
