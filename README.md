@@ -160,7 +160,7 @@ another administrator.
 
 Secret `selectors` can select exact targets or groups and filter by target kind,
 system, username, configuration, environment, and tags. Non-empty selector
-fields are ANDead (values within one field are ORed); tags are all-required, and
+fields are ANDed (values within one field are ORed); tags are all-required, and
 the result is unioned with explicit `consumers`. Selector references are
 validated against the target/group graph before recipient derivation.
 
