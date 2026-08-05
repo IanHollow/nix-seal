@@ -1048,7 +1048,7 @@ fn open_compatibility_parent(path: &Path) -> Result<(File, std::ffi::OsString), 
             let canonical_parent = parent_path
                 .canonicalize()
                 .map_err(|_| RuntimeError::CompatibilityPath)?;
-            open_directory_chain_nofollow(&canonical_parent)
+            open_directory_nofollow(&canonical_parent)
                 .map_err(|_| RuntimeError::CompatibilityPath)?
         }
         Err(_) => return Err(RuntimeError::CompatibilityPath),
@@ -2080,7 +2080,7 @@ fn open_source_parent(path: &Path) -> Result<(File, std::ffi::OsString), Runtime
         Err(RuntimeError::UnsafeSource) => {
             reject_user_owned_source_symlinks(parent_path)?;
             let canonical_parent = parent_path.canonicalize().map_err(RuntimeError::Io)?;
-            open_directory_chain_nofollow(&canonical_parent)?
+            open_directory_path_nofollow(&canonical_parent)?
         }
         Err(error) => return Err(error),
     };
@@ -2152,7 +2152,7 @@ fn open_directory_chain_nofollow(path: &Path) -> Result<File, RuntimeError> {
 }
 
 #[cfg(unix)]
-fn open_directory_nofollow(path: &Path) -> Result<File, RuntimeError> {
+fn open_directory_path_nofollow(path: &Path) -> Result<File, RuntimeError> {
     use rustix::fs::{FileType, Mode, OFlags, fstat, open};
     let descriptor = open(
         path,
@@ -2167,12 +2167,22 @@ fn open_directory_nofollow(path: &Path) -> Result<File, RuntimeError> {
         }
     })?;
     let metadata = fstat(&descriptor).map_err(|error| RuntimeError::Io(error.into()))?;
-    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
-        || metadata.st_uid != rustix::process::geteuid().as_raw()
-    {
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory {
         return Err(RuntimeError::InvalidDestination);
     }
     Ok(File::from(descriptor))
+}
+
+#[cfg(unix)]
+fn open_directory_nofollow(path: &Path) -> Result<File, RuntimeError> {
+    use rustix::fs::fstat;
+
+    let directory = open_directory_path_nofollow(path)?;
+    let metadata = fstat(&directory).map_err(|error| RuntimeError::Io(error.into()))?;
+    if metadata.st_uid != rustix::process::geteuid().as_raw() {
+        return Err(RuntimeError::InvalidDestination);
+    }
+    Ok(directory)
 }
 
 #[cfg(unix)]
@@ -2298,6 +2308,17 @@ fn set_file_owner(file: &File, uid: u32, gid: u32) -> Result<(), std::io::Error>
         fs::fchown,
         process::{Gid, Uid},
     };
+    use std::os::unix::fs::MetadataExt;
+
+    // macOS rejects even a no-op fchown from an unprivileged owner. Runtime
+    // activation commonly runs as that owner, so avoid asking the kernel to
+    // change ownership when the newly-created file already has the declared
+    // uid/gid. A real ownership change still goes through fchown below.
+    let metadata = file.metadata()?;
+    if metadata.uid() == uid && metadata.gid() == gid {
+        return Ok(());
+    }
+
     fchown(file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).map_err(Into::into)
 }
 
@@ -2308,6 +2329,39 @@ fn set_file_owner(_file: &File, _uid: u32, _gid: u32) -> Result<(), std::io::Err
 
 #[cfg(not(unix))]
 fn set_file_mode(_file: &File, _mode: u32) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn set_file_owner_accepts_existing_unprivileged_owner() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let file = std::fs::File::create(temporary.path().join("owner-check"))?;
+
+    set_file_owner(
+        &file,
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    )?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn open_regular_nofollow_handles_execute_only_ancestor() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir()?;
+    let directory = temporary.path().join("private");
+    std::fs::create_dir(&directory)?;
+    let file = directory.join("secret");
+    std::fs::File::create(&file)?;
+    std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o711))?;
+
+    let opened = open_regular_nofollow(&file)?;
+    assert_eq!(opened.metadata()?.len(), 0);
+
     Ok(())
 }
 
