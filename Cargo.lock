@@ -1321,6 +1321,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "argon2",
+ "base16ct",
  "base64 0.23.0",
  "blake3",
  "clap",
@@ -1342,7 +1343,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "toml 1.1.4+spec-1.1.0",
  "uzers",
@@ -1390,12 +1391,13 @@ name = "nix-seal-crypto"
 version = "0.1.0-alpha.1"
 dependencies = [
  "age",
+ "base16ct",
  "bech32 0.12.0",
  "blake3",
  "getrandom 0.4.3",
  "rustix",
  "secrecy",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.19",
  "x25519-dalek 3.0.0",
@@ -1441,6 +1443,7 @@ dependencies = [
 name = "nix-seal-rekey"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "base16ct",
  "blake3",
  "nix-seal-cache",
  "nix-seal-core",
@@ -1449,7 +1452,7 @@ dependencies = [
  "rustix",
  "secrecy",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.19",
 ]

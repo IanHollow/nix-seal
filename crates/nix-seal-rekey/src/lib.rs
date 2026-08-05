@@ -441,7 +441,10 @@ fn copy_and_sha256_bounded<R: Read, W: Write>(
             .checked_sub(u64::try_from(read).map_err(|_| RekeyError::Limit)?)
             .ok_or(RekeyError::Limit)?;
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(format!(
+        "{:x}",
+        base16ct::HexDisplay(hasher.finalize().as_slice())
+    ))
 }
 
 #[cfg(unix)]
@@ -637,7 +640,10 @@ mod tests {
         assert_eq!(std::fs::read(&created.ciphertext_path)?, source_bytes);
         assert_eq!(
             created.source_ciphertext_hash,
-            format!("{:x}", Sha256::digest(&source_bytes))
+            format!(
+                "{:x}",
+                base16ct::HexDisplay(Sha256::digest(&source_bytes).as_slice())
+            )
         );
         assert_ne!(
             created.source_ciphertext_hash,

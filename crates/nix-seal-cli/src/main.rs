@@ -6329,7 +6329,10 @@ fn canonical_ciphertext_hash(repository_root: &Path, relative: &str) -> Result<S
     if total == 0 {
         bail!("canonical ciphertext is empty");
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(format!(
+        "{:x}",
+        base16ct::HexDisplay(hasher.finalize().as_slice())
+    ))
 }
 
 #[cfg(target_os = "macos")]
